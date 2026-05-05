@@ -19,6 +19,7 @@ Kronos 是全球首个开源金融K线基础模型，用于预测金融市场的
 |------|------|
 | [installation.md](guide/installation.md) | 安装指南、依赖说明 |
 | [quick-start.md](guide/quick-start.md) | 快速开始、预测示例 |
+| [kronos-quant-usage.md](guide/kronos-quant-usage.md) | 量化使用手册、信号提取、接入指南 |
 
 ### reference/ — 参考文档
 
