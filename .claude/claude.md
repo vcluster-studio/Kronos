@@ -69,14 +69,22 @@ DataFrame 必须包含：
 
 ## 文档索引
 
-详细文档位于 `docs/` 目录：
+详细文档位于 `docs/` 目录，按类型组织：
+
+### guide/ — 使用指南
+- [installation.md](docs/guide/installation.md) - 安装指南
+- [quick-start.md](docs/guide/quick-start.md) - 快速开始
+
+### reference/ — 参考文档
+- [api-reference.md](docs/reference/api-reference.md) - API参考
+- [model-zoo.md](docs/reference/model-zoo.md) - 模型仓库
+
+### tutorial/ — 教程
+- [finetuning.md](docs/tutorial/finetuning.md) - 微调指南
+
+### 根目录
 - [MEMORY.md](docs/MEMORY.md) - 文档索引
 - [overview.md](docs/overview.md) - 项目概述
-- [installation.md](docs/installation.md) - 安装指南
-- [quick-start.md](docs/quick-start.md) - 快速开始
-- [api-reference.md](docs/api-reference.md) - API参考
-- [finetuning.md](docs/finetuning.md) - 微调指南
-- [model-zoo.md](docs/model-zoo.md) - 模型仓库
 
 ## 资源链接
 

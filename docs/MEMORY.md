@@ -11,18 +11,33 @@ Kronos 是全球首个开源金融K线基础模型，用于预测金融市场的
 - **框架**: PyTorch
 - **许可证**: MIT
 
-## 文档列表
+## 文档目录
 
-### 项目文档 (docs/)
+### guide/ — 使用指南
+
+| 文档 | 内容 |
+|------|------|
+| [installation.md](guide/installation.md) | 安装指南、依赖说明 |
+| [quick-start.md](guide/quick-start.md) | 快速开始、预测示例 |
+
+### reference/ — 参考文档
+
+| 文档 | 内容 |
+|------|------|
+| [api-reference.md](reference/api-reference.md) | API参考、类和方法说明 |
+| [model-zoo.md](reference/model-zoo.md) | 模型仓库、可用模型列表 |
+
+### tutorial/ — 教程
+
+| 文档 | 内容 |
+|------|------|
+| [finetuning.md](tutorial/finetuning.md) | 微调指南、Qlib管道 |
+
+### 根目录
 
 | 文档 | 内容 |
 |------|------|
 | [overview.md](overview.md) | 项目概述、核心创新、项目结构 |
-| [installation.md](installation.md) | 安装指南、依赖说明 |
-| [quick-start.md](quick-start.md) | 快速开始、预测示例 |
-| [api-reference.md](api-reference.md) | API参考、类和方法说明 |
-| [finetuning.md](finetuning.md) | 微调指南、Qlib管道 |
-| [model-zoo.md](model-zoo.md) | 模型仓库、可用模型列表 |
 
 ## 核心模块
 

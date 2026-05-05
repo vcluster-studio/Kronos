@@ -73,4 +73,5 @@ venv.bak/
 *.temp
 temp/
 tmp/
+docs/temp/
 .python-version
