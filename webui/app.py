@@ -33,24 +33,24 @@ predictor = None
 AVAILABLE_MODELS = {
     'kronos-mini': {
         'name': 'Kronos-mini',
-        'model_id': 'NeoQuasar/Kronos-mini',
-        'tokenizer_id': 'NeoQuasar/Kronos-Tokenizer-2k',
+        'model_id': 'pretrained/Kronos-mini',
+        'tokenizer_id': 'pretrained/Kronos-Tokenizer-2k',
         'context_length': 2048,
         'params': '4.1M',
         'description': 'Lightweight model, suitable for fast prediction'
     },
     'kronos-small': {
         'name': 'Kronos-small',
-        'model_id': 'NeoQuasar/Kronos-small',
-        'tokenizer_id': 'NeoQuasar/Kronos-Tokenizer-base',
+        'model_id': 'pretrained/Kronos-small',
+        'tokenizer_id': 'pretrained/Kronos-Tokenizer-base',
         'context_length': 512,
         'params': '24.7M',
         'description': 'Small model, balanced performance and speed'
     },
     'kronos-base': {
         'name': 'Kronos-base',
-        'model_id': 'NeoQuasar/Kronos-base',
-        'tokenizer_id': 'NeoQuasar/Kronos-Tokenizer-base',
+        'model_id': 'pretrained/Kronos-base',
+        'tokenizer_id': 'pretrained/Kronos-Tokenizer-base',
         'context_length': 512,
         'params': '102.3M',
         'description': 'Base model, provides better prediction quality'

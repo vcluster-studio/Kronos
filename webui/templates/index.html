@@ -534,14 +534,14 @@
                 <!-- Prediction Parameters -->
                 <div class="form-group">
                     <label for="lookback">Lookback Window Size:</label>
-                    <input type="number" id="lookback" value="400" readonly>
-                    <small class="form-text">Fixed at 400 data points</small>
+                    <input type="number" id="lookback" value="400" min="1" max="2048">
+                    <small class="form-text">Number of historical data points for prediction</small>
                 </div>
 
                 <div class="form-group">
                     <label for="pred-len">Prediction Length:</label>
-                    <input type="number" id="pred-len" value="120" readonly>
-                    <small class="form-text">Fixed at 120 data points</small>
+                    <input type="number" id="pred-len" value="120" min="1" max="512">
+                    <small class="form-text">Number of data points to predict</small>
                 </div>
 
                 <!-- Prediction Quality Parameters -->
@@ -907,48 +907,70 @@
         function updateStartHandle(percentage) {
             const startHandle = document.getElementById('start-handle');
             const selection = document.getElementById('slider-selection');
-            
-            // Fixed window size of 520 data points
-            const windowSize = 520;
-            const totalRows = sliderData ? sliderData.totalRows : 1000;
-            const windowPercentage = windowSize / totalRows;
-            
-            // Ensure start handle doesn't cause window to exceed data range
-            if (percentage + windowPercentage > 1) {
-                percentage = 1 - windowPercentage;
-            }
-            
-            startHandle.style.left = (percentage * 100) + '%';
-            selection.style.left = (percentage * 100) + '%';
-            selection.style.width = (windowPercentage * 100) + '%';
-            
-            // Automatically adjust end handle position to maintain fixed window size
             const endHandle = document.getElementById('end-handle');
-            endHandle.style.left = ((percentage + windowPercentage) * 100) + '%';
+            const totalRows = sliderData ? sliderData.totalRows : 1000;
+
+            const lookback = parseInt(document.getElementById('lookback').value) || 400;
+            const predLen = parseInt(document.getElementById('pred-len').value) || 120;
+            const minWindowPercentage = (lookback + predLen) / totalRows;
+
+            // Get current end handle position
+            const endPercentage = parseFloat(endHandle.style.left) / 100 || (percentage + minWindowPercentage);
+            const currentWindowPercentage = endPercentage - percentage;
+
+            // Ensure minimum window size
+            if (currentWindowPercentage < minWindowPercentage) {
+                // Push end handle forward to maintain minimum size
+                const newEndPercentage = percentage + minWindowPercentage;
+                if (newEndPercentage > 1) {
+                    percentage = 1 - minWindowPercentage;
+                    endHandle.style.left = '100%';
+                } else {
+                    endHandle.style.left = (newEndPercentage * 100) + '%';
+                }
+            }
+
+            if (percentage < 0) percentage = 0;
+
+            startHandle.style.left = (percentage * 100) + '%';
+            const finalEndPercentage = parseFloat(endHandle.style.left) / 100;
+            selection.style.left = (percentage * 100) + '%';
+            selection.style.width = ((finalEndPercentage - percentage) * 100) + '%';
         }
 
         // Update end handle position
         function updateEndHandle(percentage) {
             const endHandle = document.getElementById('end-handle');
             const selection = document.getElementById('slider-selection');
-            
-            // Fixed window size of 520 data points
-            const windowSize = 520;
-            const totalRows = sliderData ? sliderData.totalRows : 1000;
-            const windowPercentage = windowSize / totalRows;
-            
-            // Ensure end handle doesn't cause window to exceed data range
-            if (percentage - windowPercentage < 0) {
-                percentage = windowPercentage;
-            }
-            
-            endHandle.style.left = (percentage * 100) + '%';
-            selection.style.left = ((percentage - windowPercentage) * 100) + '%';
-            selection.style.width = (windowPercentage * 100) + '%';
-            
-            // Automatically adjust start handle position to maintain fixed window size
             const startHandle = document.getElementById('start-handle');
-            startHandle.style.left = ((percentage - windowPercentage) * 100) + '%';
+            const totalRows = sliderData ? sliderData.totalRows : 1000;
+
+            const lookback = parseInt(document.getElementById('lookback').value) || 400;
+            const predLen = parseInt(document.getElementById('pred-len').value) || 120;
+            const minWindowPercentage = (lookback + predLen) / totalRows;
+
+            // Get current start handle position
+            const startPercentage = parseFloat(startHandle.style.left) / 100 || 0;
+            const currentWindowPercentage = percentage - startPercentage;
+
+            // Ensure minimum window size
+            if (currentWindowPercentage < minWindowPercentage) {
+                // Push start handle backward to maintain minimum size
+                const newStartPercentage = percentage - minWindowPercentage;
+                if (newStartPercentage < 0) {
+                    startHandle.style.left = '0%';
+                    percentage = minWindowPercentage;
+                } else {
+                    startHandle.style.left = (newStartPercentage * 100) + '%';
+                }
+            }
+
+            if (percentage > 1) percentage = 1;
+
+            endHandle.style.left = (percentage * 100) + '%';
+            const finalStartPercentage = parseFloat(startHandle.style.left) / 100;
+            selection.style.left = (finalStartPercentage * 100) + '%';
+            selection.style.width = ((percentage - finalStartPercentage) * 100) + '%';
         }
 
         // Update slider display based on handle positions
@@ -972,13 +994,11 @@
             // Update display information
             document.getElementById('window-start').textContent = `Start: ${startDate.toLocaleDateString()}`;
             document.getElementById('window-end').textContent = `End: ${endDate.toLocaleDateString()}`;
-            
-            // Display fixed window size
-            document.getElementById('window-size').textContent = `Window Size: 400 + 120 = 520 data points (fixed)`;
-            
-            // Input field values remain fixed
-            document.getElementById('lookback').value = 400;
-            document.getElementById('pred-len').value = 120;
+
+            // Display window size
+            const lookback = parseInt(document.getElementById('lookback').value) || 400;
+            const predLen = parseInt(document.getElementById('pred-len').value) || 120;
+            document.getElementById('window-size').textContent = `Window Size: ${lookback} + ${predLen} = ${lookback + predLen} data points`;
         }
 
         // Update slider based on input fields
@@ -986,8 +1006,8 @@
             if (!sliderData) return;
             
             // Fixed window size: 400 + 120 = 520 data points
-            const lookback = 400;
-            const predLen = 120;
+            const lookback = parseInt(document.getElementById('lookback').value) || 400;
+            const predLen = parseInt(document.getElementById('pred-len').value) || 120;
             const windowSize = lookback + predLen; // Fixed at 520
             
             // Calculate slider position
