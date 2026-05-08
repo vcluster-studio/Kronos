@@ -74,6 +74,8 @@ DataFrame 必须包含：
 ### guide/ — 使用指南
 - [installation.md](docs/guide/installation.md) - 安装指南
 - [quick-start.md](docs/guide/quick-start.md) - 快速开始
+- [kronos-quant-usage.md](docs/guide/kronos-quant-usage.md) - 量化使用手册
+- [full-a-share-finetune.md](docs/guide/full-a-share-finetune.md) - 全 A 股微调训练方案
 
 ### reference/ — 参考文档
 - [api-reference.md](docs/reference/api-reference.md) - API参考
