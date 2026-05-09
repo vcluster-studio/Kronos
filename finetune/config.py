@@ -3,115 +3,106 @@ import os
 class Config:
     """
     Configuration class for the entire project.
+    All paths are relative to project root - run scripts from project root directory.
     """
 
     def __init__(self):
+        # Project root directory (Kronos/)
+        self.project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
         # =================================================================
         # Data & Feature Parameters
         # =================================================================
-        # TODO: Update this path to your Qlib data directory.
-        self.qlib_data_path = "~/.qlib/qlib_data/cn_data"
-        self.instrument = 'csi300'
+        self.qlib_data_path = "~/.qlib/qlib_data/cn_data"  # Not used for CSV preprocessing
+        self.instrument = 'main_board'
 
-        # Overall time range for data loading from Qlib.
-        self.dataset_begin_time = "2011-01-01"
-        self.dataset_end_time = '2025-06-05'
+        # Overall time range
+        self.dataset_begin_time = "2017-10-01"
+        self.dataset_end_time = '2026-05-07'
 
-        # Sliding window parameters for creating samples.
-        self.lookback_window = 90  # Number of past time steps for input.
-        self.predict_window = 10  # Number of future time steps for prediction.
-        self.max_context = 512  # Maximum context length for the model.
+        # Sliding window parameters
+        self.lookback_window = 90
+        self.predict_window = 10
+        self.max_context = 512
 
-        # Features to be used from the raw data.
+        # Features
         self.feature_list = ['open', 'high', 'low', 'close', 'vol', 'amt']
-        # Time-based features to be generated.
         self.time_feature_list = ['minute', 'hour', 'weekday', 'day', 'month']
 
         # =================================================================
         # Dataset Splitting & Paths
         # =================================================================
-        # Note: The validation/test set starts earlier than the training/validation set ends
-        # to account for the `lookback_window`.
-        self.train_time_range = ["2011-01-01", "2022-12-31"]
-        self.val_time_range = ["2022-09-01", "2024-06-30"]
-        self.test_time_range = ["2024-04-01", "2025-06-05"]
-        self.backtest_time_range = ["2024-07-01", "2025-06-05"]
+        self.train_time_range = ["2018-01-02", "2024-12-31"]
+        self.val_time_range = ["2025-01-02", "2025-06-30"]
+        self.test_time_range = ["2025-07-01", "2026-05-07"]
+        self.backtest_time_range = ["2025-07-01", "2026-05-07"]
 
-        # TODO: Directory to save the processed, pickled datasets.
-        self.dataset_path = "./data/processed_datasets"
+        # Paths (relative to project root)
+        self.dataset_path = os.path.join(self.project_root, "finetune", "data", "processed_datasets")
 
         # =================================================================
-        # Training Hyperparameters
+        # Training Hyperparameters (OPTIMIZED CONFIG v2)
         # =================================================================
-        self.clip = 5.0  # Clipping value for normalized data to prevent outliers.
+        self.clip = 5.0
 
-        self.epochs = 30
-        self.log_interval = 100  # Log training status every N batches.
-        self.batch_size = 50  # Batch size per GPU.
+        # === 优化后的训练配置 ===
+        self.epochs = 30                   # 正常训练轮数
+        self.log_interval = 100            # 每100步打印日志
+        self.batch_size = 8                # 适应 2GB 显存
 
-        # Number of samples to draw for one "epoch" of training/validation.
-        # This is useful for large datasets where a true epoch is too long.
-        self.n_train_iter = 2000 * self.batch_size
-        self.n_val_iter = 400 * self.batch_size
+        # === 优化：增加训练样本量 ===
+        self.n_train_iter = 5000 * self.batch_size   # 原值 3000，增加到 5000（每轮 40000 样本）
+        self.n_val_iter = 800 * self.batch_size      # 原值 500，增加到 800（每轮 6400 样本）
 
-        # Learning rates for different model components.
+        # Learning rates
         self.tokenizer_learning_rate = 2e-4
-        self.predictor_learning_rate = 4e-5
+        # === 优化：降低预测器学习率，防止过拟合 ===
+        self.predictor_learning_rate = 1e-5          # 原值 4e-5，降低 4 倍
 
-        # Gradient accumulation to simulate a larger batch size.
         self.accumulation_steps = 1
-
-        # AdamW optimizer parameters.
         self.adam_beta1 = 0.9
         self.adam_beta2 = 0.95
         self.adam_weight_decay = 0.1
-
-        # Miscellaneous
-        self.seed = 100  # Global random seed for reproducibility.
+        self.seed = 100
 
         # =================================================================
         # Experiment Logging & Saving
         # =================================================================
-        self.use_comet = True # Set to False if you don't want to use Comet ML
+        self.use_comet = False
         self.comet_config = {
-            # It is highly recommended to load secrets from environment variables
-            # for security purposes. Example: os.getenv("COMET_API_KEY")
             "api_key": "YOUR_COMET_API_KEY",
-            "project_name": "Kronos-Finetune-Demo",
-            "workspace": "your_comet_workspace" # TODO: Change to your Comet ML workspace name
+            "project_name": "Kronos-A-Share-Finetune",
+            "workspace": "your_comet_workspace"
         }
-        self.comet_tag = 'finetune_demo'
-        self.comet_name = 'finetune_demo'
+        self.comet_tag = 'a_share_main_board'
+        self.comet_name = 'a_share_main_board_finetune'
 
-        # Base directory for saving model checkpoints and results.
-        # Using a general 'outputs' directory is a common practice.
-        self.save_path = "./outputs/models"
-        self.tokenizer_save_folder_name = 'finetune_tokenizer_demo'
-        self.predictor_save_folder_name = 'finetune_predictor_demo'
-        self.backtest_save_folder_name = 'finetune_backtest_demo'
-
-        # Path for backtesting results.
-        self.backtest_result_path = "./outputs/backtest_results"
+        # Save paths
+        self.save_path = os.path.join(self.project_root, "outputs", "models")
+        self.tokenizer_save_folder_name = 'a_share_tokenizer_v2'    # v2 版本，优化后
+        self.predictor_save_folder_name = 'a_share_predictor_v2'    # v2 版本，优化后
+        self.backtest_save_folder_name = 'a_share_backtest_v2'
+        self.backtest_result_path = os.path.join(self.project_root, "outputs", "backtest_results")
 
         # =================================================================
         # Model & Checkpoint Paths
         # =================================================================
-        # TODO: Update these paths to your pretrained model locations.
-        # These can be local paths or Hugging Face Hub model identifiers.
-        self.pretrained_tokenizer_path = "path/to/your/Kronos-Tokenizer-base"
-        self.pretrained_predictor_path = "path/to/your/Kronos-small"
+        # Pretrained models
+        self.pretrained_tokenizer_path = os.path.join(self.project_root, "pretrained", "Kronos-Tokenizer-base")
+        self.pretrained_predictor_path = os.path.join(self.project_root, "pretrained", "Kronos-small")
 
-        # Paths to the fine-tuned models, derived from the save_path.
-        # These will be generated automatically during training.
-        self.finetuned_tokenizer_path = f"{self.save_path}/{self.tokenizer_save_folder_name}/checkpoints/best_model"
-        self.finetuned_predictor_path = f"{self.save_path}/{self.predictor_save_folder_name}/checkpoints/best_model"
+        # Fine-tuned models (output)
+        # 分词器用之前训练好的版本（已收敛）
+        self.finetuned_tokenizer_path = os.path.join(self.save_path, "a_share_tokenizer", "checkpoints", "best_model")
+        # 预测器是新版本（优化后）
+        self.finetuned_predictor_path = os.path.join(self.save_path, self.predictor_save_folder_name, "checkpoints", "best_model")
 
         # =================================================================
         # Backtesting Parameters
         # =================================================================
-        self.backtest_n_symbol_hold = 50  # Number of symbols to hold in the portfolio.
-        self.backtest_n_symbol_drop = 5  # Number of symbols to drop from the pool.
-        self.backtest_hold_thresh = 5  # Minimum holding period for a stock.
+        self.backtest_n_symbol_hold = 50
+        self.backtest_n_symbol_drop = 5
+        self.backtest_hold_thresh = 5
         self.inference_T = 0.6
         self.inference_top_p = 0.9
         self.inference_top_k = 0
@@ -124,8 +115,6 @@ class Config:
             'csi800': "SH000906",
             'csi1000': "SH000852",
             'csi300': "SH000300",
+            'main_board': "SH000300",
         }
-        if instrument in dt_benchmark:
-            return dt_benchmark[instrument]
-        else:
-            raise ValueError(f"Benchmark not defined for instrument: {instrument}")
+        return dt_benchmark.get(instrument, "SH000300")

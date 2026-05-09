@@ -1,9 +1,17 @@
+import os
+import sys
 import pickle
 import random
 import numpy as np
 import torch
 from torch.utils.data import Dataset
-from config import Config
+
+# Add project root to path
+script_dir = os.path.dirname(os.path.abspath(__file__))
+project_root = os.path.dirname(script_dir)
+sys.path.insert(0, project_root)
+
+from finetune.config import Config
 
 
 class QlibDataset(Dataset):
