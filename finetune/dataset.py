@@ -21,6 +21,8 @@ class QlibDataset(Dataset):
     This dataset pre-computes all possible start indices for sliding windows
     and then randomly samples from them during training/validation.
 
+    支持分层采样：按股票类型（大盘/中盘/小盘）均衡采样。
+
     Args:
         data_type (str): The type of dataset to load, either 'train' or 'val'.
 
@@ -49,14 +51,31 @@ class QlibDataset(Dataset):
         with open(self.data_path, 'rb') as f:
             self.data = pickle.load(f)
 
+        # === 加载股票分类信息 ===
+        categories_path = f"{self.config.dataset_path}/stock_categories.pkl"
+        if os.path.exists(categories_path):
+            with open(categories_path, 'rb') as f:
+                self.stock_categories = pickle.load(f)
+            self.use_stratified_sampling = True
+        else:
+            self.stock_categories = {}
+            self.use_stratified_sampling = False
+
         self.window = self.config.lookback_window + self.config.predict_window + 1
 
         self.symbols = list(self.data.keys())
         self.feature_list = self.config.feature_list
         self.time_feature_list = self.config.time_feature_list
 
-        # Pre-compute all possible (symbol, start_index) pairs.
-        self.indices = []
+        # === 分层索引构建 ===
+        # 按股票类型分组索引
+        self.category_indices = {
+            'large': [],   # 大盘股
+            'mid': [],     # 中盘股
+            'small': []    # 小盘股
+        }
+        self.indices = []  # 全部索引（兼容旧逻辑）
+
         print(f"[{data_type.upper()}] Pre-computing sample indices...")
         for symbol in self.symbols:
             df = self.data[symbol].reset_index()
@@ -75,11 +94,23 @@ class QlibDataset(Dataset):
 
                 # Add all valid starting indices for this symbol to the global list.
                 for i in range(num_samples):
-                    self.indices.append((symbol, i))
+                    idx_tuple = (symbol, i)
+                    self.indices.append(idx_tuple)
+
+                    # === 添加到分类索引 ===
+                    category = self.stock_categories.get(symbol, 'mid')  # 默认为中盘股
+                    self.category_indices[category].append(idx_tuple)
 
         # The effective dataset size is the minimum of the configured iterations
         # and the total number of available samples.
         self.n_samples = min(self.n_samples, len(self.indices))
+
+        # 打印分层统计
+        if self.use_stratified_sampling:
+            print(f"[{data_type.upper()}] Stratified indices:")
+            for cat, indices in self.category_indices.items():
+                print(f"  - {cat}: {len(indices)} samples ({len(indices)/len(self.indices)*100:.1f}%)")
+
         print(f"[{data_type.upper()}] Found {len(self.indices)} possible samples. Using {self.n_samples} per epoch.")
 
     def set_epoch_seed(self, epoch: int):
@@ -98,10 +129,30 @@ class QlibDataset(Dataset):
         return self.n_samples
 
     def __getitem__(self, idx: int) -> tuple[torch.Tensor, torch.Tensor]:
-        
-        # Select a random sample from the entire pool of indices.
-        random_idx = self.py_rng.randint(0, len(self.indices) - 1)
-        symbol, start_idx = self.indices[random_idx]
+
+        # === 分层采样：每类股票均衡采样 ===
+        if self.use_stratified_sampling:
+            # 随机选择一个分类（均匀选择）
+            categories = ['large', 'mid', 'small']
+            # 检查每个分类是否有样本
+            valid_categories = [cat for cat in categories if len(self.category_indices[cat]) > 0]
+
+            if len(valid_categories) > 0:
+                # 均匀选择分类
+                selected_category = self.py_rng.choice(valid_categories)
+
+                # 从选中的分类中随机选择一个样本
+                cat_indices = self.category_indices[selected_category]
+                random_idx = self.py_rng.randint(0, len(cat_indices) - 1)
+                symbol, start_idx = cat_indices[random_idx]
+            else:
+                # 降级为普通随机采样
+                random_idx = self.py_rng.randint(0, len(self.indices) - 1)
+                symbol, start_idx = self.indices[random_idx]
+        else:
+            # 不分层时，普通随机采样
+            random_idx = self.py_rng.randint(0, len(self.indices) - 1)
+            symbol, start_idx = self.indices[random_idx]
 
         # Extract the sliding window from the dataframe.
         df = self.data[symbol]
@@ -128,7 +179,18 @@ class QlibDataset(Dataset):
         x_tensor = torch.from_numpy(x)
         x_stamp_tensor = torch.from_numpy(x_stamp)
 
-        return x_tensor, x_stamp_tensor
+        # === 返回用于方向损失的信息 ===
+        # 原始 close 价格的涨跌方向
+        # close 列是第 3 列（open, high, low, close, vol, amt）
+        original_close = win_df['close'].values
+        lookback_close_mean = np.mean(original_close[:past_len])
+        pred_close_end = original_close[past_len + self.config.predict_window - 1]
+
+        # 涨跌方向：True = 涨，False = 跌
+        direction = pred_close_end > lookback_close_mean
+        direction_tensor = torch.tensor(direction, dtype=torch.float32)
+
+        return x_tensor, x_stamp_tensor, direction_tensor
 
 
 if __name__ == '__main__':

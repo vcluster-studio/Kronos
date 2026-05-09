@@ -212,6 +212,7 @@ class CSVDataPreprocessor:
     def prepare_dataset(self, data: dict):
         """
         按时间范围划分数据集并保存。
+        同时计算股票分类（大盘/中盘/小盘）用于分层采样。
         """
         print("\n" + "=" * 60)
         print("Splitting data into train, validation, and test sets...")
@@ -230,7 +231,37 @@ class CSVDataPreprocessor:
 
         min_samples = self.config.lookback_window + self.config.predict_window + 1
 
+        # === 计算股票分类（按成交额） ===
+        stock_categories = {}  # {symbol: 'large'/'mid'/'small'}
+        category_stats = {'large': 0, 'mid': 0, 'small': 0}
+
         symbols = list(data.keys())
+        for i in trange(len(symbols), desc="Computing stock categories"):
+            symbol = symbols[i]
+            df = data[symbol]
+
+            # 计算平均日成交额
+            avg_amount = df['amt'].mean()
+
+            # 分类标准
+            if avg_amount > 1e9:  # > 10亿
+                stock_categories[symbol] = 'large'
+                category_stats['large'] += 1
+            elif avg_amount >= 1e8:  # 1-10亿
+                stock_categories[symbol] = 'mid'
+                category_stats['mid'] += 1
+            else:  # < 1亿
+                stock_categories[symbol] = 'small'
+                category_stats['small'] += 1
+
+        print("\n" + "-" * 60)
+        print("Stock category distribution (by avg daily amount):")
+        print(f"  Large cap (> 10亿):  {category_stats['large']:5d} stocks")
+        print(f"  Mid cap (1-10亿):    {category_stats['mid']:5d} stocks")
+        print(f"  Small cap (< 1亿):   {category_stats['small']:5d} stocks")
+        print("-" * 60)
+
+        # 划分数据集
         for i in trange(len(symbols), desc="Splitting datasets"):
             symbol = symbols[i]
             df = data[symbol]
@@ -274,6 +305,11 @@ class CSVDataPreprocessor:
             pickle.dump(val_data, f)
         with open(f"{self.config.dataset_path}/test_data.pkl", 'wb') as f:
             pickle.dump(test_data, f)
+
+        # === 保存股票分类信息 ===
+        with open(f"{self.config.dataset_path}/stock_categories.pkl", 'wb') as f:
+            pickle.dump(stock_categories, f)
+        print(f"Stock categories saved to: {self.config.dataset_path}/stock_categories.pkl")
 
         print(f"\nDatasets saved to: {self.config.dataset_path}")
 
