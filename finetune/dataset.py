@@ -193,6 +193,10 @@ class QlibDataset(Dataset):
             rolling_std = np.where(np.isnan(rolling_std), 1e-5, rolling_std)
             rolling_std = np.where(rolling_std < 1e-5, 1e-5, rolling_std)
 
+            # 确保数据类型一致（float32）
+            rolling_mean = rolling_mean.astype(np.float32)
+            rolling_std = rolling_std.astype(np.float32)
+
             x_norm = (x - rolling_mean) / rolling_std
             x = np.clip(x_norm, -self.config.clip, self.config.clip)
 
