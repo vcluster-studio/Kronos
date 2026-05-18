@@ -157,68 +157,47 @@ class QlibDataset(Dataset):
         # === 归一化模式选择 ===
         # norm_mode: 'full_window' - 全窗口归一化（pretrained原始方式）
         #            'sliding_ma60' - 滑动MA60归一化（每个点看自己的前60步）
+        #            'sliding_ma20' - 滑动MA20归一化（每个点看自己的前20步）
         past_len = self.config.lookback_window
         norm_mode = getattr(self.config, 'norm_mode', 'full_window')
 
         if norm_mode == 'full_window':
             # 全窗口归一化：使用整个lookback窗口的mean/std
-            # 这是原始pretrained模型的归一化方式
             past_x = x[:past_len]
             x_mean = np.mean(past_x, axis=0)
             x_std = np.std(past_x, axis=0) + 1e-5
-
-            # 对整个序列（lookback + predict + 1）应用统一的归一化
             x = (x - x_mean) / x_std
             x = np.clip(x, -self.config.clip, self.config.clip)
 
-        elif norm_mode == 'sliding_ma60':
-            # 滑动MA60归一化：每个点根据自己的前60步计算MA
-            # 更符合实际交易者视角：每一步看自己"过去60个交易日"的基准
-            ma_window = 60
+        elif norm_mode.startswith('sliding_ma'):
+            # 滑动MA归一化（向量化实现）：每个点根据自己的前N步计算mean/std
+            # 从norm_mode中提取窗口大小，如 'sliding_ma60' -> 60
+            ma_window = int(norm_mode.split('_ma')[-1])
 
-            x_norm = np.zeros_like(x)
-            for t in range(len(x)):
-                # 当前时间点的前60步（如果不足60则用全部可用的）
-                start_idx = max(0, t - ma_window)
-                window_data = x[start_idx:t]
+            # 使用 pandas rolling 实现向量化滑动计算
+            # 注意：要看当前点"之前"的数据，用 shift(1) 排除当前点
+            import pandas as pd
+            df = pd.DataFrame(x)
 
-                if len(window_data) == 0:
-                    # 第一个点没有历史，用自身作为基准
-                    x_mean_t = x[t]
-                    x_std_t = np.ones(6) * 1e-5
-                else:
-                    x_mean_t = np.mean(window_data, axis=0)
-                    x_std_t = np.std(window_data, axis=0) + 1e-5
+            # shift(1) 让 rolling 只看前面N步（不包括当前点）
+            df_shifted = df.shift(1)
+            # ddof=0 与 numpy.std 默认行为一致
+            rolling_mean = df_shifted.rolling(window=ma_window, min_periods=1).mean().values.copy()
+            rolling_std = df_shifted.rolling(window=ma_window, min_periods=1).std(ddof=0).values.copy()
 
-                x_norm[t] = (x[t] - x_mean_t) / x_std_t
+            # 第一个点没有历史数据，用自身作为mean，std=1e-5
+            rolling_mean[0] = x[0]
+            rolling_std[0] = 1e-5
 
-            x = np.clip(x_norm, -self.config.clip, self.config.clip)
+            # 处理 std=0 或 NaN 的情况
+            rolling_std = np.where(np.isnan(rolling_std), 1e-5, rolling_std)
+            rolling_std = np.where(rolling_std < 1e-5, 1e-5, rolling_std)
 
-        elif norm_mode == 'sliding_ma20':
-            # 滑动MA20归一化：每个点根据自己的前20步计算MA
-            # 每一步看自己"过去20个交易日"的基准（月线级别）
-            ma_window = 20
-
-            x_norm = np.zeros_like(x)
-            for t in range(len(x)):
-                # 当前时间点的前20步（如果不足20则用全部可用的）
-                start_idx = max(0, t - ma_window)
-                window_data = x[start_idx:t]
-
-                if len(window_data) == 0:
-                    # 第一个点没有历史，用自身作为基准
-                    x_mean_t = x[t]
-                    x_std_t = np.ones(6) * 1e-5
-                else:
-                    x_mean_t = np.mean(window_data, axis=0)
-                    x_std_t = np.std(window_data, axis=0) + 1e-5
-
-                x_norm[t] = (x[t] - x_mean_t) / x_std_t
-
+            x_norm = (x - rolling_mean) / rolling_std
             x = np.clip(x_norm, -self.config.clip, self.config.clip)
 
         else:
-            raise ValueError(f"Unknown norm_mode: {norm_mode}. Use 'full_window', 'sliding_ma60', or 'sliding_ma20'")
+            raise ValueError(f"Unknown norm_mode: {norm_mode}. Use 'full_window' or 'sliding_ma{N}'")
 
         # Convert to PyTorch tensors.
         x_tensor = torch.from_numpy(x)
