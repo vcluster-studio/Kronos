@@ -33,9 +33,12 @@ class CSVDataPreprocessor:
     3. 排除次新股（上市不足 1 年）
     4. 排除流动性差的股票（日均成交额 < 5000 万）
     5. 排除停牌过多的股票（缺失数据 > 30%）
+
+    支持按股票类别筛选：
+    - exclude_categories: 要排除的类别列表，如 ['large'] 表示只保留 mid+small
     """
 
-    def __init__(self):
+    def __init__(self, exclude_categories=None, output_dir=None, args=None):
         self.config = Config()
         self.feature_list = ['open', 'high', 'low', 'close', 'vol', 'amt']
 
@@ -43,6 +46,25 @@ class CSVDataPreprocessor:
         self.min_amount = 50_000_000  # 日均成交额阈值：5000 万
         self.min_list_days = 250       # 最小上市天数：约 1 年
         self.max_gap_ratio = 0.30      # 最大允许缺失比例
+
+        # 类别筛选
+        self.exclude_categories = exclude_categories or []  # 要排除的类别
+
+        # 输出目录（可自定义）
+        if output_dir:
+            self.config.dataset_path = output_dir
+        elif args and hasattr(args, 'output') and args.output:
+            # 使用命令行指定的输出目录名
+            self.config.dataset_path = os.path.join(
+                os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                "finetune", "data", args.output
+            )
+        elif exclude_categories:
+            # 排除 large 时自动使用 mid_small 目录
+            self.config.dataset_path = os.path.join(
+                os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                "finetune", "data", "processed_datasets_mid_small"
+            )
 
     def is_main_board(self, symbol: str) -> bool:
         """
@@ -211,80 +233,91 @@ class CSVDataPreprocessor:
 
     def prepare_dataset(self, data: dict):
         """
-        按时间范围划分数据集并保存。
-        同时计算股票分类（大盘/中盘/小盘）用于分层采样。
+        按股票内部时间序列划分数据集。
+
+        每只股票从后向前划分：
+        - 测试集：最后 411 步（或更多）
+        - 验证集：倒数第 412-822 步
+        - 训练集：剩余部分
+
+        这样保证每个集合都有足够长度（>=411步）。
         """
         print("\n" + "=" * 60)
         print("Splitting data into train, validation, and test sets...")
+        print("Strategy: Split within each stock (last 411 for test, prev 411 for val)")
         print("=" * 60)
 
         train_data, val_data, test_data = {}, {}, {}
-
-        # 时间范围
-        train_start, train_end = self.config.train_time_range
-        val_start, val_end = self.config.val_time_range
-        test_start, test_end = self.config.test_time_range
-
-        print(f"  Train: {train_start} ~ {train_end}")
-        print(f"  Val:   {val_start} ~ {val_end}")
-        print(f"  Test:  {test_start} ~ {test_end}")
-
-        min_samples = self.config.lookback_window + self.config.predict_window + 1
+        min_samples = self.config.lookback_window + self.config.predict_window + 1  # 411
 
         # === 计算股票分类（按成交额） ===
-        stock_categories = {}  # {symbol: 'large'/'mid'/'small'}
+        stock_categories = {}
         category_stats = {'large': 0, 'mid': 0, 'small': 0}
 
         symbols = list(data.keys())
         for i in trange(len(symbols), desc="Computing stock categories"):
             symbol = symbols[i]
             df = data[symbol]
-
-            # 计算平均日成交额
             avg_amount = df['amt'].mean()
 
-            # 分类标准
-            if avg_amount > 1e9:  # > 10亿
+            if avg_amount > 1e9:
                 stock_categories[symbol] = 'large'
                 category_stats['large'] += 1
-            elif avg_amount >= 1e8:  # 1-10亿
+            elif avg_amount >= 1e8:
                 stock_categories[symbol] = 'mid'
                 category_stats['mid'] += 1
-            else:  # < 1亿
+            else:
                 stock_categories[symbol] = 'small'
                 category_stats['small'] += 1
 
         print("\n" + "-" * 60)
-        print("Stock category distribution (by avg daily amount):")
-        print(f"  Large cap (> 10亿):  {category_stats['large']:5d} stocks")
-        print(f"  Mid cap (1-10亿):    {category_stats['mid']:5d} stocks")
-        print(f"  Small cap (< 1亿):   {category_stats['small']:5d} stocks")
+        print("Stock category distribution:")
+        print(f"  Large cap (> 10亿):  {category_stats['large']:5d}")
+        print(f"  Mid cap (1-10亿):    {category_stats['mid']:5d}")
+        print(f"  Small cap (< 1亿):   {category_stats['small']:5d}")
+        if self.exclude_categories:
+            print(f"\n  Excluding: {self.exclude_categories}")
         print("-" * 60)
 
-        # 划分数据集
+        # 按股票内部划分
+        excluded_by_category = {'large': 0, 'mid': 0, 'small': 0}
+        skipped_short = 0
+
         for i in trange(len(symbols), desc="Splitting datasets"):
             symbol = symbols[i]
             df = data[symbol]
 
-            # 创建时间掩码
-            train_mask = (df.index >= train_start) & (df.index <= train_end)
-            val_mask = (df.index >= val_start) & (df.index <= val_end)
-            test_mask = (df.index >= test_start) & (df.index <= test_end)
+            # 类别筛选
+            category = stock_categories.get(symbol, 'mid')
+            if category in self.exclude_categories:
+                excluded_by_category[category] += 1
+                continue
 
-            # 应用掩码
-            train_df = df[train_mask]
-            val_df = df[val_mask]
-            test_df = df[test_mask]
+            total_len = len(df)
 
-            # 只保留有足够数据的股票
-            if len(train_df) >= min_samples:
-                train_data[symbol] = train_df
-            if len(val_df) >= min_samples:
-                val_data[symbol] = val_df
-            if len(test_df) >= min_samples:
-                test_data[symbol] = test_df
+            # 需要至少 3 * min_samples 才能分成三份
+            if total_len < 3 * min_samples:
+                skipped_short += 1
+                continue
 
-        # 统计信息
+            # 从后向前划分
+            test_df = df.iloc[-min_samples:]  # 最后 411 步
+            val_df = df.iloc[-2*min_samples:-min_samples]  # 倒数第 412-822 步
+            train_df = df.iloc[:-2*min_samples]  # 前面部分
+
+            train_data[symbol] = train_df
+            val_data[symbol] = val_df
+            test_data[symbol] = test_df
+
+        # 统计
+        if self.exclude_categories:
+            print(f"\nExcluded by category:")
+            for cat in self.exclude_categories:
+                print(f"  {cat}: {excluded_by_category[cat]}")
+
+        if skipped_short > 0:
+            print(f"\nSkipped (too short, < {3*min_samples} steps): {skipped_short}")
+
         train_samples = sum(len(df) for df in train_data.values())
         val_samples = sum(len(df) for df in val_data.values())
         test_samples = sum(len(df) for df in test_data.values())
@@ -294,9 +327,15 @@ class CSVDataPreprocessor:
         print(f"  Train: {len(train_data):5d} stocks, {train_samples:10d} samples")
         print(f"  Val:   {len(val_data):5d} stocks, {val_samples:10d} samples")
         print(f"  Test:  {len(test_data):5d} stocks, {test_samples:10d} samples")
+
+        # 检查长度
+        for name, dataset in [('Train', train_data), ('Val', val_data), ('Test', test_data)]:
+            lengths = [len(df) for df in dataset.values()]
+            if lengths:
+                print(f"  {name} lengths: min={min(lengths)}, max={max(lengths)}")
         print("-" * 60)
 
-        # 保存数据集
+        # 保存
         os.makedirs(self.config.dataset_path, exist_ok=True)
 
         with open(f"{self.config.dataset_path}/train_data.pkl", 'wb') as f:
@@ -306,10 +345,13 @@ class CSVDataPreprocessor:
         with open(f"{self.config.dataset_path}/test_data.pkl", 'wb') as f:
             pickle.dump(test_data, f)
 
-        # === 保存股票分类信息 ===
+        # 保存股票分类
+        final_stock_categories = {
+            symbol: category for symbol, category in stock_categories.items()
+            if category not in self.exclude_categories and symbol in train_data
+        }
         with open(f"{self.config.dataset_path}/stock_categories.pkl", 'wb') as f:
-            pickle.dump(stock_categories, f)
-        print(f"Stock categories saved to: {self.config.dataset_path}/stock_categories.pkl")
+            pickle.dump(final_stock_categories, f)
 
         print(f"\nDatasets saved to: {self.config.dataset_path}")
 
@@ -317,9 +359,13 @@ class CSVDataPreprocessor:
         """
         运行完整的数据预处理流程。
         """
+        strategy_name = "Pure Main Board"
+        if self.exclude_categories:
+            strategy_name += f" (excluding {self.exclude_categories})"
+
         print("\n" + "=" * 60)
         print("Kronos A-Share Data Preprocessing")
-        print("Strategy: Pure Main Board Model")
+        print(f"Strategy: {strategy_name}")
         print("=" * 60)
 
         # 1. 加载 CSV 数据
@@ -337,6 +383,15 @@ class CSVDataPreprocessor:
 
 
 if __name__ == '__main__':
+    import argparse
+
+    parser = argparse.ArgumentParser(description='CSV data preprocessing for Kronos')
+    parser.add_argument('--exclude', nargs='*', default=None,
+                        help='Categories to exclude (e.g., --exclude large)')
+    parser.add_argument('--output', type=str, default=None,
+                        help='Output directory name (e.g., processed_datasets_mid)')
+    args = parser.parse_args()
+
     # CSV 数据目录（从项目根目录计算）
     # 获取项目根目录（finetune 的上级目录）
     project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -350,5 +405,5 @@ if __name__ == '__main__':
         raise FileNotFoundError(f"CSV directory not found: {csv_dir}")
 
     # 运行预处理
-    preprocessor = CSVDataPreprocessor()
+    preprocessor = CSVDataPreprocessor(exclude_categories=args.exclude, args=args)
     preprocessor.run(csv_dir)

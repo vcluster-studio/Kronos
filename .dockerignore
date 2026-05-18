@@ -1,0 +1,71 @@
+# =============================================================================
+# .dockerignore - Exclude unnecessary files from Docker build context
+# =============================================================================
+
+# Git
+.git
+.gitignore
+
+# Python cache
+__pycache__
+*.pyc
+*.pyo
+*.pyd
+.Python
+
+# Virtual environments
+.venv
+venv
+env
+ENV
+
+# IDE
+.idea
+.vscode
+*.swp
+*.swo
+
+# Large data files (mounted as volumes, not baked into image)
+finetune_csv/
+finetune/data/
+outputs/
+logs/
+data/
+
+# Pretrained models (downloaded at runtime or mounted)
+pretrained/
+
+# Docker files themselves
+Dockerfile
+docker-compose.yml
+.dockerignore
+
+# Documentation (not needed for training)
+docs/
+figures/
+*.md
+!README.md
+
+# OS files
+.DS_Store
+Thumbs.db
+Desktop.ini
+
+# Jupyter
+.ipynb_checkpoints
+
+# Temp files
+*.tmp
+*.log
+*.pkl
+*.pth
+*.pt
+*.ckpt
+*.bin
+*.feather
+*.parquet
+*.h5
+*.hdf5
+
+# Claude Code
+.claude/
