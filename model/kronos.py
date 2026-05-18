@@ -176,6 +176,24 @@ class KronosTokenizer(nn.Module, PyTorchModelHubMixin):
         z = self.head(z)
         return z
 
+    def decode_from_bits(self, bits):
+        """
+        Decodes bits representation directly to features (bypasses indices_to_bits).
+        Used for soft decoding in training - allows gradient flow.
+
+        Args:
+            bits (torch.Tensor): Bits representation of shape (batch_size, seq_len, codebook_dim).
+                                 Should be bipolar [-1, 1] scaled by q_scale.
+
+        Returns:
+            torch.Tensor: Reconstructed features of shape (batch_size, seq_len, d_in).
+        """
+        z = self.post_quant_embed(bits)
+        for layer in self.decoder:
+            z = layer(z)
+        z = self.head(z)
+        return z
+
 
 class Kronos(nn.Module, PyTorchModelHubMixin):
     """
@@ -274,6 +292,33 @@ class Kronos(nn.Module, PyTorchModelHubMixin):
         x2 = self.dep_layer(x, sibling_embed, key_padding_mask=padding_mask) # Dependency Aware Layer: Condition on s1 embeddings
         s2_logits = self.head.cond_forward(x2)
         return s1_logits, s2_logits
+
+    def forward_with_hidden(self, s1_ids, s2_ids, stamp=None, padding_mask=None):
+        """
+        Forward pass that also returns hidden state for auxiliary tasks.
+        Used for close direction prediction (bypasses token decoding).
+
+        Args:
+            s1_ids, s2_ids, stamp, padding_mask: Same as forward()
+
+        Returns:
+            s1_logits, s2_logits, hidden_state (before head projection)
+        """
+        x = self.embedding([s1_ids, s2_ids])
+        if stamp is not None:
+            time_embedding = self.time_emb(stamp)
+            x = x + time_embedding
+        x = self.token_drop(x)
+
+        for layer in self.transformer:
+            x = layer(x, key_padding_mask=padding_mask)
+
+        x = self.norm(x)  # hidden state
+
+        s1_logits = self.head(x)
+        s2_logits = self.head.cond_forward(x)  # 简化版，不依赖 s1 采样
+
+        return s1_logits, s2_logits, x  # x is hidden state [batch, seq, d_model]
 
     def decode_s1(self, s1_ids, s2_ids, stamp=None, padding_mask=None):
         """
@@ -470,12 +515,23 @@ def auto_regressive_inference(tokenizer, model, x, x_stamp, y_stamp, max_context
 
 
 def calc_time_stamps(x_timestamp):
-    time_df = pd.DataFrame()
-    time_df['minute'] = x_timestamp.dt.minute
-    time_df['hour'] = x_timestamp.dt.hour
-    time_df['weekday'] = x_timestamp.dt.weekday
-    time_df['day'] = x_timestamp.dt.day
-    time_df['month'] = x_timestamp.dt.month
+    """Calculate time features from timestamps. Handles both DatetimeIndex and Series."""
+    # DatetimeIndex has direct attributes, Series needs .dt accessor
+    if isinstance(x_timestamp, pd.DatetimeIndex):
+        time_df = pd.DataFrame()
+        time_df['minute'] = x_timestamp.minute
+        time_df['hour'] = x_timestamp.hour
+        time_df['weekday'] = x_timestamp.weekday
+        time_df['day'] = x_timestamp.day
+        time_df['month'] = x_timestamp.month
+    else:
+        # Series or other types with .dt accessor
+        time_df = pd.DataFrame()
+        time_df['minute'] = x_timestamp.dt.minute
+        time_df['hour'] = x_timestamp.dt.hour
+        time_df['weekday'] = x_timestamp.dt.weekday
+        time_df['day'] = x_timestamp.dt.day
+        time_df['month'] = x_timestamp.dt.month
     return time_df
 
 
@@ -541,7 +597,8 @@ class KronosPredictor:
         x_stamp = x_time_df.values.astype(np.float32)
         y_stamp = y_time_df.values.astype(np.float32)
 
-        x_mean, x_std = np.mean(x, axis=0), np.std(x, axis=0)
+        # 全窗口归一化（原始pretrained方式）
+        x_mean, x_std = np.mean(x, axis=0), np.std(x, axis=0) + 1e-5
 
         x = (x - x_mean) / (x_std + 1e-5)
         x = np.clip(x, -self.clip, self.clip)
