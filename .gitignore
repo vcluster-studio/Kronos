@@ -78,8 +78,9 @@ tmp/
 docs/temp/
 .python-version
 
-# Finetune outputs (training results)
-outputs/
+# Finetune outputs (training results, but keep logs)
+outputs/models/
+!outputs/training_logs/
 
 # Finetune data (preprocessed datasets)
 finetune/data/
