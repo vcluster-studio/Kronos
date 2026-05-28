@@ -84,5 +84,12 @@ outputs/
 # Finetune data (preprocessed datasets)
 finetune/data/
 
-# Raw CSV data
-finetune_csv/exported_kline_data/
+# Raw data (SQL, CSV etc.)
+data/
+
+# Final model files (large, not in git)
+final_models/Kronos-*/
+final_models/training_scripts/
+
+# Final model docs (keep in git)
+!final_models/TRAINING_EXPERIENCE.md

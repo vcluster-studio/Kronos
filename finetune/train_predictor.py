@@ -150,9 +150,9 @@ def get_model_size(model):
     return sum(p.numel() for p in model.parameters()) / 1e6
 
 
-def quick_ic_test(model, tokenizer, device, test_data, n_samples=200, lookback=90, pred_len=10, ic_point=3):
+def quick_ic_test(model, tokenizer, device, val_data, n_samples=500, lookback=90, pred_len=10, ic_point=3, rng=None):
     """
-    快速 IC 测试（在训练过程中）
+    快速 IC 测试（在训练过程中，使用 val_data，随机采样）
 
     使用 auto_regressive_inference 进行真正的未来预测
 
@@ -161,6 +161,7 @@ def quick_ic_test(model, tokenizer, device, test_data, n_samples=200, lookback=9
     - 预测收益率：相对于基准值的变化
     - 实际收益率：相对于基准值的变化
     - ic_point: 计算哪个点的IC（默认3，即Point+3）
+    - rng: numpy RandomState，用于可复现的随机采样
 
     Returns:
         dict: { 'ic': float, 'rank_ic': float, 'direction_acc': float }
@@ -171,10 +172,14 @@ def quick_ic_test(model, tokenizer, device, test_data, n_samples=200, lookback=9
     predictions = []
     actuals = []
 
-    symbols = list(test_data.keys())[:n_samples]
+    all_symbols = list(val_data.keys())
+    if rng is not None:
+        symbols = rng.choice(all_symbols, size=min(n_samples, len(all_symbols)), replace=False).tolist()
+    else:
+        symbols = all_symbols[:n_samples]
 
     for symbol in symbols:
-        df = test_data[symbol]
+        df = val_data[symbol]
         if len(df) < lookback + pred_len:
             continue
 
@@ -291,7 +296,7 @@ def create_dataloader(dataset, config, data_type):
     return loader
 
 
-def train_model(model, tokenizer, device, config, save_dir, test_data=None):
+def train_model(model, tokenizer, device, config, save_dir, val_data=None):
     """训练模型，支持动态早停和周期性学习率"""
     start_time = time.time()
     print(f"BATCHSIZE: {config.batch_size}", flush=True)
@@ -474,18 +479,27 @@ def train_model(model, tokenizer, device, config, save_dir, test_data=None):
         history['val_loss'].append(avg_val_loss)
         val_loss_history.append(avg_val_loss)
 
-        # Quick IC test（在 LR 调整前执行）
-        ic_result = quick_ic_test(model.module, tokenizer, device, test_data,
-                                   n_samples=config.ic_test_samples, ic_point=config.ic_point)
+        # Quick IC test（在 LR 调整前执行，使用 val_data 随机采样）
+        ic_rng = np.random.RandomState(config.seed + epoch_idx * 9999)
+        ic_result = quick_ic_test(model.module, tokenizer, device, val_data,
+                                   n_samples=config.ic_test_samples, ic_point=config.ic_point,
+                                   rng=ic_rng)
         current_ic = 0
         if ic_result:
             current_ic = ic_result['ic']
             history['ic'].append(current_ic)
             ic_history.append(current_ic)
 
+        # IC 滑动均值（用于决策，减少噪声）
+        ic_window = 3
+        if len(history['ic']) >= ic_window:
+            ic_smoothed = np.mean(history['ic'][-ic_window:])
+        else:
+            ic_smoothed = current_ic
+
         # 计算 IC 改善幅度
         if best_ic > -999:
-            ic_improve_ratio = (current_ic - best_ic) / max(abs(best_ic), 0.01)
+            ic_improve_ratio = (ic_smoothed - best_ic) / max(abs(best_ic), 0.01)
         else:
             ic_improve_ratio = 0
 
@@ -494,7 +508,7 @@ def train_model(model, tokenizer, device, config, save_dir, test_data=None):
 
         # Epoch 结果
         print(f"Train: {avg_train_loss:.4f}, Val: {avg_val_loss:.4f}", flush=True)
-        print(f"IC: {current_ic:.4f} (best: {best_ic:.4f}, improve: {ic_improve_ratio:.2%})", flush=True)
+        print(f"IC: {current_ic:.4f}, IC_smoothed: {ic_smoothed:.4f} (best: {best_ic:.4f}, improve: {ic_improve_ratio:.2%})", flush=True)
         print(f"Time: {format_time(epoch_time)}, Total: {format_time(total_time)}", flush=True)
 
         # Plateau scheduler step (per epoch)
@@ -648,9 +662,9 @@ def train_model(model, tokenizer, device, config, save_dir, test_data=None):
             model.module.save_pretrained(save_path)
             print(f"[VAL LOSS SAVED] {best_val_loss:.4f}", flush=True)
 
-        # 2. IC 改善（只要提升就保存，无阈值）
-        if config.early_stopping_check_ic and current_ic > best_ic:
-            best_ic = current_ic
+        # 2. IC 改善（使用滑动均值，只要提升就保存，无阈值）
+        if config.early_stopping_check_ic and ic_smoothed > best_ic:
+            best_ic = ic_smoothed
             patience_counter = 0
             improved = True
             ic_save_path = f"{save_dir}/checkpoints/best_ic_model"
@@ -750,7 +764,7 @@ def main():
                         help='Override batch_size')
     parser.add_argument('--lr', type=float, default=None,
                         help='Override learning_rate')
-    parser.add_argument('--n-samples', type=int, default=200,
+    parser.add_argument('--n-samples', type=int, default=500,
                         help='Number of samples for IC test during training (default: 200)')
     parser.add_argument('--save-folder', type=str, default=None,
                         help='Override save folder name (default: {dataset}_predictor_v1)')
@@ -905,20 +919,20 @@ def main():
     # 方向损失参数（从 hidden state 直接预测）
     config.direction_loss_weight = run_config['direction_loss_weight']
 
-    # 加载测试数据
+    # 加载验证数据（IC 评估用）
     import pickle
-    test_path = os.path.join(dataset_path, "test_data.pkl")
-    if os.path.exists(test_path):
-        print(f"Loading test data for IC monitoring...", flush=True)
-        with open(test_path, 'rb') as f:
-            test_data = pickle.load(f)
-        print(f"Test data: {len(test_data)} stocks", flush=True)
+    val_path = os.path.join(dataset_path, "val_data.pkl")
+    if os.path.exists(val_path):
+        print(f"Loading val data for IC evaluation...", flush=True)
+        with open(val_path, 'rb') as f:
+            val_data = pickle.load(f)
+        print(f"Val data: {len(val_data)} stocks", flush=True)
     else:
-        test_data = None
-        print("Warning: No test data for IC monitoring", flush=True)
+        val_data = None
+        print("Warning: No val data for IC evaluation", flush=True)
 
     # Train
-    result = train_model(model, tokenizer, device, config, save_dir, test_data)
+    result = train_model(model, tokenizer, device, config, save_dir, val_data)
 
     # Save summary
     summary = {
