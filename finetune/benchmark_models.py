@@ -100,6 +100,97 @@ def compute_nmse(predictions, actuals):
     return np.mean((predictions - actuals) ** 2) / var_actual
 
 
+def compute_vol_corr(predictions, actuals):
+    """波动率预测准确性：预测幅度与真实幅度的相关性"""
+    pred_abs = np.abs(predictions)
+    actual_abs = np.abs(actuals)
+    if len(pred_abs) < 10:
+        return np.nan
+    return np.corrcoef(pred_abs, actual_abs)[0, 1]
+
+
+def compute_vol_binned(predictions, actuals, n_bins=2):
+    """分档波动率验证：高/低波动预测组的实际波动差异"""
+    if len(predictions) < 20:
+        return {'high_mean': np.nan, 'low_mean': np.nan, 'ratio': np.nan, 'n': len(predictions)}
+    pred_abs = np.abs(predictions)
+    actual_abs = np.abs(actuals)
+    median = np.median(pred_abs)
+    high_mask = pred_abs >= median
+    low_mask = pred_abs < median
+    high_mean = np.mean(actual_abs[high_mask]) if high_mask.sum() > 0 else np.nan
+    low_mean = np.mean(actual_abs[low_mask]) if low_mask.sum() > 0 else np.nan
+    ratio = high_mean / low_mean if (low_mean and low_mean > 1e-12) else np.nan
+    return {'high_mean': float(high_mean), 'low_mean': float(low_mean),
+            'ratio': float(ratio), 'n': len(predictions)}
+
+
+def compute_vol_weighted_ic(predictions, actuals):
+    """波动率加权 IC：以预测幅度为权重计算加权 Pearson 相关"""
+    if len(predictions) < 10:
+        return np.nan
+    weights = np.abs(predictions)
+    w_sum = weights.sum()
+    if w_sum < 1e-12:
+        return np.nan
+    w_mean_pred = np.average(predictions, weights=weights)
+    w_mean_actual = np.average(actuals, weights=weights)
+    w_cov = np.average((predictions - w_mean_pred) * (actuals - w_mean_actual), weights=weights)
+    w_var_pred = np.average((predictions - w_mean_pred) ** 2, weights=weights)
+    w_var_actual = np.average((actuals - w_mean_actual) ** 2, weights=weights)
+    denom = np.sqrt(w_var_pred * w_var_actual)
+    if denom < 1e-12:
+        return np.nan
+    return float(w_cov / denom)
+
+
+def compute_vol_da(predictions, actuals):
+    """波动率方向准确率：预测波动大小 vs 实际波动大小，对了几次（朴素指标）
+
+    预测波动 = abs(预测收益)，实际波动 = abs(真实收益)
+    各取中位数分高/低两组，计算分类准确率。
+    返回: (accuracy, up_hit, down_hit) — 总体准确率、预测高波动的命中率、预测低波动的命中率
+    """
+    if len(predictions) < 20:
+        return np.nan, np.nan, np.nan
+    pred_abs = np.abs(predictions)
+    actual_abs = np.abs(actuals)
+    pred_median = np.median(pred_abs)
+    actual_median = np.median(actual_abs)
+    pred_high = pred_abs >= pred_median
+    actual_high = actual_abs >= actual_median
+    accuracy = np.mean(pred_high == actual_high)
+    # Up-hit: 预测高波动时，实际也高波动的比例
+    up_hit = np.mean(actual_high[pred_high]) if pred_high.sum() > 0 else np.nan
+    # Down-hit: 预测低波动时，实际也低波动的比例
+    down_hit = np.mean(~actual_high[~pred_high]) if (~pred_high).sum() > 0 else np.nan
+    return float(accuracy), float(up_hit), float(down_hit)
+
+
+def compute_up_down_hits(predictions, actuals):
+    """涨跌命中率：预测涨的里面实际涨的比例，预测跌的里面实际跌的比例（朴素指标）
+
+    返回: (up_hit, down_hit, balance)
+    - up_hit: 预测上涨的股票中实际涨了的比例
+    - down_hit: 预测下跌的股票中实际跌了的比例
+    - balance: up_hit 和 down_hit 的调和平均（衡量多空双向判断力是否均衡）
+    """
+    if len(predictions) < 20:
+        return np.nan, np.nan, np.nan
+    pred_up = predictions > 0
+    pred_down = predictions < 0
+    actual_up = actuals > 0
+    actual_down = actuals < 0
+    up_hit = np.mean(actual_up[pred_up]) if pred_up.sum() > 0 else np.nan
+    down_hit = np.mean(actual_down[pred_down]) if pred_down.sum() > 0 else np.nan
+    # 调和平均：如果多空严重失衡（比如只会喊涨），balance 会很低
+    if not np.isnan(up_hit) and not np.isnan(down_hit) and up_hit + down_hit > 1e-12:
+        balance = 2 * up_hit * down_hit / (up_hit + down_hit)
+    else:
+        balance = np.nan
+    return float(up_hit), float(down_hit), float(balance)
+
+
 def compute_quantile_coverage(sample_preds, actuals, quantiles=[0.1, 0.5, 0.9]):
     """分位数覆盖率"""
     coverages = {}
@@ -271,6 +362,21 @@ def benchmark_model(model, tokenizer, device, val_data, lookback, pred_len,
             results[f'{fname}_da'] = m['da']
             results[f'{fname}_dda'] = m['dda']
             results[f'{fname}_nmse'] = m['nmse']
+            # 波动率指标
+            step_preds_f = np.array(step_preds_all[rep_step][f])
+            step_actuals_f = np.array(step_actuals_all[rep_step][f])
+            results[f'{fname}_vol_corr'] = compute_vol_corr(step_preds_f, step_actuals_f)
+            results[f'{fname}_vol_binned'] = compute_vol_binned(step_preds_f, step_actuals_f)
+            results[f'{fname}_vol_weighted_ic'] = compute_vol_weighted_ic(step_preds_f, step_actuals_f)
+            # 朴素指标
+            vol_da, vol_up, vol_down = compute_vol_da(step_preds_f, step_actuals_f)
+            results[f'{fname}_vol_da'] = vol_da
+            results[f'{fname}_vol_up_hit'] = vol_up
+            results[f'{fname}_vol_down_hit'] = vol_down
+            up_hit, down_hit, balance = compute_up_down_hits(step_preds_f, step_actuals_f)
+            results[f'{fname}_up_hit'] = up_hit
+            results[f'{fname}_down_hit'] = down_hit
+            results[f'{fname}_hit_balance'] = balance
         if len(step_ics_f) >= 2:
             results[f'{fname}_icir'] = compute_icir(step_ics_f)
 
@@ -405,6 +511,49 @@ def main():
                 varr_str = f"{f_varr:.4f}" if not np.isnan(f_varr) else "    N/A"
                 print(f"  {fname:>5s} {f_ic:>8.4f} {f_ric:>8.4f} {f_icir:>8.4f} {f_da:>8.4f} {f_nmse:>8.4f} {bias_str:>8s} {varr_str:>8s}")
 
+            # === 波动率指标 (step 3) ===
+            print(f"\n  === Volatility Metrics (step 3) ===")
+            print(f"  {'Feat':>5s} {'VolCorr':>8s} {'W-IC':>8s} {'RawIC':>8s} {'Delta':>8s} {'HiVol':>8s} {'LoVol':>8s} {'Ratio':>8s}")
+            print(f"  {'':>5s} {'(abs corr)':>8s} {'(w cov)':>8s} {'(pearson)':>8s} {'(WIC-IC)':>8s} {'(abs mean)':>8s} {'(abs mean)':>8s} {'(Hi/Lo)':>8s}")
+            for fname in feature_names:
+                f_vc = result.get(f'{fname}_vol_corr', np.nan)
+                f_wic = result.get(f'{fname}_vol_weighted_ic', np.nan)
+                f_ic = result.get(f'{fname}_ic', np.nan)
+                f_delta = f_wic - f_ic if not (np.isnan(f_wic) or np.isnan(f_ic)) else np.nan
+                f_vb = result.get(f'{fname}_vol_binned', {})
+                f_hi = f_vb.get('high_mean', np.nan)
+                f_lo = f_vb.get('low_mean', np.nan)
+                f_ratio = f_vb.get('ratio', np.nan)
+                vc_str = f"{f_vc:.4f}" if not np.isnan(f_vc) else "    N/A"
+                wic_str = f"{f_wic:.4f}" if not np.isnan(f_wic) else "    N/A"
+                ic_str = f"{f_ic:.4f}" if not np.isnan(f_ic) else "    N/A"
+                delta_str = f"{f_delta:+.4f}" if not np.isnan(f_delta) else "    N/A"
+                hi_str = f"{f_hi:.4f}" if not np.isnan(f_hi) else "    N/A"
+                lo_str = f"{f_lo:.4f}" if not np.isnan(f_lo) else "    N/A"
+                ratio_str = f"{f_ratio:.4f}" if not np.isnan(f_ratio) else "    N/A"
+                print(f"  {fname:>5s} {vc_str:>8s} {wic_str:>8s} {ic_str:>8s} {delta_str:>8s} {hi_str:>8s} {lo_str:>8s} {ratio_str:>8s}")
+
+            # === 朴素指标 (step 3) — 100次中对了多少次 ===
+            print(f"\n  === Plain Metrics (step 3) — 'out of 100, how many correct?' ===")
+            print(f"  {'Feat':>5s} {'DA':>7s} {'UpHit':>7s} {'DnHit':>7s} {'Bal':>7s} {'VolDA':>7s} {'VUp':>7s} {'VDn':>7s}")
+            print(f"  {'':>5s} {'(涨跌)':>7s} {'(喊涨)':>7s} {'(喊跌)':>7s} {'(平衡)':>7s} {'(波动)':>7s} {'(喊大)':>7s} {'(喊小)':>7s}")
+            for fname in feature_names:
+                f_da = result.get(f'{fname}_da', np.nan)
+                f_up = result.get(f'{fname}_up_hit', np.nan)
+                f_dn = result.get(f'{fname}_down_hit', np.nan)
+                f_bal = result.get(f'{fname}_hit_balance', np.nan)
+                f_vda = result.get(f'{fname}_vol_da', np.nan)
+                f_vup = result.get(f'{fname}_vol_up_hit', np.nan)
+                f_vdn = result.get(f'{fname}_vol_down_hit', np.nan)
+                da_str = f"{f_da:.3f}" if not np.isnan(f_da) else "   N/A"
+                up_str = f"{f_up:.3f}" if not np.isnan(f_up) else "   N/A"
+                dn_str = f"{f_dn:.3f}" if not np.isnan(f_dn) else "   N/A"
+                bal_str = f"{f_bal:.3f}" if not np.isnan(f_bal) else "   N/A"
+                vda_str = f"{f_vda:.3f}" if not np.isnan(f_vda) else "   N/A"
+                vup_str = f"{f_vup:.3f}" if not np.isnan(f_vup) else "   N/A"
+                vdn_str = f"{f_vdn:.3f}" if not np.isnan(f_vdn) else "   N/A"
+                print(f"  {fname:>5s} {da_str:>7s} {up_str:>7s} {dn_str:>7s} {bal_str:>7s} {vda_str:>7s} {vup_str:>7s} {vdn_str:>7s}")
+
             all_results[model_name] = result
         else:
             print(f"  [FAIL] Not enough valid predictions")
@@ -427,6 +576,53 @@ def main():
             r = all_results[model_name]
             dda_str = f"{r['dda']:.4f}" if not np.isnan(r.get('dda', np.nan)) else "    N/A"
             print(f"{model_name:<25s} {r['ic']:>8.4f} {r['rank_ic']:>8.4f} {r.get('icir',np.nan):>8.4f} {r['da']:>8.4f} {dda_str:>8s} {r['nmse']:>8.4f} {r['n_samples']:>6d}")
+
+    # 波动率指标对比 (close only)
+    feature_names = ['open', 'high', 'low', 'close', 'vol', 'amt']
+    for fname in ['close']:  # 核心关注 close
+        print(f"\n--- {fname} Volatility Metrics (step 3) ---")
+        print(f"{'Model':<25s} {'VolCorr':>8s} {'W-IC':>8s} {'RawIC':>8s} {'Delta':>8s} {'Hi/Lo':>8s}")
+        print("-" * 65)
+        for model_name, _, _, _, _, _ in MODELS:
+            if model_name in all_results:
+                r = all_results[model_name]
+                f_vc = r.get(f'{fname}_vol_corr', np.nan)
+                f_wic = r.get(f'{fname}_vol_weighted_ic', np.nan)
+                f_ic = r.get(f'{fname}_ic', np.nan)
+                f_delta = f_wic - f_ic if not (np.isnan(f_wic) or np.isnan(f_ic)) else np.nan
+                f_vb = r.get(f'{fname}_vol_binned', {})
+                f_ratio = f_vb.get('ratio', np.nan)
+                vc_str = f"{f_vc:.4f}" if not np.isnan(f_vc) else "    N/A"
+                wic_str = f"{f_wic:.4f}" if not np.isnan(f_wic) else "    N/A"
+                ic_str = f"{f_ic:.4f}" if not np.isnan(f_ic) else "    N/A"
+                delta_str = f"{f_delta:+.4f}" if not np.isnan(f_delta) else "    N/A"
+                ratio_str = f"{f_ratio:.4f}" if not np.isnan(f_ratio) else "    N/A"
+                print(f"{model_name:<25s} {vc_str:>8s} {wic_str:>8s} {ic_str:>8s} {delta_str:>8s} {ratio_str:>8s}")
+
+    # 朴素指标对比 (close only) — 100次中对了多少次
+    for fname in ['close']:
+        print(f"\n--- {fname} Plain Metrics (step 3) — 'out of 100 correct' ---")
+        print(f"{'Model':<25s} {'DA':>7s} {'UpHit':>7s} {'DnHit':>7s} {'Bal':>7s} {'VolDA':>7s} {'VUp':>7s} {'VDn':>7s}")
+        print(f"{'':<25s} {'(涨跌)':>7s} {'(喊涨)':>7s} {'(喊跌)':>7s} {'(均衡)':>7s} {'(波大)':>7s} {'(喊大)':>7s} {'(喊小)':>7s}")
+        print("-" * 81)
+        for model_name, _, _, _, _, _ in MODELS:
+            if model_name in all_results:
+                r = all_results[model_name]
+                f_da = r.get(f'{fname}_da', np.nan)
+                f_up = r.get(f'{fname}_up_hit', np.nan)
+                f_dn = r.get(f'{fname}_down_hit', np.nan)
+                f_bal = r.get(f'{fname}_hit_balance', np.nan)
+                f_vda = r.get(f'{fname}_vol_da', np.nan)
+                f_vup = r.get(f'{fname}_vol_up_hit', np.nan)
+                f_vdn = r.get(f'{fname}_vol_down_hit', np.nan)
+                da_str = f"{f_da:.3f}" if not np.isnan(f_da) else "   N/A"
+                up_str = f"{f_up:.3f}" if not np.isnan(f_up) else "   N/A"
+                dn_str = f"{f_dn:.3f}" if not np.isnan(f_dn) else "   N/A"
+                bal_str = f"{f_bal:.3f}" if not np.isnan(f_bal) else "   N/A"
+                vda_str = f"{f_vda:.3f}" if not np.isnan(f_vda) else "   N/A"
+                vup_str = f"{f_vup:.3f}" if not np.isnan(f_vup) else "   N/A"
+                vdn_str = f"{f_vdn:.3f}" if not np.isnan(f_vdn) else "   N/A"
+                print(f"{model_name:<25s} {da_str:>7s} {up_str:>7s} {dn_str:>7s} {bal_str:>7s} {vda_str:>7s} {vup_str:>7s} {vdn_str:>7s}")
 
     # 多步 IC 表
     print(f"\n--- Multi-step IC ---")

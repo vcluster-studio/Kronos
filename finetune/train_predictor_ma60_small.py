@@ -5,9 +5,14 @@ MA60 Predictor Training Script - for small model (group_size=4)
 使用预计算好的 MA60 归一化数据（lookback=200，适配 small 模型 max_context=512）。
 
 V5: 纯 CE loss (direction_loss_weight=0.0)，lookback=200，Cosine Annealing LR
+V5b: dl=0.3 + 冻结前4层+embedding（IC 崩溃）
+V6: PCGrad 梯度手术 — 将 price (s1) 和 volume (s2) 视为两个任务，
+    投影冲突梯度到法平面，解决 vol/amt 梯度主导导致 IC 崩溃的问题。
+    参考: Yu et al., "Gradient Surgery for Multi-Task Learning", NeurIPS 2020
 
 Usage:
-    python -u finetune/train_predictor_ma60_small.py
+    python -u finetune/train_predictor_ma60_small.py --pcgrad
+    python -u finetune/train_predictor_ma60_small.py  # 原始模式（无 PCGrad）
 
 数据格式：
     processed_datasets_ma60_windowed_v3_small/{train,val,test}_data.pkl
@@ -70,8 +75,8 @@ TRAINING_PARAMS = {
     # IC 测试
     'ic_test_samples': 500,
     'ic_point': 3,
-    # 方向损失（V5b: dl=0.3 + 冻结前4层+embedding，降低有效容量）
-    'direction_loss_weight': 0.3,
+    # 方向损失（V6+PCGrad: 不额外加权，PCGrad 本身解决梯度冲突）
+    'direction_loss_weight': 0.0,
     # Cosine Annealing LR
     'lr_scheduler': 'cosine',
     'lr_min': 1e-5,
@@ -82,7 +87,7 @@ TRAINING_PARAMS = {
 }
 
 # 保存目录
-SAVE_FOLDER = 'ma60_predictor_small_v5b'
+SAVE_FOLDER = 'ma60_predictor_small_v6'
 
 
 def set_seed(seed: int):
@@ -178,6 +183,83 @@ class MA60Dataset(Dataset):
         direction = pred_close_end > baseline_close
 
         return torch.from_numpy(x_norm), torch.from_numpy(x_stamp), torch.tensor(direction, dtype=torch.float32)
+
+
+def compute_vol_corr(predictions, actuals):
+    """波动率预测准确性：预测幅度与真实幅度的相关性"""
+    pred_abs = np.abs(predictions)
+    actual_abs = np.abs(actuals)
+    if len(pred_abs) < 10:
+        return np.nan
+    return np.corrcoef(pred_abs, actual_abs)[0, 1]
+
+
+def compute_vol_binned(predictions, actuals, n_bins=2):
+    """分档波动率验证：高/低波动预测组的实际波动差异"""
+    if len(predictions) < 20:
+        return {'high_mean': np.nan, 'low_mean': np.nan, 'ratio': np.nan, 'n': len(predictions)}
+    pred_abs = np.abs(predictions)
+    actual_abs = np.abs(actuals)
+    median = np.median(pred_abs)
+    high_mask = pred_abs >= median
+    low_mask = pred_abs < median
+    high_mean = np.mean(actual_abs[high_mask]) if high_mask.sum() > 0 else np.nan
+    low_mean = np.mean(actual_abs[low_mask]) if low_mask.sum() > 0 else np.nan
+    ratio = high_mean / low_mean if (low_mean and low_mean > 1e-12) else np.nan
+    return {'high_mean': float(high_mean), 'low_mean': float(low_mean),
+            'ratio': float(ratio), 'n': len(predictions)}
+
+
+def compute_vol_weighted_ic(predictions, actuals):
+    """波动率加权 IC：以预测幅度为权重计算加权 Pearson 相关"""
+    if len(predictions) < 10:
+        return np.nan
+    weights = np.abs(predictions)
+    w_sum = weights.sum()
+    if w_sum < 1e-12:
+        return np.nan
+    w_mean_pred = np.average(predictions, weights=weights)
+    w_mean_actual = np.average(actuals, weights=weights)
+    w_cov = np.average((predictions - w_mean_pred) * (actuals - w_mean_actual), weights=weights)
+    w_var_pred = np.average((predictions - w_mean_pred) ** 2, weights=weights)
+    w_var_actual = np.average((actuals - w_mean_actual) ** 2, weights=weights)
+    denom = np.sqrt(w_var_pred * w_var_actual)
+    if denom < 1e-12:
+        return np.nan
+    return float(w_cov / denom)
+
+
+def compute_vol_da(predictions, actuals):
+    """波动率方向准确率：100次中波动大小判断对了几次"""
+    if len(predictions) < 20:
+        return np.nan, np.nan, np.nan
+    pred_abs = np.abs(predictions)
+    actual_abs = np.abs(actuals)
+    pred_median = np.median(pred_abs)
+    actual_median = np.median(actual_abs)
+    pred_high = pred_abs >= pred_median
+    actual_high = actual_abs >= actual_median
+    accuracy = np.mean(pred_high == actual_high)
+    up_hit = np.mean(actual_high[pred_high]) if pred_high.sum() > 0 else np.nan
+    down_hit = np.mean(~actual_high[~pred_high]) if (~pred_high).sum() > 0 else np.nan
+    return float(accuracy), float(up_hit), float(down_hit)
+
+
+def compute_up_down_hits(predictions, actuals):
+    """涨跌命中率：喊涨对了多少，喊跌对了多少"""
+    if len(predictions) < 20:
+        return np.nan, np.nan, np.nan
+    pred_up = predictions > 0
+    pred_down = predictions < 0
+    actual_up = actuals > 0
+    actual_down = actuals < 0
+    up_hit = np.mean(actual_up[pred_up]) if pred_up.sum() > 0 else np.nan
+    down_hit = np.mean(actual_down[pred_down]) if pred_down.sum() > 0 else np.nan
+    if not np.isnan(up_hit) and not np.isnan(down_hit) and up_hit + down_hit > 1e-12:
+        balance = 2 * up_hit * down_hit / (up_hit + down_hit)
+    else:
+        balance = np.nan
+    return float(up_hit), float(down_hit), float(balance)
 
 
 def quick_ic_test_ma60(model, tokenizer, device, val_data, n_samples=500,
@@ -323,6 +405,22 @@ def quick_ic_test_ma60(model, tokenizer, device, val_data, n_samples=500,
             ic_std = np.std(step_ics_f)
             result[f'{fname}_icir'] = ic_mean / ic_std if ic_std > 1e-8 else np.nan
 
+            # 波动率指标 (step 3)
+            step_preds_f = np.array(step_preds_all[rep][f])
+            step_actuals_f = np.array(step_actuals_all[rep][f])
+            result[f'{fname}_vol_corr'] = compute_vol_corr(step_preds_f, step_actuals_f)
+            result[f'{fname}_vol_binned'] = compute_vol_binned(step_preds_f, step_actuals_f)
+            result[f'{fname}_vol_weighted_ic'] = compute_vol_weighted_ic(step_preds_f, step_actuals_f)
+            # 朴素指标
+            vol_da, vol_up, vol_down = compute_vol_da(step_preds_f, step_actuals_f)
+            result[f'{fname}_vol_da'] = vol_da
+            result[f'{fname}_vol_up_hit'] = vol_up
+            result[f'{fname}_vol_down_hit'] = vol_down
+            up_hit, down_hit, balance = compute_up_down_hits(step_preds_f, step_actuals_f)
+            result[f'{fname}_up_hit'] = up_hit
+            result[f'{fname}_down_hit'] = down_hit
+            result[f'{fname}_hit_balance'] = balance
+
         # 兼容：close 的指标也赋给顶层 key
         result['ic'] = result.get('close_ic', 0)
         result['rank_ic'] = result.get('close_rank_ic', 0)
@@ -364,6 +462,115 @@ def freeze_model_layers(model, freeze_layers=6, freeze_embedding=True):
     total = sum(p.numel() for p in model.parameters())
     trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
     print(f"[FREEZE] Trainable: {trainable/1e6:.2f}M / {total/1e6:.2f}M ({100*trainable/total:.1f}%)")
+
+
+class PCGrad:
+    """PCGrad: Projecting Conflicting Gradients (Yu et al., NeurIPS 2020)
+
+    直接使用模型已计算的 s1_loss 和 s2_loss 作为两个独立任务:
+      - Task 1: s1_loss — token_seq_0 的 CE（codebook 前半比特位）
+      - Task 2: s2_loss — token_seq_1 的 CE（codebook 后半比特位）
+
+    compute_loss 已返回独立的 s1_loss 和 s2_loss，无需任何转换。
+    各任务独立 backward → PCGrad 梯度投影 → 合并更新。
+
+    参考: Yu et al., "Gradient Surgery for Multi-Task Learning", NeurIPS 2020
+    """
+
+    def __init__(self, optimizer):
+        self.optimizer = optimizer
+
+    def project_conflicting_gradients(self, grad_s1, grad_s2):
+        """若 g_s1 · g_s2 < 0，将各自投影到对方的法平面。"""
+        dot = sum(torch.sum(g1 * g2) for g1, g2 in zip(grad_s1, grad_s2)
+                  if g1 is not None and g2 is not None)
+
+        if dot < 0:
+            norm_s2_sq = sum(torch.sum(g * g) for g in grad_s2 if g is not None)
+            norm_s1_sq = sum(torch.sum(g * g) for g in grad_s1 if g is not None)
+
+            if norm_s2_sq > 1e-12:
+                coeff = dot / norm_s2_sq
+                grad_s1 = [g - coeff * g2 if g is not None and g2 is not None else g
+                           for g, g2 in zip(grad_s1, grad_s2)]
+
+            if norm_s1_sq > 1e-12:
+                coeff = dot / norm_s1_sq
+                grad_s2 = [g - coeff * g1 if g is not None and g1 is not None else g
+                           for g, g1 in zip(grad_s2, grad_s1)]
+
+        merged = []
+        for g1, g2 in zip(grad_s1, grad_s2):
+            if g1 is not None and g2 is not None:
+                merged.append(g1 + g2)
+            elif g1 is not None:
+                merged.append(g1)
+            elif g2 is not None:
+                merged.append(g2)
+            else:
+                merged.append(None)
+
+        return merged, float(dot)
+
+    def pcgrad_step(self, model, tokenizer, batch_x, batch_stamp,
+                    batch_direction, device, direction_head,
+                    direction_loss_weight, model_params, head_params, max_norm=3.0):
+        """执行一步 PCGrad 训练。
+
+        使用 compute_loss 已返回的 s1_loss 和 s2_loss 作为两个独立任务。
+        direction loss 归入 s1（通过 hidden states 链接到前半部分 token 的表征）。
+
+        Returns:
+            total_loss:  总 loss 值（用于日志）
+            grad_dot:    s1·s2 梯度点积（负值 = 冲突）
+        """
+        with torch.no_grad():
+            token_seq_0, token_seq_1 = tokenizer.encode(batch_x, half=True)
+
+        token_in = [token_seq_0[:, :-1], token_seq_1[:, :-1]]
+        token_out = [token_seq_0[:, 1:], token_seq_1[:, 1:]]
+
+        s1_logits, s2_logits, hidden = model.module.forward_with_hidden(
+            token_in[0], token_in[1], batch_stamp[:, :-1, :]
+        )
+
+        # compute_loss 返回 (recon_loss, s1_loss, s2_loss)
+        _, s1_loss, s2_loss = model.module.head.compute_loss(
+            s1_logits, s2_logits, token_out[0], token_out[1]
+        )
+
+        # 方向损失
+        pred_hidden = hidden[:, -1, :]
+        direction_logits = direction_head(pred_hidden).squeeze(-1)
+        direction_pred = torch.sigmoid(direction_logits)
+        direction_loss = F.binary_cross_entropy(direction_pred, batch_direction)
+
+        # ---- Backward: Task 1 (s1_loss + direction_loss) ----
+        self.optimizer.zero_grad()
+        (s1_loss + direction_loss_weight * direction_loss).backward(retain_graph=True)
+        grad_s1 = [p.grad.clone() if p.grad is not None else None
+                   for p in model_params + list(head_params)]
+
+        # ---- Backward: Task 2 (s2_loss，仅 model params) ----
+        self.optimizer.zero_grad()
+        s2_loss.backward()
+        grad_s2 = [p.grad.clone() if p.grad is not None else None
+                   for p in model_params + list(head_params)]
+
+        # ---- PCGrad projection ----
+        merged_grads, grad_dot = self.project_conflicting_gradients(grad_s1, grad_s2)
+
+        # ---- 应用合并后的梯度 ----
+        all_params = model_params + list(head_params)
+        for p, mg in zip(all_params, merged_grads):
+            if mg is not None:
+                p.grad = mg
+
+        torch.nn.utils.clip_grad_norm_(all_params, max_norm=max_norm)
+        self.optimizer.step()
+
+        total_loss = s1_loss.item() + s2_loss.item() + direction_loss_weight * direction_loss.item()
+        return total_loss, grad_dot
 
 
 def train_model(model, tokenizer, device, config, save_dir, val_data=None):
@@ -416,6 +623,11 @@ def train_model(model, tokenizer, device, config, save_dir, val_data=None):
     patience_counter = 0
 
     history = {'train_loss': [], 'val_loss': [], 'ic': [], 'lr': []}
+    if config.pcgrad:
+        history['grad_dot'] = []
+
+    # PCGrad 优化器
+    pcgrad_optimizer = PCGrad(optimizer) if config.pcgrad else None
 
     for epoch_idx in range(config.epochs):
         epoch_start = time.time()
@@ -424,53 +636,77 @@ def train_model(model, tokenizer, device, config, save_dir, val_data=None):
         train_dataset.py_rng.seed(config.seed + epoch_idx * 10000)
 
         epoch_losses = []
+        epoch_grad_dots = []
         current_lr = optimizer.param_groups[0]['lr']
 
         print(f"\n=== Epoch {epoch_idx+1}/{config.epochs} ===")
         print(f"LR: {current_lr:.6f}")
+        if config.pcgrad:
+            print(f"PCGrad: ON (price vs volume gradient surgery)")
 
         for i, (batch_x, batch_stamp, batch_direction) in enumerate(train_loader):
             batch_x = batch_x.to(device, non_blocking=True)
             batch_stamp = batch_stamp.to(device, non_blocking=True)
             batch_direction = batch_direction.to(device, non_blocking=True)
 
-            with torch.no_grad():
-                token_seq_0, token_seq_1 = tokenizer.encode(batch_x, half=True)
+            if config.pcgrad:
+                # PCGrad 模式：s1_loss vs s2_loss 独立 backward，梯度投影
+                total_loss, grad_dot = pcgrad_optimizer.pcgrad_step(
+                    model, tokenizer, batch_x, batch_stamp, batch_direction,
+                    device, close_direction_head, config.direction_loss_weight,
+                    trainable_params, close_direction_head.parameters(), max_norm=3.0
+                )
+                epoch_grad_dots.append(grad_dot)
+            else:
+                # 原始模式：统一 backward
+                with torch.no_grad():
+                    token_seq_0, token_seq_1 = tokenizer.encode(batch_x, half=True)
 
-            token_in = [token_seq_0[:, :-1], token_seq_1[:, :-1]]
-            token_out = [token_seq_0[:, 1:], token_seq_1[:, 1:]]
+                token_in = [token_seq_0[:, :-1], token_seq_1[:, :-1]]
+                token_out = [token_seq_0[:, 1:], token_seq_1[:, 1:]]
 
-            s1_logits, s2_logits, hidden = model.module.forward_with_hidden(
-                token_in[0], token_in[1], batch_stamp[:, :-1, :]
-            )
-            recon_loss, s1_loss, s2_loss = model.module.head.compute_loss(
-                s1_logits, s2_logits, token_out[0], token_out[1]
-            )
+                s1_logits, s2_logits, hidden = model.module.forward_with_hidden(
+                    token_in[0], token_in[1], batch_stamp[:, :-1, :]
+                )
+                recon_loss, s1_loss, s2_loss = model.module.head.compute_loss(
+                    s1_logits, s2_logits, token_out[0], token_out[1]
+                )
 
-            # 方向损失
-            pred_hidden = hidden[:, -1, :]
-            direction_logits = close_direction_head(pred_hidden).squeeze(-1)
-            direction_pred = torch.sigmoid(direction_logits)
-            direction_loss = F.binary_cross_entropy(direction_pred, batch_direction)
+                # 方向损失
+                pred_hidden = hidden[:, -1, :]
+                direction_logits = close_direction_head(pred_hidden).squeeze(-1)
+                direction_pred = torch.sigmoid(direction_logits)
+                direction_loss = F.binary_cross_entropy(direction_pred, batch_direction)
 
-            total_loss = recon_loss + config.direction_loss_weight * direction_loss
+                total_loss = recon_loss + config.direction_loss_weight * direction_loss
 
-            optimizer.zero_grad()
-            total_loss.backward()
-            torch.nn.utils.clip_grad_norm_(trainable_params, max_norm=3.0)
-            optimizer.step()
+                optimizer.zero_grad()
+                total_loss.backward()
+                torch.nn.utils.clip_grad_norm_(trainable_params, max_norm=3.0)
+                optimizer.step()
 
             scheduler.step()
 
-            epoch_losses.append(total_loss.item())
+            epoch_losses.append(total_loss)
 
             if (i + 1) % 50 == 0 or i == 0:
                 avg_loss = sum(epoch_losses[-50:]) / min(len(epoch_losses[-50:]), 50)
                 progress = (i + 1) / len(train_loader) * 100
-                print(f"  Batch {i+1}/{len(train_loader)} ({progress:.1f}%) - Loss: {total_loss.item():.4f}, Avg: {avg_loss:.4f}")
+                extra = ""
+                if config.pcgrad and epoch_grad_dots:
+                    avg_dot = sum(epoch_grad_dots[-50:]) / min(len(epoch_grad_dots[-50:]), 50)
+                    extra = f", GradDot: {avg_dot:.4f}"
+                print(f"  Batch {i+1}/{len(train_loader)} ({progress:.1f}%) - Loss: {total_loss:.4f}, Avg: {avg_loss:.4f}{extra}")
 
         current_lr = optimizer.param_groups[0]['lr']
         history['lr'].append(current_lr)
+
+        # 记录梯度冲突
+        if config.pcgrad and epoch_grad_dots:
+            avg_grad_dot = sum(epoch_grad_dots) / len(epoch_grad_dots)
+            n_conflict = sum(1 for d in epoch_grad_dots if d < 0)
+            history['grad_dot'].append(avg_grad_dot)
+            print(f"  GradDot avg: {avg_grad_dot:.4f}, conflicts: {n_conflict}/{len(epoch_grad_dots)} ({100*n_conflict/len(epoch_grad_dots):.1f}%)")
 
         # Validation
         model.eval()
@@ -490,7 +726,7 @@ def train_model(model, tokenizer, device, config, save_dir, val_data=None):
                 s1_logits, s2_logits, hidden = model.module.forward_with_hidden(
                     token_in[0], token_in[1], batch_stamp[:, :-1, :]
                 )
-                recon_loss, _, _ = model.module.head.compute_loss(
+                recon_loss, s1_loss, s2_loss = model.module.head.compute_loss(
                     s1_logits, s2_logits, token_out[0], token_out[1]
                 )
 
@@ -502,10 +738,17 @@ def train_model(model, tokenizer, device, config, save_dir, val_data=None):
                 val_loss = recon_loss + config.direction_loss_weight * direction_loss
                 val_loss_sum += val_loss.item()
                 val_batches += 1
+                if val_batches == 1:
+                    val_ce_sum = recon_loss.item()
+                    val_dir_sum = direction_loss.item()
+                else:
+                    val_ce_sum += recon_loss.item()
+                    val_dir_sum += direction_loss.item()
 
         avg_val_loss = val_loss_sum / val_batches
         avg_train_loss = sum(epoch_losses) / len(epoch_losses)
-
+        avg_val_ce = val_ce_sum / val_batches
+        avg_val_dir = val_dir_sum / val_batches
         history['train_loss'].append(avg_train_loss)
         history['val_loss'].append(avg_val_loss)
 
@@ -529,7 +772,7 @@ def train_model(model, tokenizer, device, config, save_dir, val_data=None):
         epoch_time = time.time() - epoch_start
         total_time = time.time() - start_time
 
-        print(f"Train: {avg_train_loss:.4f}, Val: {avg_val_loss:.4f}")
+        print(f"Train: {avg_train_loss:.4f}, Val: {avg_val_loss:.4f} (CE: {avg_val_ce:.4f}, Dir: {avg_val_dir:.4f})")
         if ic_result:
             # === 全特征概览 (step 3) ===
             feature_names = ic_result.get('feature_names', ['open', 'high', 'low', 'close', 'vol', 'amt'])
@@ -548,6 +791,41 @@ def train_model(model, tokenizer, device, config, save_dir, val_data=None):
                 varr_str = f"{f_varr:.4f}" if not np.isnan(f_varr) else "    N/A"
                 print(f"  {fname:>5s} {f_ic:>7.4f} {f_ric:>7.4f} {f_icir:>7.4f} {f_da:>7.4f} {dda_str:>7s} {f_nmse:>7.4f} {bias_str:>7s} {varr_str:>7s}")
 
+            # === 波动率指标 (step 3) ===
+            print(f"  {'Feat':>5s} {'VolCorr':>7s} {'W-IC':>7s} {'RawIC':>7s} {'Delta':>7s} {'Hi/Lo':>7s}")
+            for fname in feature_names:
+                f_vc = ic_result.get(f'{fname}_vol_corr', np.nan)
+                f_wic = ic_result.get(f'{fname}_vol_weighted_ic', np.nan)
+                f_ic = ic_result.get(f'{fname}_ic', np.nan)
+                f_delta = f_wic - f_ic if not (np.isnan(f_wic) or np.isnan(f_ic)) else np.nan
+                f_vb = ic_result.get(f'{fname}_vol_binned', {})
+                f_ratio = f_vb.get('ratio', np.nan)
+                vc_str = f"{f_vc:.4f}" if not np.isnan(f_vc) else "   N/A"
+                wic_str = f"{f_wic:.4f}" if not np.isnan(f_wic) else "   N/A"
+                ic_str = f"{f_ic:.4f}" if not np.isnan(f_ic) else "   N/A"
+                delta_str = f"{f_delta:+.4f}" if not np.isnan(f_delta) else "   N/A"
+                ratio_str = f"{f_ratio:.4f}" if not np.isnan(f_ratio) else "   N/A"
+                print(f"  {fname:>5s} {vc_str:>7s} {wic_str:>7s} {ic_str:>7s} {delta_str:>7s} {ratio_str:>7s}")
+
+            # === 朴素指标 (step 3) — 100次中对了多少次 ===
+            print(f"  {'Feat':>5s} {'DA':>7s} {'UpHit':>7s} {'DnHit':>7s} {'Bal':>7s} {'VolDA':>7s} {'VUp':>7s} {'VDn':>7s}")
+            for fname in feature_names:
+                f_da = ic_result.get(f'{fname}_da', np.nan)
+                f_up = ic_result.get(f'{fname}_up_hit', np.nan)
+                f_dn = ic_result.get(f'{fname}_down_hit', np.nan)
+                f_bal = ic_result.get(f'{fname}_hit_balance', np.nan)
+                f_vda = ic_result.get(f'{fname}_vol_da', np.nan)
+                f_vup = ic_result.get(f'{fname}_vol_up_hit', np.nan)
+                f_vdn = ic_result.get(f'{fname}_vol_down_hit', np.nan)
+                da_str = f"{f_da:.3f}" if not np.isnan(f_da) else "   N/A"
+                up_str = f"{f_up:.3f}" if not np.isnan(f_up) else "   N/A"
+                dn_str = f"{f_dn:.3f}" if not np.isnan(f_dn) else "   N/A"
+                bal_str = f"{f_bal:.3f}" if not np.isnan(f_bal) else "   N/A"
+                vda_str = f"{f_vda:.3f}" if not np.isnan(f_vda) else "   N/A"
+                vup_str = f"{f_vup:.3f}" if not np.isnan(f_vup) else "   N/A"
+                vdn_str = f"{f_vdn:.3f}" if not np.isnan(f_vdn) else "   N/A"
+                print(f"  {fname:>5s} {da_str:>7s} {up_str:>7s} {dn_str:>7s} {bal_str:>7s} {vda_str:>7s} {vup_str:>7s} {vdn_str:>7s}")
+
             # === 各特征多步 IC ===
             print(f"  {'Feat':>5s}", end="")
             for s in range(1, min(config.predict + 1, 6)):
@@ -561,7 +839,9 @@ def train_model(model, tokenizer, device, config, save_dir, val_data=None):
                 print()
         else:
             print(f"IC: {current_ic:.4f}")
-        print(f"IC_smoothed: {ic_smoothed:.4f} (best: {best_ic:.4f})")
+        print(f"IC_smoothed: {ic_smoothed:.4f} (best: {best_ic:.4f}) — monitor only, VL decides")
+        if ic_smoothed > best_ic:
+            best_ic = ic_smoothed
         print(f"Time: {format_time(epoch_time)}, Total: {format_time(total_time)}")
 
         print(f"[LR] {current_lr:.6f}")
@@ -570,7 +850,7 @@ def train_model(model, tokenizer, device, config, save_dir, val_data=None):
         latest_path = f"{save_dir}/checkpoints/latest_model"
         model.module.save_pretrained(latest_path)
 
-        # Check improvement
+        # Check improvement — 仅通过 val loss 判定（PCGrad 下回归模型自身）
         improved = False
 
         if avg_val_loss < best_val_loss:
@@ -579,15 +859,7 @@ def train_model(model, tokenizer, device, config, save_dir, val_data=None):
             improved = True
             save_path = f"{save_dir}/checkpoints/best_model"
             model.module.save_pretrained(save_path)
-            print(f"[VAL LOSS SAVED] {best_val_loss:.4f}")
-
-        if ic_smoothed > best_ic:
-            best_ic = ic_smoothed
-            patience_counter = 0
-            improved = True
-            ic_save_path = f"{save_dir}/checkpoints/best_ic_model"
-            model.module.save_pretrained(ic_save_path)
-            print(f"[IC SAVED] {best_ic:.4f}")
+            print(f"[VL SAVED] {best_val_loss:.4f}")
 
         if not improved:
             patience_counter += 1
@@ -624,6 +896,8 @@ def main():
                         help='Resume from checkpoint path')
     parser.add_argument('--save-folder', type=str, default=SAVE_FOLDER,
                         help='Save folder name')
+    parser.add_argument('--pcgrad', action='store_true',
+                        help='Enable PCGrad gradient surgery (price vs volume)')
     args = parser.parse_args()
 
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
@@ -704,6 +978,7 @@ def main():
     config.freeze_layers = TRAINING_PARAMS['freeze_layers']
     config.freeze_embedding = TRAINING_PARAMS['freeze_embedding']
     config.max_context = TRAINING_PARAMS['max_context']
+    config.pcgrad = args.pcgrad
 
     # 加载验证数据（IC 评估用）
     val_path = DATA_PATHS['val']
