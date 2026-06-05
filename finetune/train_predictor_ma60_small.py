@@ -4,11 +4,7 @@ MA60 Predictor Training Script - for small model (group_size=4)
 基于 MA60 base tokenizer (group_size=4) 微调 Kronos-small predictor。
 使用预计算好的 MA60 归一化数据（lookback=200，适配 small 模型 max_context=512）。
 
-V5: 纯 CE loss (direction_loss_weight=0.0)，lookback=200，Cosine Annealing LR
-V5b: dl=0.3 + 冻结前4层+embedding（IC 崩溃）
-V6: PCGrad 梯度手术 — 将 price (s1) 和 volume (s2) 视为两个任务，
-    投影冲突梯度到法平面，解决 vol/amt 梯度主导导致 IC 崩溃的问题。
-    参考: Yu et al., "Gradient Surgery for Multi-Task Learning", NeurIPS 2020
+目标：纯 token CE loss 训练，不添加额外 head。IC/DA 仅用于评估监控。
 
 Usage:
     python -u finetune/train_predictor_ma60_small.py --pcgrad
@@ -26,7 +22,6 @@ import time
 import argparse
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 from torch.utils.data import DataLoader, Dataset
 from torch.utils.data import RandomSampler, SequentialSampler
 import numpy as np
@@ -75,8 +70,6 @@ TRAINING_PARAMS = {
     # IC 测试
     'ic_test_samples': 500,
     'ic_point': 3,
-    # 方向损失（V6+PCGrad: 不额外加权，PCGrad 本身解决梯度冲突）
-    'direction_loss_weight': 0.0,
     # Cosine Annealing LR
     'lr_scheduler': 'cosine',
     'lr_min': 1e-5,
@@ -176,13 +169,7 @@ class MA60Dataset(Dataset):
             timestamps.month.values,
         ], axis=1).astype(np.float32)
 
-        # 方向标签
-        original_close = data['original'][start_idx:end_idx, 3]
-        baseline_close = original_close[self.config.lookback - 1]
-        pred_close_end = original_close[self.config.lookback + self.config.predict]
-        direction = pred_close_end > baseline_close
-
-        return torch.from_numpy(x_norm), torch.from_numpy(x_stamp), torch.tensor(direction, dtype=torch.float32)
+        return torch.from_numpy(x_norm), torch.from_numpy(x_stamp)
 
 
 def compute_vol_corr(predictions, actuals):
@@ -513,12 +500,11 @@ class PCGrad:
         return merged, float(dot)
 
     def pcgrad_step(self, model, tokenizer, batch_x, batch_stamp,
-                    batch_direction, device, direction_head,
-                    direction_loss_weight, model_params, head_params, max_norm=3.0):
+                    device, model_params, max_norm=3.0):
         """执行一步 PCGrad 训练。
 
-        使用 compute_loss 已返回的 s1_loss 和 s2_loss 作为两个独立任务。
-        direction loss 归入 s1（通过 hidden states 链接到前半部分 token 的表征）。
+        使用 compute_loss 已返回的 s1_loss 和 s2_loss 作为两个独立任务，
+        各任务独立 backward → PCGrad 梯度投影 → 合并更新。
 
         Returns:
             total_loss:  总 loss 值（用于日志）
@@ -539,37 +525,30 @@ class PCGrad:
             s1_logits, s2_logits, token_out[0], token_out[1]
         )
 
-        # 方向损失
-        pred_hidden = hidden[:, -1, :]
-        direction_logits = direction_head(pred_hidden).squeeze(-1)
-        direction_pred = torch.sigmoid(direction_logits)
-        direction_loss = F.binary_cross_entropy(direction_pred, batch_direction)
-
-        # ---- Backward: Task 1 (s1_loss + direction_loss) ----
+        # ---- Backward: Task 1 (s1_loss) ----
         self.optimizer.zero_grad()
-        (s1_loss + direction_loss_weight * direction_loss).backward(retain_graph=True)
+        s1_loss.backward(retain_graph=True)
         grad_s1 = [p.grad.clone() if p.grad is not None else None
-                   for p in model_params + list(head_params)]
+                   for p in model_params]
 
-        # ---- Backward: Task 2 (s2_loss，仅 model params) ----
+        # ---- Backward: Task 2 (s2_loss) ----
         self.optimizer.zero_grad()
         s2_loss.backward()
         grad_s2 = [p.grad.clone() if p.grad is not None else None
-                   for p in model_params + list(head_params)]
+                   for p in model_params]
 
         # ---- PCGrad projection ----
         merged_grads, grad_dot = self.project_conflicting_gradients(grad_s1, grad_s2)
 
         # ---- 应用合并后的梯度 ----
-        all_params = model_params + list(head_params)
-        for p, mg in zip(all_params, merged_grads):
+        for p, mg in zip(model_params, merged_grads):
             if mg is not None:
                 p.grad = mg
 
-        torch.nn.utils.clip_grad_norm_(all_params, max_norm=max_norm)
+        torch.nn.utils.clip_grad_norm_(model_params, max_norm=max_norm)
         self.optimizer.step()
 
-        total_loss = s1_loss.item() + s2_loss.item() + direction_loss_weight * direction_loss.item()
+        total_loss = s1_loss.item() + s2_loss.item()
         return total_loss, grad_dot
 
 
@@ -601,14 +580,9 @@ def train_model(model, tokenizer, device, config, save_dir, val_data=None):
 
     print(f"Train: {len(train_dataset)}, Val: {len(val_dataset)}")
 
-    # 方向预测 head
-    d_model = model.module.d_model
-    close_direction_head = nn.Linear(d_model, 1).to(device)
-
     # 优化器（只优化可训练参数）
     trainable_params = [p for p in model.parameters() if p.requires_grad]
-    all_params = trainable_params + list(close_direction_head.parameters())
-    optimizer = torch.optim.AdamW(all_params, lr=config.learning_rate,
+    optimizer = torch.optim.AdamW(trainable_params, lr=config.learning_rate,
                                    weight_decay=config.weight_decay,
                                    betas=(config.adam_beta1, config.adam_beta2))
 
@@ -644,17 +618,15 @@ def train_model(model, tokenizer, device, config, save_dir, val_data=None):
         if config.pcgrad:
             print(f"PCGrad: ON (price vs volume gradient surgery)")
 
-        for i, (batch_x, batch_stamp, batch_direction) in enumerate(train_loader):
+        for i, (batch_x, batch_stamp) in enumerate(train_loader):
             batch_x = batch_x.to(device, non_blocking=True)
             batch_stamp = batch_stamp.to(device, non_blocking=True)
-            batch_direction = batch_direction.to(device, non_blocking=True)
 
             if config.pcgrad:
                 # PCGrad 模式：s1_loss vs s2_loss 独立 backward，梯度投影
                 total_loss, grad_dot = pcgrad_optimizer.pcgrad_step(
-                    model, tokenizer, batch_x, batch_stamp, batch_direction,
-                    device, close_direction_head, config.direction_loss_weight,
-                    trainable_params, close_direction_head.parameters(), max_norm=3.0
+                    model, tokenizer, batch_x, batch_stamp,
+                    device, trainable_params, max_norm=3.0
                 )
                 epoch_grad_dots.append(grad_dot)
             else:
@@ -672,13 +644,7 @@ def train_model(model, tokenizer, device, config, save_dir, val_data=None):
                     s1_logits, s2_logits, token_out[0], token_out[1]
                 )
 
-                # 方向损失
-                pred_hidden = hidden[:, -1, :]
-                direction_logits = close_direction_head(pred_hidden).squeeze(-1)
-                direction_pred = torch.sigmoid(direction_logits)
-                direction_loss = F.binary_cross_entropy(direction_pred, batch_direction)
-
-                total_loss = recon_loss + config.direction_loss_weight * direction_loss
+                total_loss = recon_loss
 
                 optimizer.zero_grad()
                 total_loss.backward()
@@ -714,10 +680,9 @@ def train_model(model, tokenizer, device, config, save_dir, val_data=None):
         val_batches = 0
 
         with torch.no_grad():
-            for batch_x, batch_stamp, batch_direction in val_loader:
+            for batch_x, batch_stamp in val_loader:
                 batch_x = batch_x.to(device, non_blocking=True)
                 batch_stamp = batch_stamp.to(device, non_blocking=True)
-                batch_direction = batch_direction.to(device, non_blocking=True)
 
                 token_seq_0, token_seq_1 = tokenizer.encode(batch_x, half=True)
                 token_in = [token_seq_0[:, :-1], token_seq_1[:, :-1]]
@@ -730,25 +695,11 @@ def train_model(model, tokenizer, device, config, save_dir, val_data=None):
                     s1_logits, s2_logits, token_out[0], token_out[1]
                 )
 
-                pred_hidden = hidden[:, -1, :]
-                direction_logits = close_direction_head(pred_hidden).squeeze(-1)
-                direction_pred = torch.sigmoid(direction_logits)
-                direction_loss = F.binary_cross_entropy(direction_pred, batch_direction)
-
-                val_loss = recon_loss + config.direction_loss_weight * direction_loss
-                val_loss_sum += val_loss.item()
+                val_loss_sum += recon_loss.item()
                 val_batches += 1
-                if val_batches == 1:
-                    val_ce_sum = recon_loss.item()
-                    val_dir_sum = direction_loss.item()
-                else:
-                    val_ce_sum += recon_loss.item()
-                    val_dir_sum += direction_loss.item()
 
         avg_val_loss = val_loss_sum / val_batches
         avg_train_loss = sum(epoch_losses) / len(epoch_losses)
-        avg_val_ce = val_ce_sum / val_batches
-        avg_val_dir = val_dir_sum / val_batches
         history['train_loss'].append(avg_train_loss)
         history['val_loss'].append(avg_val_loss)
 
@@ -772,7 +723,7 @@ def train_model(model, tokenizer, device, config, save_dir, val_data=None):
         epoch_time = time.time() - epoch_start
         total_time = time.time() - start_time
 
-        print(f"Train: {avg_train_loss:.4f}, Val: {avg_val_loss:.4f} (CE: {avg_val_ce:.4f}, Dir: {avg_val_dir:.4f})")
+        print(f"Train: {avg_train_loss:.4f}, Val: {avg_val_loss:.4f}")
         if ic_result:
             # === 全特征概览 (step 3) ===
             feature_names = ic_result.get('feature_names', ['open', 'high', 'low', 'close', 'vol', 'amt'])
@@ -971,7 +922,6 @@ def main():
     config.early_stopping_grace_period = TRAINING_PARAMS['early_stopping_grace_period']
     config.ic_test_samples = args.n_samples
     config.ic_point = TRAINING_PARAMS['ic_point']
-    config.direction_loss_weight = TRAINING_PARAMS['direction_loss_weight']
     config.lr_scheduler = TRAINING_PARAMS['lr_scheduler']
     config.lr_min = TRAINING_PARAMS['lr_min']
     config.warmup_epochs = TRAINING_PARAMS['warmup_epochs']
