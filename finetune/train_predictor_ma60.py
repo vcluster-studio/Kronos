@@ -40,11 +40,11 @@ from model.kronos import KronosTokenizer, Kronos, auto_regressive_inference
 # MA60 tokenizer 路径
 TOKENIZER_MA60 = 'outputs/models/ma60_tokenizer_v1/checkpoints/best_model'
 
-# 预归一化数据路径
+# 预归一化数据路径（支持窗口化随机分配和传统时间截断两种格式）
 DATA_PATHS = {
-    'train': 'finetune/data/processed_datasets_ma60/train_data.pkl',
-    'val': 'finetune/data/processed_datasets_ma60/val_data.pkl',
-    'test': 'finetune/data/processed_datasets_ma60/test_data.pkl',
+    'train': 'finetune/data/processed_datasets_ma60_windowed_v3/train_data.pkl',
+    'val': 'finetune/data/processed_datasets_ma60_windowed_v3/val_data.pkl',
+    'test': 'finetune/data/processed_datasets_ma60_windowed_v3/test_data.pkl',
 }
 
 # Predictor 预训练路径
@@ -52,10 +52,10 @@ PREDICTOR_PRETRAINED = 'pretrained/Kronos-mini'
 
 # 训练参数
 TRAINING_PARAMS = {
-    'epochs': 30,
+    'epochs': 50,
     'batch_size': 16,
-    'learning_rate': 0.02,
-    'weight_decay': 0.1,
+    'learning_rate': 0.003,
+    'weight_decay': 0.01,
     'adam_beta1': 0.9,
     'adam_beta2': 0.95,
     'seed': 100,
@@ -64,18 +64,20 @@ TRAINING_PARAMS = {
     'clip': 5.0,
     'max_context': 2048,
     # 早停
-    'early_stopping_patience': 10,
-    'early_stopping_grace_period': 5,
+    'early_stopping_patience': 12,
+    'early_stopping_grace_period': 8,
     # IC 测试
     'ic_test_samples': 500,
     'ic_point': 3,
     # 方向损失
-    'direction_loss_weight': 0.3,
-    # VL-Adaptive LR
-    'lr_scheduler': 'vl_adaptive',
-    'lr_max': 0.03,
-    'lr_min': 1e-4,
-    'lr_decay_factor': 0.7,
+    'direction_loss_weight': 0.1,
+    # Cosine Annealing LR
+    'lr_scheduler': 'cosine',
+    'lr_min': 1e-5,
+    'warmup_epochs': 2,
+    # 冻结层
+    'freeze_layers': 0,
+    'freeze_embedding': False,
 }
 
 
@@ -103,8 +105,11 @@ class MA60Dataset(Dataset):
     """
     使用预归一化的 MA60 数据
 
-    数据格式:
-        {symbol: {'normalized': (T,6), 'means': (T,6), 'stds': (T,6), 'original': (T,6), 'index': DatetimeIndex}}
+    支持两种数据格式：
+    1. 传统格式（无 windows 字段）: {symbol: {'normalized', 'means', 'stds', 'original', 'index'}}
+       - 所有滑动窗口都可用
+    2. 窗口化格式（有 windows 字段）: {symbol: {..., 'windows': [start_idx_array]}}
+       - 只使用预分配的窗口列表
     """
 
     def __init__(self, data_type='train', config=None):
@@ -124,12 +129,26 @@ class MA60Dataset(Dataset):
         # 预计算索引
         print(f"[{data_type.upper()}] Pre-computing indices...")
         self.indices = []
-        for symbol in self.symbols:
-            data = self.raw_data[symbol]
-            seq_len = len(data['normalized'])
-            if seq_len >= self.window:
-                for i in range(seq_len - self.window + 1):
-                    self.indices.append((symbol, i))
+
+        # 检测数据格式：有 windows 字段则为窗口化格式
+        sample_data = self.raw_data[self.symbols[0]]
+        has_windows = 'windows' in sample_data
+
+        if has_windows:
+            # 窗口化格式：使用预分配的窗口列表
+            for symbol in self.symbols:
+                data = self.raw_data[symbol]
+                for start_idx in data['windows']:
+                    self.indices.append((symbol, int(start_idx)))
+            print(f"[{data_type.upper()}] Windowed format: using pre-assigned {len(self.indices)} windows")
+        else:
+            # 传统格式：所有滑动窗口
+            for symbol in self.symbols:
+                data = self.raw_data[symbol]
+                seq_len = len(data['normalized'])
+                if seq_len >= self.window:
+                    for i in range(seq_len - self.window + 1):
+                        self.indices.append((symbol, i))
 
         # 样本数
         n_iter = config.n_train_iter if data_type == 'train' else config.n_val_iter
@@ -174,7 +193,7 @@ def quick_ic_test_ma60(model, tokenizer, device, val_data, n_samples=500,
     """
     使用预归一化 MA60 数据的 IC 测试（val_data，随机采样）
 
-    val_data: 预归一化格式 {symbol: {'normalized', 'means', 'stds', 'original', 'index'}}
+    val_data: 预归一化格式 {symbol: {'normalized', 'means', 'stds', 'original', 'index', 'windows'(optional)}}
     rng: numpy RandomState，用于可复现的随机采样
     """
     model.eval()
@@ -182,88 +201,148 @@ def quick_ic_test_ma60(model, tokenizer, device, val_data, n_samples=500,
     predictions = []
     actuals = []
 
-    all_symbols = list(val_data.keys())
-    if rng is not None:
-        symbols = rng.choice(all_symbols, size=min(n_samples, len(all_symbols)), replace=False).tolist()
+    # 检测是否为窗口化格式
+    sample_symbol = list(val_data.keys())[0]
+    has_windows = 'windows' in val_data[sample_symbol]
+
+    if has_windows:
+        # 窗口化格式：从 val 的预分配窗口中随机采样
+        all_windows = []
+        for sym in val_data:
+            for start in val_data[sym]['windows']:
+                all_windows.append((sym, int(start)))
+
+        if rng is not None:
+            sample_indices = rng.choice(len(all_windows), size=min(n_samples, len(all_windows)), replace=False)
+        else:
+            sample_indices = np.arange(min(n_samples, len(all_windows)))
+
+        for idx in sample_indices:
+            symbol, start_idx = all_windows[idx]
+            data = val_data[symbol]
+            end_idx = start_idx + lookback + pred_len
+
+            try:
+                x_norm_full = data['normalized'][start_idx:end_idx].astype(np.float32)
+                means_full = data['means'][start_idx:end_idx]
+                stds_full = data['stds'][start_idx:end_idx]
+                timestamps_full = data['index'][start_idx:end_idx]
+
+                x_norm = x_norm_full[:lookback]
+                x_ts = timestamps_full[:lookback]
+                y_ts = timestamps_full[lookback:]
+
+                means = means_full
+                stds = stds_full
+
+                x_stamp = np.stack([
+                    x_ts.minute.values, x_ts.hour.values, x_ts.weekday.values, x_ts.day.values, x_ts.month.values
+                ], axis=1).astype(np.float32)
+
+                y_stamp = np.stack([
+                    y_ts.minute.values, y_ts.hour.values, y_ts.weekday.values, y_ts.day.values, y_ts.month.values
+                ], axis=1).astype(np.float32)
+
+                original_close = data['original'][:, 3]
+                baseline_close = original_close[start_idx + lookback - 1]
+                actual_end_close = original_close[start_idx + lookback + ic_point - 1]
+                actual_return = (actual_end_close - baseline_close) / baseline_close
+
+                with torch.no_grad():
+                    x_tensor = torch.from_numpy(x_norm).unsqueeze(0).to(device)
+                    x_stamp_tensor = torch.from_numpy(x_stamp).unsqueeze(0).to(device)
+                    y_stamp_tensor = torch.from_numpy(y_stamp).unsqueeze(0).to(device)
+
+                    preds = auto_regressive_inference(
+                        tokenizer, model,
+                        x_tensor, x_stamp_tensor, y_stamp_tensor,
+                        max_context=2048, pred_len=pred_len,
+                        clip=clip, T=1.0, top_k=0, top_p=0.9,
+                        sample_count=1, verbose=False
+                    )
+
+                    pred_close_norm = preds[0, -pred_len:, 3]
+                    pred_close_raw = pred_close_norm * stds[lookback:, 3] + means[lookback:, 3]
+                    pred_return = (pred_close_raw[ic_point - 1] - baseline_close) / baseline_close
+
+                predictions.append(pred_return)
+                actuals.append(actual_return)
+
+            except Exception as e:
+                if len(predictions) == 0:
+                    print(f"[IC TEST] First error: {e}")
+                continue
     else:
-        symbols = all_symbols[:n_samples]
+        # 传统格式：从每只股票末尾采样
+        all_symbols = list(val_data.keys())
+        if rng is not None:
+            symbols = rng.choice(all_symbols, size=min(n_samples, len(all_symbols)), replace=False).tolist()
+        else:
+            symbols = all_symbols[:n_samples]
 
-    for symbol in symbols:
-        data = val_data[symbol]
-        seq_len = len(data['normalized'])
+        for symbol in symbols:
+            data = val_data[symbol]
+            seq_len = len(data['normalized'])
 
-        if seq_len < lookback + pred_len:
-            continue
+            if seq_len < lookback + pred_len:
+                continue
 
-        try:
-            # 取最后 lookback + pred_len 数据
-            end_idx = seq_len
-            start_idx = end_idx - (lookback + pred_len)
+            try:
+                end_idx = seq_len
+                start_idx = end_idx - (lookback + pred_len)
 
-            # 取 lookback + pred_len 长度的数据
-            full_len = lookback + pred_len
-            x_norm_full = data['normalized'][end_idx - full_len:end_idx].astype(np.float32)
-            means_full = data['means'][end_idx - full_len:end_idx]
-            stds_full = data['stds'][end_idx - full_len:end_idx]
+                full_len = lookback + pred_len
+                x_norm_full = data['normalized'][end_idx - full_len:end_idx].astype(np.float32)
+                means_full = data['means'][end_idx - full_len:end_idx]
+                stds_full = data['stds'][end_idx - full_len:end_idx]
 
-            timestamps_full = data['index'][end_idx - full_len:end_idx]
+                timestamps_full = data['index'][end_idx - full_len:end_idx]
 
-            # 分割为 x (lookback) 和 y (pred_len)
-            x_norm = x_norm_full[:lookback]
-            x_ts = timestamps_full[:lookback]
-            y_ts = timestamps_full[lookback:]
+                x_norm = x_norm_full[:lookback]
+                x_ts = timestamps_full[:lookback]
+                y_ts = timestamps_full[lookback:]
 
-            # means/stds 用于反归一化预测部分
-            means = means_full
-            stds = stds_full
+                means = means_full
+                stds = stds_full
 
-            x_stamp = np.stack([
-                x_ts.minute.values, x_ts.hour.values, x_ts.weekday.values, x_ts.day.values, x_ts.month.values
-            ], axis=1).astype(np.float32)
+                x_stamp = np.stack([
+                    x_ts.minute.values, x_ts.hour.values, x_ts.weekday.values, x_ts.day.values, x_ts.month.values
+                ], axis=1).astype(np.float32)
 
-            y_stamp = np.stack([
-                y_ts.minute.values, y_ts.hour.values, y_ts.weekday.values, y_ts.day.values, y_ts.month.values
-            ], axis=1).astype(np.float32)
+                y_stamp = np.stack([
+                    y_ts.minute.values, y_ts.hour.values, y_ts.weekday.values, y_ts.day.values, y_ts.month.values
+                ], axis=1).astype(np.float32)
 
-            # 原始 close（用于计算实际收益率）
-            original_close = data['original'][:, 3]
-            baseline_close = original_close[end_idx - pred_len - 1]
+                original_close = data['original'][:, 3]
+                baseline_close = original_close[end_idx - pred_len - 1]
 
-            with torch.no_grad():
-                x_tensor = torch.from_numpy(x_norm[:lookback]).unsqueeze(0).to(device)
-                x_stamp_tensor = torch.from_numpy(x_stamp).unsqueeze(0).to(device)
-                y_stamp_tensor = torch.from_numpy(y_stamp).unsqueeze(0).to(device)
+                with torch.no_grad():
+                    x_tensor = torch.from_numpy(x_norm[:lookback]).unsqueeze(0).to(device)
+                    x_stamp_tensor = torch.from_numpy(x_stamp).unsqueeze(0).to(device)
+                    y_stamp_tensor = torch.from_numpy(y_stamp).unsqueeze(0).to(device)
 
-                preds = auto_regressive_inference(
-                    tokenizer, model,
-                    x_tensor, x_stamp_tensor, y_stamp_tensor,
-                    max_context=2048, pred_len=pred_len,
-                    clip=clip, T=1.0, top_k=0, top_p=0.9,
-                    sample_count=1, verbose=False
-                )
+                    preds = auto_regressive_inference(
+                        tokenizer, model,
+                        x_tensor, x_stamp_tensor, y_stamp_tensor,
+                        max_context=2048, pred_len=pred_len,
+                        clip=clip, T=1.0, top_k=0, top_p=0.9,
+                        sample_count=1, verbose=False
+                    )
 
-                # 预测 close（取 pred_len 部分）
-                # auto_regressive_inference 返回 numpy array，不需要 .cpu()
-                pred_close_norm = preds[0, -pred_len:, 3]
+                    pred_close_norm = preds[0, -pred_len:, 3]
+                    pred_close_raw = pred_close_norm * stds[lookback:, 3] + means[lookback:, 3]
+                    pred_return = (pred_close_raw[ic_point - 1] - baseline_close) / baseline_close
 
-                # 反归一化（使用预计算的 means/stds）
-                pred_close_raw = pred_close_norm * stds[lookback:, 3] + means[lookback:, 3]
+                actual_close = original_close[end_idx - pred_len:]
+                actual_return = (actual_close[ic_point - 1] - baseline_close) / baseline_close
 
-                # 预测收益率
-                pred_return = (pred_close_raw[ic_point - 1] - baseline_close) / baseline_close
+                predictions.append(pred_return)
+                actuals.append(actual_return)
 
-            # 实际收益率
-            actual_close = original_close[end_idx - pred_len:]
-            actual_return = (actual_close[ic_point - 1] - baseline_close) / baseline_close
-
-            predictions.append(pred_return)
-            actuals.append(actual_return)
-
-        except Exception as e:
-            # 打印第一个错误，便于调试
-            if len(predictions) == 0:
-                print(f"[IC TEST] First error: {e}")
-            continue
+            except Exception as e:
+                if len(predictions) == 0:
+                    print(f"[IC TEST] First error: {e}")
+                continue
 
     if len(predictions) > 5:
         predictions = np.array(predictions)
@@ -278,14 +357,46 @@ def quick_ic_test_ma60(model, tokenizer, device, val_data, n_samples=500,
     return None
 
 
+def freeze_model_layers(model, freeze_layers=2, freeze_embedding=True):
+    """冻结模型前 N 层 transformer 和 embedding"""
+    # 冻结 embedding
+    if freeze_embedding:
+        for param in model.module.embedding.parameters():
+            param.requires_grad = False
+        for param in model.module.time_emb.parameters():
+            param.requires_grad = False
+        print(f"[FREEZE] Embedding + TemporalEmb frozen")
+
+    # 冻结前 N 层 transformer
+    for i in range(min(freeze_layers, len(model.module.transformer))):
+        for param in model.module.transformer[i].parameters():
+            param.requires_grad = False
+        print(f"[FREEZE] Transformer layer {i} frozen")
+
+    # 统计可训练参数
+    total = sum(p.numel() for p in model.parameters())
+    trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    print(f"[FREEZE] Trainable: {trainable/1e6:.2f}M / {total/1e6:.2f}M ({100*trainable/total:.1f}%)")
+
+
 def train_model(model, tokenizer, device, config, save_dir, val_data=None):
     """训练 MA60 predictor"""
     start_time = time.time()
 
     print(f"BATCHSIZE: {config.batch_size}")
     print(f"LR: {config.learning_rate}")
+    print(f"LR Scheduler: {config.lr_scheduler}")
+    print(f"Weight Decay: {config.weight_decay}")
     print(f"Lookback: {config.lookback}")
     print(f"Predict: {config.predict}")
+
+    # 冻结层
+    if config.freeze_layers > 0 or config.freeze_embedding:
+        freeze_model_layers(model, config.freeze_layers, config.freeze_embedding)
+
+    # 方向预测头（从 hidden state 预测 close 涨跌）
+    d_model = model.module.d_model
+    close_direction_head = torch.nn.Linear(d_model, 1).to(device)
 
     # 数据集
     train_dataset = MA60Dataset('train', config=config)
@@ -300,26 +411,43 @@ def train_model(model, tokenizer, device, config, save_dir, val_data=None):
 
     print(f"Train: {len(train_dataset)}, Val: {len(val_dataset)}")
 
-    # 方向预测 head
-    import torch.nn as nn
-    d_model = model.module.d_model
-    close_direction_head = nn.Linear(d_model, 1).to(device)
-
-    # 优化器
-    all_params = list(model.parameters()) + list(close_direction_head.parameters())
+    # 优化器（只优化可训练参数）
+    trainable_params = [p for p in model.parameters() if p.requires_grad]
+    all_params = trainable_params + list(close_direction_head.parameters())
     optimizer = torch.optim.AdamW(all_params, lr=config.learning_rate,
                                    weight_decay=config.weight_decay,
                                    betas=(config.adam_beta1, config.adam_beta2))
+
+    # Cosine Annealing LR（无 warmup，直接 cosine）
+    total_steps = config.epochs * len(train_loader)
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+        optimizer, T_max=total_steps, eta_min=config.lr_min
+    )
 
     best_val_loss = float('inf')
     best_ic = -999
     patience_counter = 0
 
-    history = {'train_loss': [], 'val_loss': [], 'ic': [], 'lr': []}
+    # 预计算 bit_mask 用于 soft decode（只需一次）
+    # bit_mask[idx, b] = 1.0 if bit b is set in idx, else 0.0
+    # P(bit_b=1) = probs @ bit_mask[:, b]
+    tokenizer_module = tokenizer.module if hasattr(tokenizer, 'module') else tokenizer
+    vocab_s1 = 2 ** tokenizer_module.s1_bits
+    vocab_s2 = 2 ** tokenizer_module.s2_bits
+    s1_bit_mask = torch.zeros(vocab_s1, tokenizer_module.s1_bits, device=device)
+    s2_bit_mask = torch.zeros(vocab_s2, tokenizer_module.s2_bits, device=device)
+    for idx in range(vocab_s1):
+        for b in range(tokenizer_module.s1_bits):
+            if (idx >> b) & 1:
+                s1_bit_mask[idx, b] = 1.0
+    for idx in range(vocab_s2):
+        for b in range(tokenizer_module.s2_bits):
+            if (idx >> b) & 1:
+                s2_bit_mask[idx, b] = 1.0
+    codebook_dim = tokenizer_module.codebook_dim
+    q_scale = 1.0 / (codebook_dim ** 0.5)
 
-    # VL-Adaptive LR 状态
-    good_lr_pool = []
-    lr_before_decay = None
+    history = {'train_loss': [], 'val_loss': [], 'ic': [], 'lr': []}
 
     for epoch_idx in range(config.epochs):
         epoch_start = time.time()
@@ -349,11 +477,13 @@ def train_model(model, tokenizer, device, config, save_dir, val_data=None):
             s1_logits, s2_logits, hidden = model.module.forward_with_hidden(
                 token_in[0], token_in[1], batch_stamp[:, :-1, :]
             )
-            recon_loss, s1_loss, s2_loss = model.module.head.compute_loss(
+
+            # 全位置均匀 CE（与原始项目一致）
+            recon_loss, ce_s1, ce_s2 = model.module.head.compute_loss(
                 s1_logits, s2_logits, token_out[0], token_out[1]
             )
 
-            # 方向损失
+            # 方向损失（从 hidden state 预测 close 涨跌）
             pred_hidden = hidden[:, -1, :]
             direction_logits = close_direction_head(pred_hidden).squeeze(-1)
             direction_pred = torch.sigmoid(direction_logits)
@@ -363,8 +493,10 @@ def train_model(model, tokenizer, device, config, save_dir, val_data=None):
 
             optimizer.zero_grad()
             total_loss.backward()
-            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=3.0)
+            torch.nn.utils.clip_grad_norm_(trainable_params, max_norm=3.0)
             optimizer.step()
+
+            scheduler.step()
 
             epoch_losses.append(total_loss.item())
 
@@ -373,6 +505,7 @@ def train_model(model, tokenizer, device, config, save_dir, val_data=None):
                 progress = (i + 1) / len(train_loader) * 100
                 print(f"  Batch {i+1}/{len(train_loader)} ({progress:.1f}%) - Loss: {total_loss.item():.4f}, Avg: {avg_loss:.4f}")
 
+        current_lr = optimizer.param_groups[0]['lr']
         history['lr'].append(current_lr)
 
         # Validation
@@ -393,16 +526,20 @@ def train_model(model, tokenizer, device, config, save_dir, val_data=None):
                 s1_logits, s2_logits, hidden = model.module.forward_with_hidden(
                     token_in[0], token_in[1], batch_stamp[:, :-1, :]
                 )
+
+                # 全位置均匀 CE（与训练一致）
                 recon_loss, _, _ = model.module.head.compute_loss(
                     s1_logits, s2_logits, token_out[0], token_out[1]
                 )
 
+                # 方向损失（与训练一致）
                 pred_hidden = hidden[:, -1, :]
                 direction_logits = close_direction_head(pred_hidden).squeeze(-1)
                 direction_pred = torch.sigmoid(direction_logits)
                 direction_loss = F.binary_cross_entropy(direction_pred, batch_direction)
 
                 val_loss = recon_loss + config.direction_loss_weight * direction_loss
+
                 val_loss_sum += val_loss.item()
                 val_batches += 1
 
@@ -436,57 +573,7 @@ def train_model(model, tokenizer, device, config, save_dir, val_data=None):
         print(f"IC: {current_ic:.4f}, IC_smoothed: {ic_smoothed:.4f} (best: {best_ic:.4f})")
         print(f"Time: {format_time(epoch_time)}, Total: {format_time(total_time)}")
 
-        # VL-Adaptive LR
-        if config.lr_scheduler == 'vl_adaptive':
-            tl_history = history['train_loss']
-            vl_history = history['val_loss']
-
-            def calc_stability(loss_history, window=3):
-                if len(loss_history) < window:
-                    return True, None
-                recent = loss_history[-window:]
-                std = np.std(recent)
-                mean = np.mean(recent)
-                is_stable = std < mean * 0.05
-                is_declining = recent[-1] < recent[0]
-                return is_stable, is_declining
-
-            tl_stable, tl_declining = calc_stability(tl_history)
-            vl_stable, vl_declining = calc_stability(vl_history)
-
-            vl_worsening = avg_val_loss > best_val_loss
-            new_lr = current_lr
-            lr_action = ""
-
-            if vl_worsening:
-                if good_lr_pool:
-                    best_good_lr = min(good_lr_pool, key=lambda x: x[1])[0]
-                    new_lr = best_good_lr
-                    lr_action = f"ROLLBACK to {best_good_lr:.6f}"
-                else:
-                    new_lr = max(current_lr * config.lr_decay_factor, config.lr_min)
-                    lr_action = f"DECAY (VL worsening)"
-                lr_before_decay = current_lr
-            elif tl_stable and tl_declining and vl_stable:
-                lr_action = "KEEP (stable)"
-            elif tl_stable and vl_declining and current_lr < config.lr_max:
-                # 探索更高 LR
-                candidate = current_lr * 1.1
-                if candidate <= config.lr_max:
-                    new_lr = candidate
-                    lr_action = f"EXPLORE {candidate:.6f}"
-            else:
-                lr_action = "KEEP"
-
-            # 记录好 LR
-            if tl_stable and tl_declining and vl_stable and vl_declining:
-                good_lr_pool.append((current_lr, avg_val_loss, avg_train_loss))
-                good_lr_pool = sorted(good_lr_pool, key=lambda x: x[1])[:5]
-                lr_action += " [GOOD LR]"
-
-            for param_group in optimizer.param_groups:
-                param_group['lr'] = new_lr
-            print(f"[VL-ADAPTIVE] {lr_action}")
+        print(f"[LR] {current_lr:.6f}")
 
         # Save latest
         latest_path = f"{save_dir}/checkpoints/latest_model"
@@ -540,12 +627,12 @@ def main():
     parser = argparse.ArgumentParser(description='MA60 Predictor Training')
     parser.add_argument('--epochs', type=int, default=30)
     parser.add_argument('--batch-size', type=int, default=16)
-    parser.add_argument('--lr', type=float, default=0.02)
+    parser.add_argument('--lr', type=float, default=0.003)
     parser.add_argument('--n-samples', type=int, default=500)
     parser.add_argument('--resume', type=str, default=None,
                         help='Resume from checkpoint path (e.g. outputs/models/ma60_predictor_v1/checkpoints/best_ic_model)')
-    parser.add_argument('--save-folder', type=str, default='ma60_predictor_v1',
-                        help='Save folder name (default: ma60_predictor_v1)')
+    parser.add_argument('--save-folder', type=str, default='ma60_predictor_mini_v6e',
+                        help='Save folder name (default: ma60_predictor_mini_v4)')
     args = parser.parse_args()
 
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
@@ -612,17 +699,18 @@ def main():
     config.weight_decay = TRAINING_PARAMS['weight_decay']
     config.adam_beta1 = TRAINING_PARAMS['adam_beta1']
     config.adam_beta2 = TRAINING_PARAMS['adam_beta2']
-    config.n_train_iter = 2000 * config.batch_size
-    config.n_val_iter = 400 * config.batch_size
+    config.n_train_iter = 2000 * config.batch_size  # 32000
+    config.n_val_iter = 400 * config.batch_size      # 6400
     config.early_stopping_patience = TRAINING_PARAMS['early_stopping_patience']
     config.early_stopping_grace_period = TRAINING_PARAMS['early_stopping_grace_period']
     config.ic_test_samples = args.n_samples
     config.ic_point = TRAINING_PARAMS['ic_point']
     config.direction_loss_weight = TRAINING_PARAMS['direction_loss_weight']
     config.lr_scheduler = TRAINING_PARAMS['lr_scheduler']
-    config.lr_max = TRAINING_PARAMS['lr_max']
     config.lr_min = TRAINING_PARAMS['lr_min']
-    config.lr_decay_factor = TRAINING_PARAMS['lr_decay_factor']
+    config.warmup_epochs = TRAINING_PARAMS['warmup_epochs']
+    config.freeze_layers = TRAINING_PARAMS['freeze_layers']
+    config.freeze_embedding = TRAINING_PARAMS['freeze_embedding']
 
     # 加载验证数据（IC 评估用）
     val_path = DATA_PATHS['val']

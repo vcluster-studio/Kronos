@@ -94,10 +94,10 @@ TOKENIZER_CONFIG = {
 
 # 训练参数默认值
 TRAINING_PARAMS = {
-    'epochs': 30,
+    'epochs': 50,
     'batch_size': 16,
-    'learning_rate': 0.02,  # 起始 LR
-    'weight_decay': 0.1,
+    'learning_rate': 0.003,  # 起始 LR（cosine annealing）
+    'weight_decay': 0.01,
     'adam_beta1': 0.9,
     'adam_beta2': 0.95,
     'seed': 100,
@@ -109,20 +109,18 @@ TRAINING_PARAMS = {
     # 归一化模式
     'norm_mode': 'full_window',  # 'full_window' 或 'sliding_ma60'
     # 早停参数
-    'early_stopping_patience': 10,
+    'early_stopping_patience': 12,
     'early_stopping_min_delta': 0.0001,
-    'early_stopping_grace_period': 5,
+    'early_stopping_grace_period': 8,
     'early_stopping_check_ic': True,
     'early_stopping_window': 5,
-    # VL-IC Adaptive 学习率（带上下限额和缓冲）
-    'lr_scheduler': 'vl_adaptive',
-    'lr_max': 0.03,           # 上限：不超过起始 LR 的 1.5 倍
-    'lr_min': 1e-4,           # 下限：不低于 0.0001
-    'lr_decay_factor': 0.7,   # 衰减保留 70%
-    'lr_boost_factor': 1.2,   # 提升保留 120%（温和提升）
-    'lr_boost_patience': 3,   # 连续 N epoch 改善才 boost（缓冲）
-    'lr_decay_patience': 3,   # 连续 N epoch 无改善才 decay（缓冲）
-    'ic_improve_threshold': 0.05,
+    # Cosine Annealing LR
+    'lr_scheduler': 'cosine',
+    'lr_min': 1e-5,
+    'warmup_epochs': 2,
+    # 冻结层
+    'freeze_layers': 0,
+    'freeze_embedding': False,
     # IC 计算目标点（Point+N，N=3表示预测窗口第3个点）
     'ic_point': 3,  # 默认计算 Point+3 的 IC（实际最有价值）
     # 方向损失（从 hidden state 直接预测，梯度可传）
@@ -296,13 +294,41 @@ def create_dataloader(dataset, config, data_type):
     return loader
 
 
+def freeze_model_layers(model, freeze_layers=2, freeze_embedding=True):
+    """冻结模型前 N 层 transformer 和 embedding"""
+    # 冻结 embedding
+    if freeze_embedding:
+        for param in model.module.embedding.parameters():
+            param.requires_grad = False
+        for param in model.module.time_emb.parameters():
+            param.requires_grad = False
+        print(f"[FREEZE] Embedding + TemporalEmb frozen", flush=True)
+
+    # 冻结前 N 层 transformer
+    for i in range(min(freeze_layers, len(model.module.transformer))):
+        for param in model.module.transformer[i].parameters():
+            param.requires_grad = False
+        print(f"[FREEZE] Transformer layer {i} frozen", flush=True)
+
+    # 统计可训练参数
+    total = sum(p.numel() for p in model.parameters())
+    trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    print(f"[FREEZE] Trainable: {trainable/1e6:.2f}M / {total/1e6:.2f}M ({100*trainable/total:.1f}%)", flush=True)
+
+
 def train_model(model, tokenizer, device, config, save_dir, val_data=None):
-    """训练模型，支持动态早停和周期性学习率"""
+    """训练模型，使用 Cosine Annealing + Warmup + Layer Freezing"""
     start_time = time.time()
     print(f"BATCHSIZE: {config.batch_size}", flush=True)
     print(f"LR: {config.predictor_learning_rate}", flush=True)
     print(f"LR Scheduler: {config.lr_scheduler}", flush=True)
+    print(f"Weight Decay: {config.adam_weight_decay}", flush=True)
+    print(f"Warmup: {config.warmup_epochs} epochs", flush=True)
     print(f"IC Test Samples: {config.ic_test_samples}", flush=True)
+
+    # 冻结层
+    if config.freeze_layers > 0 or config.freeze_embedding:
+        freeze_model_layers(model, config.freeze_layers, config.freeze_embedding)
 
     # Import dataset
     from finetune.dataset import QlibDataset
@@ -322,8 +348,9 @@ def train_model(model, tokenizer, device, config, save_dir, val_data=None):
     close_direction_head = nn.Linear(d_model, 1).to(device)  # 输出方向概率
     print(f"Close direction head: Linear({d_model}, 1)", flush=True)
 
-    # 合并参数到优化器
-    all_params = list(model.parameters()) + list(close_direction_head.parameters())
+    # 优化器（只优化可训练参数）
+    trainable_params = [p for p in model.parameters() if p.requires_grad]
+    all_params = trainable_params + list(close_direction_head.parameters())
     optimizer = torch.optim.AdamW(
         all_params,
         lr=config.predictor_learning_rate,
@@ -331,23 +358,12 @@ def train_model(model, tokenizer, device, config, save_dir, val_data=None):
         betas=(config.adam_beta1, config.adam_beta2)
     )
 
-    # === 学习率调度器 ===
-    if config.lr_scheduler == 'vl_adaptive':
-        print(f"VL-Adaptive: LR will adjust based on Val Loss improvement", flush=True)
-        print(f"  - Max LR: {config.lr_max}, Min LR: {config.lr_min}", flush=True)
-        print(f"  - IC improve threshold: {config.ic_improve_threshold}", flush=True)
-        print(f"  - Decay factor: {config.lr_decay_factor}, Boost factor: {config.lr_boost_factor}", flush=True)
-        scheduler = None
-    else:
-        scheduler = torch.optim.lr_scheduler.OneCycleLR(
-            optimizer,
-            max_lr=config.predictor_learning_rate,
-            steps_per_epoch=len(train_loader),
-            epochs=config.epochs,
-            pct_start=0.03,
-            div_factor=10
-        )
-        print(f"OneCycleLR", flush=True)
+    # Cosine Annealing LR（无 warmup）
+    total_steps = config.epochs * len(train_loader)
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+        optimizer, T_max=total_steps, eta_min=config.lr_min
+    )
+    print(f"CosineAnnealing: warmup={warmup_steps} steps, total={total_steps} steps", flush=True)
 
     best_val_loss = float('inf')
     best_ic = -999
@@ -356,17 +372,6 @@ def train_model(model, tokenizer, device, config, save_dir, val_data=None):
     # 动态早停：记录历史用于趋势判断
     val_loss_history = []
     ic_history = []
-
-    # 滑动窗口 LR 调整：用近期趋势而非单点判断
-    ic_window = []  # 最近 N 个 IC 值
-    ic_window_size = 5  # 窗口大小
-    ic_consecutive_improve = 0  # 连续改善计数
-    ic_consecutive_decay = 0    # 连续恶化计数
-
-    # === LR 智能调整策略 ===
-    good_lr_pool = []           # [(lr, vl, tl), ...] 确认好的LR
-    lr_before_decay = None      # decay前的LR（用于回退）
-    explore_lr_candidates = []  # 探索候选LR列表
 
     history = {
         'train_loss': [],
@@ -408,26 +413,19 @@ def train_model(model, tokenizer, device, config, save_dir, val_data=None):
             )
 
             # === 方向损失（直接从 hidden state 预测，梯度可传）===
-            # 取预测窗口最后一个位置的 hidden state
-            pred_hidden = hidden[:, -1, :]  # [batch, d_model] - 最后一个时间步
-            direction_logits = close_direction_head(pred_hidden).squeeze(-1)  # [batch]
-            direction_pred = torch.sigmoid(direction_logits)  # 方向概率
-
-            # 方向损失（BCE）
+            pred_hidden = hidden[:, -1, :]
+            direction_logits = close_direction_head(pred_hidden).squeeze(-1)
+            direction_pred = torch.sigmoid(direction_logits)
             direction_loss = F.binary_cross_entropy(direction_pred, batch_direction)
 
-            # 组合损失
             total_loss = recon_loss + config.direction_loss_weight * direction_loss
 
-            # Backward
             optimizer.zero_grad()
             total_loss.backward()
-            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=3.0)
+            torch.nn.utils.clip_grad_norm_(trainable_params, max_norm=3.0)
             optimizer.step()
 
-            # Step scheduler (for OneCycle and CosineAnnealingWarmRestarts - per batch)
-            if config.lr_scheduler in ['cosine_warmup', 'onecycle']:
-                scheduler.step()
+            scheduler.step()
 
             epoch_losses.append(total_loss.item())
 
@@ -435,9 +433,9 @@ def train_model(model, tokenizer, device, config, save_dir, val_data=None):
             if (i + 1) % 50 == 0 or i == 0:
                 avg_loss = sum(epoch_losses[-50:]) / min(len(epoch_losses[-50:]), 50)
                 progress = (i + 1) / len(train_loader) * 100
-                print(f"  Batch {i+1}/{len(train_loader)} ({progress:.1f}%) - Loss: {total_loss.item():.4f}, DirLoss: {direction_loss.item():.4f}, Avg: {avg_loss:.4f}", flush=True)
+                print(f"  Batch {i+1}/{len(train_loader)} ({progress:.1f}%) - Loss: {total_loss.item():.4f}, Avg: {avg_loss:.4f}", flush=True)
 
-        # Record LR
+        current_lr = optimizer.param_groups[0]['lr']
         history['lr'].append(current_lr)
 
         # Validation
@@ -497,154 +495,14 @@ def train_model(model, tokenizer, device, config, save_dir, val_data=None):
         else:
             ic_smoothed = current_ic
 
-        # 计算 IC 改善幅度
-        if best_ic > -999:
-            ic_improve_ratio = (ic_smoothed - best_ic) / max(abs(best_ic), 0.01)
-        else:
-            ic_improve_ratio = 0
-
         epoch_time = time.time() - epoch_start
         total_time = time.time() - start_time
 
         # Epoch 结果
         print(f"Train: {avg_train_loss:.4f}, Val: {avg_val_loss:.4f}", flush=True)
-        print(f"IC: {current_ic:.4f}, IC_smoothed: {ic_smoothed:.4f} (best: {best_ic:.4f}, improve: {ic_improve_ratio:.2%})", flush=True)
+        print(f"IC: {current_ic:.4f}, IC_smoothed: {ic_smoothed:.4f} (best: {best_ic:.4f})", flush=True)
         print(f"Time: {format_time(epoch_time)}, Total: {format_time(total_time)}", flush=True)
-
-        # Plateau scheduler step (per epoch)
-        if config.lr_scheduler == 'plateau':
-            scheduler.step(avg_val_loss)
-        # Warmup+Cosine scheduler step (per epoch)
-        elif config.lr_scheduler == 'warmup_cosine':
-            scheduler.step()
-        # VL-Adaptive: 滑动窗口趋势判断（避免单点波动）
-        elif config.lr_scheduler == 'vl_adaptive':
-            # === 智能 LR 调整策略（综合 TL/VL 稳定性）===
-
-            # 0. 更新 IC window（用于监控显示）
-            ic_window.append(current_ic)
-            if len(ic_window) > ic_window_size:
-                ic_window.pop(0)
-            avg_ic_window = sum(ic_window) / len(ic_window) if ic_window else 0
-
-            # IC 连续计数（用于监控显示）
-            if len(ic_history) >= 2 and current_ic > ic_history[-2]:
-                ic_consecutive_improve += 1
-                ic_consecutive_decay = 0
-            elif len(ic_history) >= 2 and current_ic < ic_history[-2]:
-                ic_consecutive_decay += 1
-                ic_consecutive_improve = 0
-            else:
-                ic_consecutive_improve = 0
-                ic_consecutive_decay = 0
-
-            # 1. 更新历史记录
-            tl_history = history['train_loss']
-            vl_history = history['val_loss']
-
-            # 2. 计算 TL/VL 稳定性（最近3轮波动）
-            def calc_stability(loss_history, window=3):
-                if len(loss_history) < window:
-                    return True, None  # 数据不足，默认稳定
-                recent = loss_history[-window:]
-                std = np.std(recent)
-                mean = np.mean(recent)
-                is_stable = std < mean * 0.05  # 波动小于5%认为稳定
-                is_declining = recent[-1] < recent[0]  # 下降趋势
-                return is_stable, is_declining
-
-            tl_stable, tl_declining = calc_stability(tl_history)
-            vl_stable, vl_declining = calc_stability(vl_history)
-
-            # 3. TL/VL 综合状态判断
-            tl_worsening = len(tl_history) >= 2 and tl_history[-1] > tl_history[-2] * 1.02  # TL上升超过2%
-            tl_volatility = len(tl_history) >= 3 and np.std(tl_history[-3:]) > np.mean(tl_history[-3:]) * 0.08  # TL波动超过8%
-
-            vl_worsening = avg_val_loss > best_val_loss  # VL恶化（直接判断，无阈值）
-            vl_improving = avg_val_loss < best_val_loss  # VL改善
-
-            # 4. 决策逻辑
-            new_lr = current_lr
-            lr_action = ""
-
-            # === 下降通道 ===
-            # VL恶化优先判断（最高优先级）
-            if vl_worsening:
-                # VL恶化 → 需要调整
-                if good_lr_pool:
-                    best_good_lr = min(good_lr_pool, key=lambda x: x[1])[0]
-                    new_lr = best_good_lr
-                    lr_action = f"ROLLBACK (VL worsening, back to good LR={best_good_lr:.6f})"
-                else:
-                    new_lr = max(current_lr * config.lr_decay_factor, config.lr_min)
-                    lr_action = f"DECAY (VL worsening: {avg_val_loss:.4f} > {best_val_loss:.4f})"
-                lr_before_decay = current_lr
-
-            elif tl_worsening or tl_volatility:
-                # TL不稳定 → 需要调整（太激进）
-                if good_lr_pool:
-                    # 回退到上一个好LR
-                    best_good_lr = min(good_lr_pool, key=lambda x: x[1])[0]  # 取VL最低的好LR
-                    new_lr = best_good_lr
-                    lr_action = f"ROLLBACK (TL unstable, back to good LR={best_good_lr:.6f})"
-                else:
-                    # 没有好LR记录，用decay
-                    new_lr = max(current_lr * config.lr_decay_factor, config.lr_min)
-                    lr_action = f"DECAY (TL unstable, no good LR history)"
-                lr_before_decay = current_lr  # 记录decay前的LR
-
-            # === 保持稳定 ===
-            elif tl_stable and tl_declining and vl_stable:
-                # TL/VL都稳定下降 → 最佳状态，保持
-                lr_action = f"KEEP (TL/VL stable and declining)"
-
-            elif tl_stable and tl_declining and not vl_stable:
-                # TL稳定下降，VL有波动 → 内部稳定，可容忍VL波动
-                lr_action = f"KEEP (TL stable, VL fluctuation tolerable)"
-
-            # === 回升通道 ===
-            elif lr_before_decay and tl_declining and vl_improving:
-                # decay后TL/VL都在改善 → 可能decay过头，尝试回升
-                if current_lr < lr_before_decay:
-                    # 回升到decay前的LR（探索）
-                    new_lr = lr_before_decay
-                    lr_action = f"RECOVER (decay was too aggressive, back to {lr_before_decay:.6f})"
-                    lr_before_decay = None  # 清除标记
-
-            elif tl_stable and vl_declining and current_lr < config.lr_max:
-                # TL稳定、VL下降，且LR未到上限 → 可小幅度探索
-                if len(explore_lr_candidates) == 0:
-                    # 生成探索候选（当前LR × 1.1, 1.15, 1.2）
-                    explore_lr_candidates = [
-                        current_lr * 1.1,
-                        current_lr * 1.15,
-                        current_lr * 1.2,
-                    ]
-                if explore_lr_candidates:
-                    candidate = explore_lr_candidates.pop(0)
-                    if candidate <= config.lr_max:
-                        new_lr = candidate
-                        lr_action = f"EXPLORE (try higher LR={candidate:.6f})"
-
-            # === 默认保持 ===
-            if not lr_action:
-                lr_action = f"KEEP (TL={avg_train_loss:.4f}, VL={avg_val_loss:.4f})"
-
-            # 5. 记录好LR（当TL/VL都稳定下降且VL创新低时）
-            if tl_stable and tl_declining and vl_stable and vl_declining:
-                good_lr_pool.append((current_lr, avg_val_loss, avg_train_loss))
-                # 去重并按VL排序，保留最近5个
-                good_lr_pool = sorted(good_lr_pool, key=lambda x: x[1])[:5]
-                lr_action += " [GOOD LR RECORDED]"
-
-            # 更新 optimizer LR
-            for param_group in optimizer.param_groups:
-                param_group['lr'] = new_lr
-            current_lr = new_lr
-
-            print(f"[VL-ADAPTIVE] {lr_action}", flush=True)
-            print(f"  IC window avg: {avg_ic_window:.4f}, consecutive: ↑{ic_consecutive_improve} ↓{ic_consecutive_decay}", flush=True)
-            print(f"Next epoch LR: {new_lr:.6f}", flush=True)
+        print(f"[LR] {current_lr:.6f}", flush=True)
 
         # === 每轮结束都保存最新模型 ===
         latest_path = f"{save_dir}/checkpoints/latest_model"
@@ -675,25 +533,10 @@ def train_model(model, tokenizer, device, config, save_dir, val_data=None):
             patience_counter += 1
 
         # === 结合 LR 状态的动态早停策略 ===
-        # 判断是否处于"爬山过程"（LR 较高，正在探索）
-        if config.lr_scheduler == 'vl_adaptive':
-            # VL-Adaptive: LR 较高时为探索期
-            lr_high = current_lr > 0.001
-            is_exploring = lr_high
-            state_desc = "EXPLORING (LR high)" if is_exploring else "CONVERGING (LR low)"
-        elif config.lr_scheduler == 'warmup_cosine':
-            # Warmup+Cosine: warmup 阶段和 LR 较高时为探索期
-            in_warmup = epoch_idx < config.lr_warmup_epochs
-            lr_high = current_lr > 0.001
-            is_exploring = in_warmup or lr_high
-            state_desc = f"WARMUP phase" if in_warmup else f"COSINE phase (LR={current_lr:.6f})"
-        else:
-            # CosineAnnealingWarmRestarts: 周期重启点附近为探索期
-            lr_high = current_lr > 0.001
-            restart_epochs = [5, 15, 35, 75]  # T_0=5, T_mult=2 的重启点
-            near_restart = any(abs(epoch_idx + 1 - e) <= 2 for e in restart_epochs)
-            is_exploring = lr_high or near_restart
-            state_desc = "EXPLORING (LR high/near restart)" if is_exploring else "CONVERGING (LR low)"
+        in_warmup = epoch_idx < config.warmup_epochs
+        lr_high = current_lr > 0.001
+        is_exploring = in_warmup or lr_high
+        state_desc = f"WARMUP phase" if in_warmup else f"COSINE phase (LR={current_lr:.6f})"
 
         # Grace period（前几轮不早停）
         if epoch_idx < config.early_stopping_grace_period:
@@ -701,9 +544,9 @@ def train_model(model, tokenizer, device, config, save_dir, val_data=None):
         else:
             # 动态 patience：探索期宽松，精细期严格
             if is_exploring:
-                dynamic_patience = config.early_stopping_patience * 2  # 爬山过程，允许更多波动
+                dynamic_patience = config.early_stopping_patience * 2
             else:
-                dynamic_patience = config.early_stopping_patience  # 精细收敛期，严格判断
+                dynamic_patience = config.early_stopping_patience
 
             print(f"[STATE] {state_desc}, Dynamic patience: {dynamic_patience}", flush=True)
 
@@ -718,7 +561,6 @@ def train_model(model, tokenizer, device, config, save_dir, val_data=None):
                     print(f"[WINDOW TREND] Recent improvement detected", flush=True)
                 elif patience_counter >= dynamic_patience:
                     print(f"\n[EARLY STOP] No improvement for {patience_counter} epochs (dynamic_patience={dynamic_patience})", flush=True)
-                    # 早停时也保存最终模型
                     final_path = f"{save_dir}/checkpoints/final_model"
                     model.module.save_pretrained(final_path)
                     print(f"[FINAL SAVED] Val Loss: {avg_val_loss:.4f}, IC: {current_ic:.4f}", flush=True)
@@ -904,17 +746,15 @@ def main():
     config.early_stopping_check_ic = run_config['early_stopping_check_ic']
     config.early_stopping_window = run_config['early_stopping_window']
 
-    # VL-IC Adaptive 学习率参数
+    # Cosine Annealing + Warmup 参数
     config.lr_scheduler = run_config['lr_scheduler']
-    config.lr_max = run_config['lr_max']
     config.lr_min = run_config['lr_min']
-    config.lr_decay_factor = run_config['lr_decay_factor']
-    config.lr_boost_factor = run_config['lr_boost_factor']
-    config.lr_boost_patience = run_config['lr_boost_patience']
-    config.lr_decay_patience = run_config['lr_decay_patience']
-    config.ic_improve_threshold = run_config['ic_improve_threshold']
-    config.ic_test_samples = run_config['ic_test_samples']  # IC test samples during training
-    config.ic_point = run_config['ic_point']  # IC calculation target point (Point+N)
+    config.warmup_epochs = run_config['warmup_epochs']
+    config.freeze_layers = run_config['freeze_layers']
+    config.freeze_embedding = run_config['freeze_embedding']
+    config.ic_improve_threshold = 0.05
+    config.ic_test_samples = run_config['ic_test_samples']
+    config.ic_point = run_config['ic_point']
 
     # 方向损失参数（从 hidden state 直接预测）
     config.direction_loss_weight = run_config['direction_loss_weight']
