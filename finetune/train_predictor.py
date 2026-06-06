@@ -403,13 +403,12 @@ def train_model(model, tokenizer, device, config, save_dir, val_data=None):
             with torch.no_grad():
                 token_seq_0, token_seq_1 = tokenizer.encode(batch_x, half=True)
 
-            token_in = [token_seq_0[:, :-1], token_seq_1[:, :-1]]
             token_out = [token_seq_0[:, 1:], token_seq_1[:, 1:]]
 
             # Forward（获取 logits 和 hidden state）
-            s1_logits, s2_logits, hidden = model.module.forward_with_hidden(token_in[0], token_in[1], batch_stamp[:, :-1, :])
+            s1_logits, s2_logits, hidden = model.module.forward_with_hidden(token_seq_0, token_seq_1, batch_stamp)
             recon_loss, s1_loss, s2_loss = model.module.head.compute_loss(
-                s1_logits, s2_logits, token_out[0], token_out[1]
+                s1_logits[:, :-1, :], s2_logits[:, :-1, :], token_out[0], token_out[1]
             )
 
             # === 方向损失（直接从 hidden state 预测，梯度可传）===
@@ -450,12 +449,11 @@ def train_model(model, tokenizer, device, config, save_dir, val_data=None):
                 batch_direction = batch_direction.to(device, non_blocking=True)
 
                 token_seq_0, token_seq_1 = tokenizer.encode(batch_x, half=True)
-                token_in = [token_seq_0[:, :-1], token_seq_1[:, :-1]]
                 token_out = [token_seq_0[:, 1:], token_seq_1[:, 1:]]
 
-                s1_logits, s2_logits, hidden = model.module.forward_with_hidden(token_in[0], token_in[1], batch_stamp[:, :-1, :])
+                s1_logits, s2_logits, hidden = model.module.forward_with_hidden(token_seq_0, token_seq_1, batch_stamp)
                 recon_loss, _, _ = model.module.head.compute_loss(
-                    s1_logits, s2_logits, token_out[0], token_out[1]
+                    s1_logits[:, :-1, :], s2_logits[:, :-1, :], token_out[0], token_out[1]
                 )
 
                 # 方向损失（与训练一致）

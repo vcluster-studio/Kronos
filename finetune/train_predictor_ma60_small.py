@@ -117,7 +117,7 @@ class MA60Dataset(Dataset):
             self.raw_data = pickle.load(f)
 
         self.symbols = list(self.raw_data.keys())
-        self.window = config.lookback + config.predict + 1
+        self.window = config.lookback + config.predict  # 仅 lookback+pred
 
         # 预计算索引
         print(f"[{data_type.upper()}] Pre-computing indices...")
@@ -513,16 +513,15 @@ class PCGrad:
         with torch.no_grad():
             token_seq_0, token_seq_1 = tokenizer.encode(batch_x, half=True)
 
-        token_in = [token_seq_0[:, :-1], token_seq_1[:, :-1]]
         token_out = [token_seq_0[:, 1:], token_seq_1[:, 1:]]
 
         s1_logits, s2_logits, hidden = model.module.forward_with_hidden(
-            token_in[0], token_in[1], batch_stamp[:, :-1, :]
+            token_seq_0, token_seq_1, batch_stamp
         )
 
         # compute_loss 返回 (recon_loss, s1_loss, s2_loss)
         _, s1_loss, s2_loss = model.module.head.compute_loss(
-            s1_logits, s2_logits, token_out[0], token_out[1]
+            s1_logits[:, :-1, :], s2_logits[:, :-1, :], token_out[0], token_out[1]
         )
 
         # ---- Backward: Task 1 (s1_loss) ----
@@ -634,14 +633,13 @@ def train_model(model, tokenizer, device, config, save_dir, val_data=None):
                 with torch.no_grad():
                     token_seq_0, token_seq_1 = tokenizer.encode(batch_x, half=True)
 
-                token_in = [token_seq_0[:, :-1], token_seq_1[:, :-1]]
                 token_out = [token_seq_0[:, 1:], token_seq_1[:, 1:]]
 
                 s1_logits, s2_logits, hidden = model.module.forward_with_hidden(
-                    token_in[0], token_in[1], batch_stamp[:, :-1, :]
+                    token_seq_0, token_seq_1, batch_stamp
                 )
                 recon_loss, s1_loss, s2_loss = model.module.head.compute_loss(
-                    s1_logits, s2_logits, token_out[0], token_out[1]
+                    s1_logits[:, :-1, :], s2_logits[:, :-1, :], token_out[0], token_out[1]
                 )
 
                 total_loss = recon_loss
@@ -685,14 +683,13 @@ def train_model(model, tokenizer, device, config, save_dir, val_data=None):
                 batch_stamp = batch_stamp.to(device, non_blocking=True)
 
                 token_seq_0, token_seq_1 = tokenizer.encode(batch_x, half=True)
-                token_in = [token_seq_0[:, :-1], token_seq_1[:, :-1]]
                 token_out = [token_seq_0[:, 1:], token_seq_1[:, 1:]]
 
                 s1_logits, s2_logits, hidden = model.module.forward_with_hidden(
-                    token_in[0], token_in[1], batch_stamp[:, :-1, :]
+                    token_seq_0, token_seq_1, batch_stamp
                 )
                 recon_loss, s1_loss, s2_loss = model.module.head.compute_loss(
-                    s1_logits, s2_logits, token_out[0], token_out[1]
+                    s1_logits[:, :-1, :], s2_logits[:, :-1, :], token_out[0], token_out[1]
                 )
 
                 val_loss_sum += recon_loss.item()

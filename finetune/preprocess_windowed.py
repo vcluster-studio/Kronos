@@ -68,7 +68,7 @@ def main():
 
     lookback = args.lookback
     predict = 10
-    window_size = lookback + predict + 1
+    window_size = lookback + predict  # 仅 lookback+pred（无 +1 泄漏）
 
     print("=" * 60)
     print("Windowed Data Preprocessing (Dense + Time-Extrapolation)")

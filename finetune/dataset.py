@@ -52,7 +52,7 @@ class QlibDataset(Dataset):
             self.stock_categories = {}
             self.use_stratified_sampling = False
 
-        self.window = self.config.lookback_window + self.config.predict_window + 1
+        self.window = self.config.lookback_window + self.config.predict_window  # 仅 lookback+pred
 
         self.symbols = list(self.data.keys())
         self.feature_list = self.config.feature_list
@@ -210,14 +210,13 @@ class QlibDataset(Dataset):
         # === 返回用于方向损失的信息 ===
         # 原始 close 价格的涨跌方向
         # close 列是第 3 列（open, high, low, close, vol, amt）
-        # window = lookback + predict + 1 = 411 个时间步
-        # 索引: 0-399 (lookback), 400-409 (predict), 410 (extra for next token pred)
+        # window = lookback + predict = 410 个时间步
+        # 索引: 0-399 (lookback), 400-409 (predict)
         #
         # 模型预测 pred_tokens[-10:] 对应 token_out 的位置 400-409
-        # 所以模型预测的终点是时间步 410
         original_close = win_df['close'].values
         baseline_close = original_close[past_len - 1]  # 索引 399：lookback 窗口最后一点
-        pred_close_end = original_close[past_len + self.config.predict_window]  # 索引 410：模型预测的终点
+        pred_close_end = original_close[past_len + self.config.predict_window - 1]  # 索引 409：predict 终点
 
         # 涨跌方向：True = 涨，False = 跌（相对于买入价）
         direction = pred_close_end > baseline_close

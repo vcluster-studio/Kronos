@@ -124,7 +124,7 @@ class MA60Dataset(Dataset):
             self.raw_data = pickle.load(f)
 
         self.symbols = list(self.raw_data.keys())
-        self.window = config.lookback + config.predict + 1
+        self.window = config.lookback + config.predict  # 仅 lookback+pred
 
         # 预计算索引
         print(f"[{data_type.upper()}] Pre-computing indices...")
@@ -470,17 +470,16 @@ def train_model(model, tokenizer, device, config, save_dir, val_data=None):
             with torch.no_grad():
                 token_seq_0, token_seq_1 = tokenizer.encode(batch_x, half=True)
 
-            token_in = [token_seq_0[:, :-1], token_seq_1[:, :-1]]
             token_out = [token_seq_0[:, 1:], token_seq_1[:, 1:]]
 
             # Forward
             s1_logits, s2_logits, hidden = model.module.forward_with_hidden(
-                token_in[0], token_in[1], batch_stamp[:, :-1, :]
+                token_seq_0, token_seq_1, batch_stamp
             )
 
             # 全位置均匀 CE（与原始项目一致）
             recon_loss, ce_s1, ce_s2 = model.module.head.compute_loss(
-                s1_logits, s2_logits, token_out[0], token_out[1]
+                s1_logits[:, :-1, :], s2_logits[:, :-1, :], token_out[0], token_out[1]
             )
 
             # 方向损失（从 hidden state 预测 close 涨跌）
@@ -520,16 +519,15 @@ def train_model(model, tokenizer, device, config, save_dir, val_data=None):
                 batch_direction = batch_direction.to(device, non_blocking=True)
 
                 token_seq_0, token_seq_1 = tokenizer.encode(batch_x, half=True)
-                token_in = [token_seq_0[:, :-1], token_seq_1[:, :-1]]
                 token_out = [token_seq_0[:, 1:], token_seq_1[:, 1:]]
 
                 s1_logits, s2_logits, hidden = model.module.forward_with_hidden(
-                    token_in[0], token_in[1], batch_stamp[:, :-1, :]
+                    token_seq_0, token_seq_1, batch_stamp
                 )
 
                 # 全位置均匀 CE（与训练一致）
                 recon_loss, _, _ = model.module.head.compute_loss(
-                    s1_logits, s2_logits, token_out[0], token_out[1]
+                    s1_logits[:, :-1, :], s2_logits[:, :-1, :], token_out[0], token_out[1]
                 )
 
                 # 方向损失（与训练一致）

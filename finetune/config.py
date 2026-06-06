@@ -31,7 +31,7 @@ class Config:
     predict_window = 10
 
     # 最小样本数
-    min_samples = lookback_window + predict_window + 1  # 411
+    min_samples = lookback_window + predict_window  # 410（仅 lookback+pred，无 +1 泄漏）
 
     # 归一化模式
     # 'full_window' - 全窗口归一化（pretrained原始方式）：使用整个lookback窗口的mean/std
