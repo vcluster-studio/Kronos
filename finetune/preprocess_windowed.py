@@ -54,6 +54,8 @@ def main():
     parser = argparse.ArgumentParser(description='Windowed data preprocessing')
     parser.add_argument('--lookback', type=int, default=400,
                         help='Lookback window size (default: 400, use 200 for small model)')
+    parser.add_argument('--predict', type=int, default=10,
+                        help='Prediction horizon in steps (default: 10)')
     parser.add_argument('--stride', type=int, default=10,
                         help='Window stride for all regions (default: 10)')
     parser.add_argument('--k-val', type=int, default=100,
@@ -67,7 +69,7 @@ def main():
     args = parser.parse_args()
 
     lookback = args.lookback
-    predict = 10
+    predict = args.predict
     window_size = lookback + predict  # 仅 lookback+pred（无 +1 泄漏）
 
     print("=" * 60)
