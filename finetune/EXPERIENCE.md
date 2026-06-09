@@ -123,6 +123,29 @@ IC = corr(pred_return, actual_return)
 
 ---
 
+## 8. 梯度绑架根因诊断（2026-06-09）
+
+**实验**：Token敏感性分析
+
+**方法**：对单个特征扰动，观察 token 变化程度（Hamming distance）
+
+**结果**：
+| Feature | Shuffle Hamming | Noise Hamming |
+|---------|-----------------|---------------|
+| close | 0.92 | 0.32 |
+| vol | 0.74 | 0.19 |
+| amt | 0.73 | 0.17 |
+
+**结论**：
+- Tokenizer 对 close 最敏感（Hamming 最高）
+- Tokenizer 已正确编码价格信息
+- **问题不在 Tokenizer，在 Predictor CE 目标**
+
+**根因**：CE loss 天然倾向优化更容易预测的特征（vol/amt），而非价格方向
+
+---
+
 ## 文档更新记录
 
 - 2026-06-09：初始版本，记录数据泄露、GT leakage、hidden state 预测错误等
+- 2026-06-09：Token敏感性实验完成，确认问题在 Predictor（CE目标偏向量能），不在 Tokenizer
