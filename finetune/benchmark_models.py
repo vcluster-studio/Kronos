@@ -1,26 +1,33 @@
 """
 模型能力对比测试 - 多维度评估
 
-支持不同模型使用不同的 lookback 和数据集：
-- 原始模型 + mini-v5: lookback=400, v3 数据集
-- small 微调模型: lookback=200, v3_small 数据集
+两种模式：
+1. multi_step (默认): 400+10 自回归预测，v3 数据集
+2. single_step: 60+1 单步预测，全序列滑动窗口数据集
 
 评估指标：
 1. IC / Rank IC — 因子预测能力
 2. ICIR — IC 稳定性
 3. DA (Directional Accuracy) — 涨跌方向准确率
 4. DDA (Directional Change Accuracy) — 转折点捕获率
-5. 多步 IC — 1~10 步的 IC 曲线
-6. 分位数覆盖率 — 概率预测质量
+5. 多步 IC — 1~10 步的 IC 曲线（仅 multi_step）
+6. 分位数覆盖率 — 概率预测质量（仅 multi_step）
 7. NMSE — 归一化均方误差
+8. 波动率指标 — VolCorr, Weighted IC, Vol Binned, Vol DA
+9. 朴素指标 — Up/Down Hit, Balance
 
 用法：
+    # 多步模式（原有）
     python -u finetune/benchmark_models.py
+
+    # 单步模式
+    python -u finetune/benchmark_models.py --mode single_step --checkpoint outputs/models/ma60_predictor_lb60_pd1/checkpoint-696418
 """
 
 import os
 import sys
 import pickle
+import argparse
 import numpy as np
 import torch
 from scipy.stats import spearmanr
@@ -64,6 +71,52 @@ MODELS = [
     # small V5b 微调模型: freeze 4层 + embedding
     ('small-v5b-best_ic', 'outputs/models/ma60_predictor_small_v5b/checkpoints/best_ic_model', TOKENIZER_MA60_BASE, 512, 200, DATA_V3_SMALL),
 ]
+
+# ============================================================================
+# 单步模式配置
+# ============================================================================
+
+SINGLE_STEP_DATA = 'finetune/data/kline_daily_ma60.pkl'
+FEATURE_NAMES = ['open', 'high', 'low', 'close', 'vol', 'amt']
+
+
+def load_single_step_data(data_path, lookback, predict):
+    """加载 kline_daily_ma60.pkl 并返回时间切分的 (stock, start) 索引"""
+    with open(data_path, 'rb') as f:
+        raw = pickle.load(f)
+
+    all_data = {}
+    train_indices, val_indices, test_indices = [], [], []
+    window = lookback + predict
+
+    for sym in sorted(raw.keys()):
+        d = raw[sym]
+        seq_len = len(d['normalized'])
+        if seq_len < window + 1:
+            continue
+
+        all_data[sym] = {
+            'normalized': d['normalized'].astype(np.float32),
+            'original': d['original'].astype(np.float32),
+            'means': d['means'].astype(np.float32),
+            'stds': d['stds'].astype(np.float32),
+            'index': d['index'],
+        }
+
+        n_windows = seq_len - window
+        tr_end = int(n_windows * 0.70)
+        val_end = int(n_windows * 0.85)
+
+        for i in range(n_windows):
+            idx = (sym, i)
+            if i < tr_end:
+                train_indices.append(idx)
+            elif i < val_end:
+                val_indices.append(idx)
+            else:
+                test_indices.append(idx)
+
+    return all_data, train_indices, val_indices, test_indices
 
 
 def compute_da(predictions, actuals):
@@ -400,13 +453,277 @@ def benchmark_model(model, tokenizer, device, val_data, lookback, pred_len,
     return results
 
 
-def main():
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+def benchmark_single_step(model, tokenizer, device, all_data, indices,
+                          lookback, n_samples, rng):
+    """单步预测综合评估 — 60+1 模式，所有指标仅 step=1"""
+    import torch.nn.functional as F
 
+    model.eval()
+    feature_names = FEATURE_NAMES
+
+    # 采样
+    n_avail = min(n_samples, len(indices))
+    sampled = rng.choice(len(indices), size=n_avail, replace=False)
+
+    preds_all = {f: [] for f in range(6)}
+    actuals_all = {f: [] for f in range(6)}
+    actuals_prev_all = {f: [] for f in range(6)}
+
+    for idx in sampled:
+        sym, start = indices[idx]
+        d = all_data[sym]
+        end = start + lookback + 1  # 60 input + 1 target
+
+        norm = d['normalized'][start:end]
+        orig = d['original'][start:end]
+        means = d['means'][start:end]
+        stds = d['stds'][start:end]
+
+        ts = d['index'][start:end]
+        stamp = np.stack([
+            ts.minute.values.astype(np.float32),
+            ts.hour.values.astype(np.float32),
+            ts.weekday.values.astype(np.float32),
+            ts.day.values.astype(np.float32),
+            ts.month.values.astype(np.float32),
+        ], axis=1)
+
+        try:
+            with torch.no_grad():
+                norm_t = torch.from_numpy(norm).unsqueeze(0).to(device)
+                stamp_t = torch.from_numpy(stamp).unsqueeze(0).to(device)
+
+                t0, t1 = tokenizer.encode(norm_t, half=True)
+                s1_logits, s2_logits = model(t0[:, :-1], t1[:, :-1], stamp=stamp_t[:, :-1, :])
+
+                s1_p = torch.argmax(s1_logits[:, -1, :], dim=-1)
+                s2_p = torch.argmax(s2_logits[:, -1, :], dim=-1)
+                z = tokenizer.decode([s1_p.unsqueeze(1), s2_p.unsqueeze(1)], half=True)
+                z = z.squeeze(1).cpu().numpy()
+        except Exception:
+            continue
+
+        pred_px = z * stds[-1] + means[-1]
+        base_px = orig[-2]
+        actual_px = orig[-1]
+
+        # 上一期的实际收益率 (for DDA)
+        actual_prev_base = orig[-3] if len(orig) >= 3 else orig[-2]
+        actual_prev_return = (orig[-2] - actual_prev_base) / (abs(actual_prev_base) + 1e-8)
+
+        for f in range(6):
+            base = float(base_px[f])
+            if abs(base) < 1e-8:
+                continue
+            pr = float((pred_px[0, f] - base) / base)
+            ar = float((actual_px[f] - base) / base)
+            apr = float(actual_prev_return[f])
+
+            if np.isfinite(pr) and np.isfinite(ar):
+                preds_all[f].append(pr)
+                actuals_all[f].append(ar)
+                actuals_prev_all[f].append(apr)
+
+    # 汇总
+    results = {}
+    for f in range(6):
+        fname = feature_names[f]
+        preds_arr = np.array(preds_all[f])
+        actuals_arr = np.array(actuals_all[f])
+        prevs_arr = np.array(actuals_prev_all[f])
+
+        if len(preds_arr) < 10:
+            continue
+
+        ic = np.corrcoef(preds_arr, actuals_arr)[0, 1]
+        rank_ic, _ = spearmanr(preds_arr, actuals_arr)
+        da = compute_da(preds_arr, actuals_arr)
+        dda = compute_dda(preds_arr, actuals_arr, prevs_arr)
+        nmse = compute_nmse(preds_arr, actuals_arr)
+        pred_bias = float(np.mean(preds_arr) - np.mean(actuals_arr))
+        var_actual = np.var(actuals_arr)
+        var_ratio = float(np.var(preds_arr) / var_actual) if var_actual > 1e-8 else np.nan
+
+        results[f'{fname}_ic'] = ic
+        results[f'{fname}_rank_ic'] = rank_ic
+        results[f'{fname}_da'] = da
+        results[f'{fname}_dda'] = dda
+        results[f'{fname}_nmse'] = nmse
+        results[f'{fname}_pred_bias'] = pred_bias
+        results[f'{fname}_var_ratio'] = var_ratio
+        results[f'{fname}_icir'] = ic  # 单步 ICIR = IC（仅一步无法计算稳定性）
+        results[f'{fname}_n'] = len(preds_arr)
+
+        # 波动率指标
+        results[f'{fname}_vol_corr'] = compute_vol_corr(preds_arr, actuals_arr)
+        results[f'{fname}_vol_binned'] = compute_vol_binned(preds_arr, actuals_arr)
+        results[f'{fname}_vol_weighted_ic'] = compute_vol_weighted_ic(preds_arr, actuals_arr)
+
+        vol_da, vol_up, vol_down = compute_vol_da(preds_arr, actuals_arr)
+        results[f'{fname}_vol_da'] = vol_da
+        results[f'{fname}_vol_up_hit'] = vol_up
+        results[f'{fname}_vol_down_hit'] = vol_down
+
+        up_hit, down_hit, balance = compute_up_down_hits(preds_arr, actuals_arr)
+        results[f'{fname}_up_hit'] = up_hit
+        results[f'{fname}_down_hit'] = down_hit
+        results[f'{fname}_hit_balance'] = balance
+
+    # 兼容顶层 key (close)
+    for key in ['ic', 'rank_ic', 'da', 'dda', 'nmse', 'icir']:
+        results[key] = results.get(f'close_{key}', np.nan)
+
+    results['n_samples'] = len(preds_all[3])
+    results['feature_names'] = feature_names
+    return results
+
+
+def print_single_step_results(result, label):
+    """打印单步评估结果"""
+    feature_names = result.get('feature_names', FEATURE_NAMES)
+
+    print(f"\n  === {label} Summary ===")
+    print(f"  IC:       {result.get('ic', np.nan):.4f}")
+    print(f"  Rank IC:  {result.get('rank_ic', np.nan):.4f}")
+    print(f"  DA:       {result.get('da', np.nan):.4f}")
+    print(f"  DDA:      {result.get('dda', np.nan):.4f}")
+    print(f"  NMSE:     {result.get('nmse', np.nan):.4f}")
+    print(f"  Samples:  {result['n_samples']}")
+
+    # 全特征
+    print(f"\n  === All Features ===")
+    print(f"  {'Feat':>5s} {'IC':>8s} {'RankIC':>8s} {'DA':>8s} {'DDA':>8s} {'NMSE':>8s} {'Bias':>8s} {'VarR':>8s}")
+    for fname in feature_names:
+        f_ic = result.get(f'{fname}_ic', np.nan)
+        f_ric = result.get(f'{fname}_rank_ic', np.nan)
+        f_da = result.get(f'{fname}_da', np.nan)
+        f_dda = result.get(f'{fname}_dda', np.nan)
+        f_nmse = result.get(f'{fname}_nmse', np.nan)
+        f_bias = result.get(f'{fname}_pred_bias', np.nan)
+        f_varr = result.get(f'{fname}_var_ratio', np.nan)
+        bias_str = f"{f_bias:+.4f}" if not np.isnan(f_bias) else "    N/A"
+        varr_str = f"{f_varr:.4f}" if not np.isnan(f_varr) else "    N/A"
+        dda_str = f"{f_dda:.4f}" if not np.isnan(f_dda) else "    N/A"
+        print(f"  {fname:>5s} {f_ic:>8.4f} {f_ric:>8.4f} {f_da:>8.4f} {dda_str:>8s} {f_nmse:>8.4f} {bias_str:>8s} {varr_str:>8s}")
+
+    # 波动率指标
+    print(f"\n  === Volatility Metrics ===")
+    print(f"  {'Feat':>5s} {'VolCorr':>8s} {'W-IC':>8s} {'RawIC':>8s} {'Delta':>8s} {'Hi/Lo':>8s}")
+    for fname in feature_names:
+        f_vc = result.get(f'{fname}_vol_corr', np.nan)
+        f_wic = result.get(f'{fname}_vol_weighted_ic', np.nan)
+        f_ic = result.get(f'{fname}_ic', np.nan)
+        f_delta = f_wic - f_ic if not (np.isnan(f_wic) or np.isnan(f_ic)) else np.nan
+        f_vb = result.get(f'{fname}_vol_binned', {})
+        f_ratio = f_vb.get('ratio', np.nan)
+        vc_str = f"{f_vc:.4f}" if not np.isnan(f_vc) else "    N/A"
+        wic_str = f"{f_wic:.4f}" if not np.isnan(f_wic) else "    N/A"
+        ic_str = f"{f_ic:.4f}" if not np.isnan(f_ic) else "    N/A"
+        delta_str = f"{f_delta:+.4f}" if not np.isnan(f_delta) else "    N/A"
+        ratio_str = f"{f_ratio:.4f}" if not np.isnan(f_ratio) else "    N/A"
+        print(f"  {fname:>5s} {vc_str:>8s} {wic_str:>8s} {ic_str:>8s} {delta_str:>8s} {ratio_str:>8s}")
+
+    # 朴素指标
+    print(f"\n  === Plain Metrics — 'out of 100 correct' ===")
+    print(f"  {'Feat':>5s} {'DA':>7s} {'UpHit':>7s} {'DnHit':>7s} {'Bal':>7s} {'VolDA':>7s} {'VUp':>7s} {'VDn':>7s}")
+    for fname in feature_names:
+        f_da = result.get(f'{fname}_da', np.nan)
+        f_up = result.get(f'{fname}_up_hit', np.nan)
+        f_dn = result.get(f'{fname}_down_hit', np.nan)
+        f_bal = result.get(f'{fname}_hit_balance', np.nan)
+        f_vda = result.get(f'{fname}_vol_da', np.nan)
+        f_vup = result.get(f'{fname}_vol_up_hit', np.nan)
+        f_vdn = result.get(f'{fname}_vol_down_hit', np.nan)
+        da_str = f"{f_da:.3f}" if not np.isnan(f_da) else "   N/A"
+        up_str = f"{f_up:.3f}" if not np.isnan(f_up) else "   N/A"
+        dn_str = f"{f_dn:.3f}" if not np.isnan(f_dn) else "   N/A"
+        bal_str = f"{f_bal:.3f}" if not np.isnan(f_bal) else "   N/A"
+        vda_str = f"{f_vda:.3f}" if not np.isnan(f_vda) else "   N/A"
+        vup_str = f"{f_vup:.3f}" if not np.isnan(f_vup) else "   N/A"
+        vdn_str = f"{f_vdn:.3f}" if not np.isnan(f_vdn) else "   N/A"
+        print(f"  {fname:>5s} {da_str:>7s} {up_str:>7s} {dn_str:>7s} {bal_str:>7s} {vda_str:>7s} {vup_str:>7s} {vdn_str:>7s}")
+
+
+def main():
+    parser = argparse.ArgumentParser(description='Model Benchmark - Multi-metric Evaluation')
+    parser.add_argument('--mode', choices=['multi_step', 'single_step'], default='multi_step')
+    parser.add_argument('--checkpoint', type=str, default=None,
+                        help='Model checkpoint path for single_step mode')
+    parser.add_argument('--tokenizer', type=str, default=TOKENIZER_MA60_V1)
+    parser.add_argument('--data', type=str, default=SINGLE_STEP_DATA)
+    parser.add_argument('--n-samples', type=int, default=N_SAMPLES)
+    parser.add_argument('--seed', type=int, default=SEED)
+    parser.add_argument('--eval-split', choices=['val', 'test', 'both'], default='both')
+    args = parser.parse_args()
+
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    rng = np.random.RandomState(args.seed)
+
+    # ========================================================================
+    # 单步模式
+    # ========================================================================
+    if args.mode == 'single_step':
+        print("=" * 80)
+        print("Model Benchmark - Single-Step Mode (60+1)")
+        print("=" * 80)
+        print(f"Checkpoint: {args.checkpoint}")
+        print(f"Tokenizer: {args.tokenizer}")
+        print(f"Data: {args.data}")
+        print(f"Samples: {args.n_samples}, Seed: {args.seed}")
+        print(f"Eval split: {args.eval_split}")
+        print(f"Device: {device}")
+
+        if not args.checkpoint:
+            print("[ERROR] --checkpoint is required for single_step mode")
+            return
+
+        lookback, predict = 60, 1
+
+        tok_path = os.path.join(project_root, args.tokenizer)
+        print(f"\nLoading tokenizer: {tok_path}")
+        tokenizer = KronosTokenizer.from_pretrained(tok_path).eval().to(device)
+
+        ckpt_path = os.path.join(project_root, args.checkpoint)
+        print(f"Loading model: {ckpt_path}")
+        model = Kronos.from_pretrained(ckpt_path).to(device)
+        n_params = sum(p.numel() for p in model.parameters()) / 1e6
+        print(f"  Params: {n_params:.1f}M")
+
+        data_path = os.path.join(project_root, args.data)
+        print(f"\nLoading data: {data_path}")
+        all_data, train_idx, val_idx, test_idx = load_single_step_data(
+            data_path, lookback, predict)
+        print(f"  Train: {len(train_idx)}, Val: {len(val_idx)}, Test: {len(test_idx)}")
+
+        for split_name, split_idx in [('Val', val_idx), ('Test', test_idx)]:
+            if args.eval_split != 'both' and args.eval_split != split_name.lower():
+                continue
+            print(f"\n{'=' * 80}")
+            print(f"Evaluating on {split_name} set ({len(split_idx)} windows)")
+            print(f"{'=' * 80}")
+
+            t0 = time.time()
+            result = benchmark_single_step(model, tokenizer, device, all_data,
+                                           split_idx, lookback, args.n_samples, rng)
+            elapsed = time.time() - t0
+
+            if result and result['n_samples'] > 0:
+                print_single_step_results(result, split_name)
+                print(f"\n  Time: {elapsed:.1f}s")
+            else:
+                print(f"  [FAIL] Not enough valid predictions")
+
+        del model
+        torch.cuda.empty_cache()
+        return
+
+    # ========================================================================
+    # 多步模式（原有逻辑）
+    # ========================================================================
     print("=" * 80)
     print("Model Benchmark - Multi-metric Evaluation")
     print("=" * 80)
-    print(f"Predict: {PRED_LEN}, Samples: {N_SAMPLES}, Seed: {SEED}")
+    print(f"Predict: {PRED_LEN}, Samples: {args.n_samples}, Seed: {args.seed}")
     print(f"Quantile samples: {N_QUANTILE_SAMPLES}")
     print(f"Device: {device}")
 
@@ -457,10 +774,9 @@ def main():
         n_params = sum(p.numel() for p in model.parameters()) / 1e6
         print(f"  Params: {n_params:.1f}M")
 
-        rng = np.random.RandomState(SEED)
         t0 = time.time()
         result = benchmark_model(model, tokenizer, device, val_data,
-                                 lookback, PRED_LEN, CLIP, max_ctx, N_SAMPLES,
+                                 lookback, PRED_LEN, CLIP, max_ctx, args.n_samples,
                                  rng, N_QUANTILE_SAMPLES)
         elapsed = time.time() - t0
 
@@ -727,7 +1043,7 @@ def main():
                 line += f" {f_nmse:>7.4f}" if not np.isnan(f_nmse) else f" {'N/A':>7s}"
             print(line)
 
-    print(f"\nPredict={PRED_LEN}, Samples={N_SAMPLES}, Seed={SEED}")
+    print(f"\nPredict={PRED_LEN}, Samples={args.n_samples}, Seed={args.seed}")
     print(f"{'=' * 80}")
 
 
