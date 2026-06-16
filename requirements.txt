@@ -1,6 +1,7 @@
 numpy
 pandas
 torch>=2.0.0
+scipy
 
 einops==0.8.1
 huggingface_hub==0.33.1

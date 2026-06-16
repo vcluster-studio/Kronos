@@ -7,7 +7,9 @@ __pycache__/
 build/
 develop-eggs/
 dist/
-pretrained/
+# Pretrained models (large, download from HuggingFace)
+pretrained/*/
+!pretrained/README.md
 downloads/
 eggs/
 .eggs/
@@ -78,9 +80,20 @@ tmp/
 docs/temp/
 .python-version
 
-# Finetune outputs (training results, but keep logs)
-outputs/models/
-!outputs/training_logs/
+# Finetune outputs (training results)
+outputs/predictors/*/
+outputs/models/*/
+outputs/tokenizers/*/
+outputs/prediction_results/
+!outputs/README.md
+!outputs/INDEX.md
+!outputs/predictors/README.md
+!outputs/models/README.md
+!outputs/tokenizers/README.md
+!outputs/predictors/archived/README.md
+
+# Temp removed
+temp_removed/
 
 # Finetune data (preprocessed datasets)
 finetune/data/
@@ -97,3 +110,9 @@ final_models/training_scripts/
 
 # Final model docs (keep in git)
 !final_models/TRAINING_EXPERIENCE.md
+
+# Deploy packages (large)
+deploy_*.tar.gz
+
+# Local scripts (hardcoded paths)
+train.bat

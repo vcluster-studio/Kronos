@@ -332,20 +332,15 @@ Predictor训练目标
 
 ## Phase 1 结果（2026-06-09）
 
-**Token敏感性实验已完成**
-
-结果：
-```text
-close 扰动 → Hamming 0.92（最高）
-vol 扰动 → Hamming 0.74
-amt 扰动 → Hamming 0.73
-```
-
-Price avg Hamming: 0.83
-Volume avg Hamming: 0.74
-Ratio: 0.88
+### 1.1 Token敏感性实验
 
 **结论**：Tokenizer 对价格敏感度更高，容量分配合理。
+
+| 扰动特征 | Hamming Distance | Decode MAE |
+|----------|------------------|------------|
+| close | **0.92**（最高） | 0.43 |
+| vol | 0.74 | 0.31 |
+| amt | 0.73 | 0.31 |
 
 **问题位置确认**：
 ```text
@@ -355,63 +350,159 @@ Predictor问题：90%（CE目标偏向量能）
 
 ---
 
-## 下一阶段计划
+### 1.2 误差分解诊断
 
-Phase 1
+**新增评估指标**：
 
-```text
-完成 Token敏感性实验 ✅ DONE
+```python
+close_delta_mae = mean(abs(pred_return - actual_return))
+close_delta_bias = mean(pred_return - actual_return)
+pred_std vs actual_std  # 均值回归程度
+direction_acc = DA
 ```
 
-回答：
+**close 特征诊断结果**：
 
-```text
-Tokenizer到底在编码什么？ → 价格信息已编码，问题不在Tokenizer
+| Step | IC | MAE | MAE/act_std | std_ratio | bias |
+|------|-----|-----|-------------|-----------|------|
+| +1 | 0.0065 | 0.0296 | **0.98** | 0.91 | 0.0064 |
+| +2 | 0.0205 | 0.0374 | 0.92 | 0.84 | -0.0088 |
+| +3 | 0.0113 | 0.0489 | 0.92 | 0.81 | -0.0119 |
+| +5 | 0.0039 | 0.0649 | 0.91 | 0.78 | -0.0319 |
+
+**核心问题**：
+
+> **MAE / actual_std ≈ 0.98 → 预测误差等于市场波动本身，方向预测基本随机**
+
+这不是均值回归（std_ratio ≈ 0.9），也不是系统偏差（bias很小），而是**方向预测能力缺失**。
+
+**vol/amt 问题**：
+- IC = 0.99+（方向正确）
+- std_ratio = 26+（幅度失控）
+
+---
+
+## Phase 2 实施方案
+
+### 2.1 核心改动
+
+**训练目标改为相对位移**：
+
+```python
+pred_return = (pred_close - baseline_close) / baseline_close
+actual_return = (actual_close - baseline_close) / baseline_close
+```
+
+而不是绝对价格 `future_close`。
+
+**Loss 结构**：
+
+```python
+total_loss =
+    prediction_only_CE        # 主损失：token 生成能力
+    + λ1 * close_delta_loss   # 辅助：价格方向
+    + λ2 * range_loss         # 辅助：波动范围
+```
+
+**初始参数**：
+
+```python
+λ1 = 0.1   # 不要太大，避免破坏预训练
+λ2 = 0.03  # range 为次要目标
 ```
 
 ---
 
-Phase 2
+### 2.2 close_delta_loss 实现要点
 
-根据实验结果决定：
+**正确路径**（不绕 token）：
 
-```text
-改Predictor（主要方向）
+```python
+# 生成 tokens → decode → denormalize → delta_loss
+pred_tokens = argmax(logits[:, -pred_len:, :])
+z = tokenizer.decode(pred_tokens, half=True)
+pred_raw = z * stds + means
+pred_delta = (pred_raw.close - baseline.close) / baseline.close
+loss = SmoothL1(pred_delta, actual_delta, beta=0.005)
 ```
 
-具体方案：
+**错误路径**（已验证无效）：
 
-1. **Feature-weighted CE Loss**
-   - 给价格特征更高权重，抑制 vol/amt 学习速度
-
-2. **两阶段训练**
-   - 第一阶段：只训练价格部分
-   - 第二阶段：放开全部特征
-
----
-
-Phase 3
-
-重新评估：
-
-```text
-未来K线预测质量
-```
-
-而不是单纯关注：
-
-```text
-Price IC
-Return IC
+```python
+hidden[:, -1, :] → Linear → delta_loss  # ❌ 绕开 token 生成
 ```
 
 ---
 
-最终目标始终保持不变：
+### 2.3 SmoothL1 参数
+
+```python
+beta = 0.005  # 约 0.5% 误差阈值
+# 网格搜索范围：0.003 ~ 0.01（0.3% ~ 1%）
+```
+
+A股低波动，MSE 被少数跳变样本拖偏，SmoothL1 更稳定。
+
+---
+
+### 2.4 Horizon 加权
+
+越近越重：
+
+```python
+weights = [1.0, 0.9, 0.8, 0.7, 0.6, 0.5, 0.45, 0.4, 0.35, 0.3]
+# 或简化：gamma=0.75 → [1.0, 0.75, 0.56, ...]
+```
+
+---
+
+### 2.5 实验步骤
+
+| Step | 改动 | 目标 |
+|------|------|------|
+| 1 | 加 close_delta_loss（λ1=0.1） | 观察 close IC 变化 |
+| 2 | 网格 λ1 ∈ [0.05, 0.1, 0.2, 0.3] | 找最优权重 |
+| 3 | 加 range_loss（λ2=0.03） | K线结构稳定性 |
+| 4 | 网格 SmoothL1 beta | 找最优阈值 |
+
+---
+
+### 2.6 预期效果
+
+| 指标 | 当前 | 目标 |
+|------|------|------|
+| close IC | 0.006 | 0.10+ |
+| close MAE/act_std | 0.98 | <0.5 |
+| vol IC | 0.99 | 0.50~0.70 |
+| DA (close) | 0.48 | 0.55+ |
+
+---
+
+## Phase 1 完成状态
 
 ```text
-让模型能够生成未来5~10日
-具有实际预测意义的K线轨迹
-并能够向普通投资者解释
-为什么选择这只股票。
+✅ Token敏感性实验 → 问题在 Predictor
+✅ 误差分解诊断 → close 方向预测失败，MAE ≈ actual_std
 ```
+
+---
+
+## Phase 2 待执行
+
+```text
+⏳ 实现 train_single_step_v2.py
+⏳ decoded close_delta SmoothL1
+⏳ horizon 加权
+```
+
+---
+
+## 文件索引
+
+| 文件 | 用途 |
+|------|------|
+| `docs/DIAGNOSIS_PLAN.md` | 主诊断文档（本文件） |
+| `docs/PHASE2_PLAN.md` | Phase 2 详细技术方案 |
+| `finetune/token_sensitivity_analysis.py` | Token敏感性实验脚本 |
+| `finetune/error_decomposition_diagnosis.py` | 误差分解诊断脚本 |
+| `finetune/EXPERIENCE.md` | 经验教训记录 |

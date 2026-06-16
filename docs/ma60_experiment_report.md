@@ -277,4 +277,104 @@ python -u finetune/train_predictor_ma60_small.py
 
 ---
 
-*文档更新时间：2026-05-27*
+*文档更新时间：2026-06-15*
+
+## 七、Lookback 实验系列 (2026-06)
+
+### 7.1 实验设计
+
+使用 Kronos-mini (4.1M) + MA60 归一化，测试不同 lookback 对预测效果的影响。
+
+| Mode | 配置 | 目的 |
+|------|------|------|
+| Mode1 | 原始归一化，无MA60 | 基线对比 |
+| Mode2 | MA60 + lb400 + pd10 | 长lookback |
+| Mode3 | MA60 + lb60 + pd10 | 短lookback |
+| Mode4 | MA60 + lb60 + pd5 + weighted loss | 加权损失 |
+| Mode5 | MA60 + lb400 + pd10 | Mode2复现 |
+| Mode6 | MA60 + lb200 + pd10 | 中等lookback |
+
+### 7.2 数据划分方式
+
+所有 Mode 使用 **Target-based Window Splitting**，避免数据泄露：
+
+- Train: 历史目标区域
+- Val: 中间目标区域 (k_val=100)
+- Test: 最后目标区域 (k_test=100)
+
+### 7.3 Trajectory IC 结果汇总
+
+Trajectory IC 评估预测轨迹与实际轨迹的相关性。
+
+| Mode | Lookback | Predict | Val Best IC | Test Close IC | 备注 |
+|------|----------|---------|-------------|---------------|------|
+| **Mode2** | 400 | 10 | ~0.19 | **0.190** | 🏆 最佳 |
+| **Mode6** | 200 | 10 | 0.122 | **0.138** | lb200 > lb60 |
+| Mode3 | 60 | 10 | ~0.11 | ~0.11 | lb60基准 |
+| Mode4 | 60 | 5 | 0.120 | 0.088 | 加权损失无效 |
+| Mode1 | - | 10 | 0.18(train) | ≈0 | 🚫 过拟合失效 |
+
+### 7.4 Lookback 影响分析
+
+```
+lb400 (IC=0.190) > lb200 (IC=0.138) > lb60 (IC=0.11)
+```
+
+**结论：长 lookback 提供更多历史上下文，预测更准确。**
+
+| Lookback | 相对提升 |
+|----------|---------|
+| 400 vs 60 | +73% IC |
+| 200 vs 60 | +27% IC |
+
+### 7.5 过拟合分析
+
+| Mode | Train IC Peak | Test IC | 泛化差距 |
+|------|---------------|---------|---------|
+| Mode1 | 0.18 | ≈0 | -100% 🚫 |
+| Mode6 | 0.12 | 0.138 | +15% ✓ |
+| Mode2 | ~0.19 | 0.190 | ~0% ✓ |
+
+**发现：**
+- Mode1 (无MA60) 完全过拟合，测试无效
+- Mode6 测试IC反而高于验证，说明模型有良好泛化能力
+- Mode2 训练-测试差距最小，最稳定
+
+### 7.6 加权损失实验 (Mode4)
+
+尝试样本加权损失 + conditional delta loss：
+
+| 指标 | Mode3 (普通) | Mode4 (加权) |
+|------|-------------|--------------|
+| Test IC | ~0.11 | 0.088 |
+| Val Best IC | ~0.11 | 0.120 |
+
+**结论：加权损失策略无效，反而降低测试效果。**
+
+### 7.7 关键发现总结
+
+1. **MA60 归一化是关键**：无MA60的Mode1完全失效
+2. **Lookback 越长越好**：lb400 最佳，lb200 中等，lb60 较弱
+3. **Target-based splitting 防泄露**：确保训练/测试无重叠
+4. **加权损失无效**：简单方案优于复杂加权
+
+### 7.8 下一步：Kronos-base DDP
+
+| 项目 | 当前 | 目标 |
+|------|------|------|
+| 模型 | Kronos-mini (4.1M) | Kronos-base (102.3M) |
+| 参数量 | 4.1M | 102.3M (25x) |
+| 总Batch | 16 | 128 (4卡DDP) |
+| 预期IC | 0.190 | >0.20 |
+
+准备 Mode7 (Kronos-base + lb400 + 4卡DDP) 进行下一轮实验。
+
+### 7.9 模型文件索引 (新增)
+
+| 路径 | 说明 |
+|------|------|
+| `outputs/models/mode2_lb400_pd10/` | Mode2 最佳模型 (IC=0.190) |
+| `outputs/models/mode6_lb200_pd10/` | Mode6 中等lookback (IC=0.138) |
+| `outputs/models/mode4_lb60_pd5/` | Mode4 加权损失实验 |
+| `finetune/predictor/mode7_base_lb400/` | Mode7 DDP脚本 (待训练) |
+| `deploy_mode7.tar.gz` | Mode7 服务器部署包 |
