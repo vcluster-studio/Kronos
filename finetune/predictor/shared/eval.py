@@ -5,6 +5,7 @@
 1. Trajectory IC: 同一股票内，预测轨迹 vs 实际轨迹的相关性
 2. MAE: 预测绝对误差（各步）
 3. Direction Acc: 方向准确率（各步）
+4. DA_score: 综合方向准确率（对数步权重 + 特征权重）
 
 注意：
 - Return IC (旧): 跨股票收益率相关性 → 不符合项目目标
@@ -18,6 +19,76 @@ from tqdm import tqdm
 
 DEVICE = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 FEATURE_NAMES = ['open', 'high', 'low', 'close', 'vol', 'amt']
+
+
+# ============================================================================
+# DA 综合评分计算
+# ============================================================================
+
+def get_log_step_weights(predict=10):
+    """对数递减步权重：短期权重高，远期平滑递减"""
+    steps = np.arange(1, predict + 1)
+    weights = 1 / np.log(steps + 1)
+    weights = weights / weights.sum()
+    return weights
+
+
+def get_feature_weights():
+    """特征权重：价格类 0.7，交易量类 0.3"""
+    return {
+        'open': 0.15, 'high': 0.15, 'low': 0.15, 'close': 0.25,  # 价格类 0.70
+        'vol': 0.15, 'amt': 0.15                                   # 交易量类 0.30
+    }
+
+
+def calculate_da_score(da_by_step, predict=10):
+    """
+    计算综合 DA 评分
+
+    两级加权：
+    1. 同特征内：对数步权重（+1=24.5% → +10=7.0%）
+    2. 特征间：价格类0.7 + 交易量类0.3
+
+    Args:
+        da_by_step: [{feature: [DA_values]}] for each step
+        predict: 预测步数
+
+    Returns:
+        da_score: 综合DA评分 (0-1)
+    """
+    step_weights = get_log_step_weights(predict)
+    feature_weights = get_feature_weights()
+
+    da_score = 0.0
+    for feature, f_weight in feature_weights.items():
+        feature_da = 0.0
+        for step in range(predict):
+            if da_by_step[step][feature]:
+                step_da = np.mean(da_by_step[step][feature])
+                feature_da += step_da * step_weights[step]
+        da_score += feature_da * f_weight
+
+    return da_score
+
+
+def calculate_combined_score(ic, da_score, ic_weight=0.6, da_weight=0.4):
+    """
+    综合评分：IC + DA（线性归一化）
+
+    Args:
+        ic: close 的 trajectory IC (-1~1)
+        da_score: 综合 DA 评分 (0~1)
+        ic_weight: IC 权重
+        da_weight: DA 权重
+
+    Returns:
+        combined_score: 综合评分 (0~1)
+    """
+    # IC 归一化: -1~1 → 0~1
+    ic_norm = (ic + 1) / 2
+    # DA 已在 0~1 范围
+
+    return ic_norm * ic_weight + da_score * da_weight
 
 
 # ============================================================================
@@ -141,6 +212,12 @@ def evaluate_full_window(model, tokenizer, test_data, lookback, predict, n_sampl
             result[f'{fn}_mae{suffix}'] = float(np.mean(mae_by_step[step_idx][fn])) if mae_by_step[step_idx][fn] else 0.0
             result[f'{fn}_da{suffix}'] = float(np.mean(da_by_step[step_idx][fn])) if da_by_step[step_idx][fn] else 0.0
 
+    # 综合评分
+    result['da_score'] = calculate_da_score(da_by_step, predict)
+    result['combined_score'] = calculate_combined_score(
+        result['close_trajectory_ic'], result['da_score']
+    )
+
     return result
 
 
@@ -247,6 +324,12 @@ def evaluate_ma60(model, tokenizer, all_data, indices, lookback, predict, n_samp
         for fn in FEATURE_NAMES:
             result[f'{fn}_mae{suffix}'] = float(np.mean(mae_by_step[step_idx][fn])) if mae_by_step[step_idx][fn] else 0.0
             result[f'{fn}_da{suffix}'] = float(np.mean(da_by_step[step_idx][fn])) if da_by_step[step_idx][fn] else 0.0
+
+    # 综合评分
+    result['da_score'] = calculate_da_score(da_by_step, predict)
+    result['combined_score'] = calculate_combined_score(
+        result['close_trajectory_ic'], result['da_score']
+    )
 
     return result
 

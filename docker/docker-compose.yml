@@ -1,0 +1,18 @@
+version: '3.8'
+
+services:
+  kronos:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+    image: kronos:latest
+    runtime: nvidia
+    environment:
+      - NVIDIA_VISIBLE_DEVICES=all
+    volumes:
+      - ../finetune/data:/app/data
+      - ../outputs:/app/outputs
+      - ../pretrained:/app/pretrained
+      - ../logs:/app/logs
+    # 默认命令，可通过 docker-compose run 覆盖
+    command: train --use-block --model mini --epochs 50

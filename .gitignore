@@ -81,16 +81,12 @@ docs/temp/
 .python-version
 
 # Finetune outputs (training results)
-outputs/predictors/*/
-outputs/models/*/
-outputs/tokenizers/*/
+outputs/predictors/
+outputs/models/
+outputs/tokenizers/
 outputs/prediction_results/
 !outputs/README.md
 !outputs/INDEX.md
-!outputs/predictors/README.md
-!outputs/models/README.md
-!outputs/tokenizers/README.md
-!outputs/predictors/archived/README.md
 
 # Temp removed
 temp_removed/

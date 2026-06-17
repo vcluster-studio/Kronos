@@ -21,20 +21,41 @@ from model.kronos import KronosTokenizer, Kronos, auto_regressive_inference
 DEVICE = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 FEATURE_NAMES = ['open', 'high', 'low', 'close', 'vol', 'amt']
 
-# 模型配置
+# 模型配置（已更新到新目录结构）
 MODEL_CONFIGS = {
-    'mode7': {
+    # ===== final/ 最佳模型 =====
+    'final_mini': {
+        'model_type': 'mini',
+        'pretrained': 'pretrained/Kronos-mini',
+        'checkpoint': 'outputs/models/final/mini/best_ic_model',
+        'data_dir': 'finetune/data/ma60_norm/windowed_lb400_pd10',
+        'lookback': 400,
+        'max_context': 2048,
+    },
+    'final_small': {
+        'model_type': 'small',
+        'pretrained': 'pretrained/Kronos-small',
+        'checkpoint': 'outputs/models/final/small/best_ic_model',
+        'data_dir': 'finetune/data/ma60_norm/windowed_lb246_pd10',
+        'lookback': 246,
+        'max_context': 512,
+    },
+
+    # ===== experiments/ 进行中实验 =====
+    'experiments_base': {
         'model_type': 'base',
         'pretrained': 'pretrained/Kronos-base',
-        'checkpoint': 'outputs/models/mode7_base_lb400_ddp/checkpoints/best_ic_model',
+        'checkpoint': 'outputs/models/experiments/base_ma60_lb400_ddp/checkpoints/best_ic_model',
         'data_dir': 'finetune/data/ma60_norm/windowed_lb400_pd10',
         'lookback': 400,
         'max_context': 512,
     },
+
+    # ===== deprecated/ 低IC模型（保留旧名称兼容）=====
     'mode8': {
         'model_type': 'small',
         'pretrained': 'pretrained/Kronos-small',
-        'checkpoint': 'outputs/models/mode8_small_lb400/checkpoints/best_ic_model',
+        'checkpoint': 'outputs/models/deprecated/small_ma60_lb400_pd10_ic145/checkpoints/best_ic_model',
         'data_dir': 'finetune/data/ma60_norm/windowed_lb400_pd10',
         'lookback': 400,
         'max_context': 512,
@@ -42,17 +63,9 @@ MODEL_CONFIGS = {
     'mode9': {
         'model_type': 'small',
         'pretrained': 'pretrained/Kronos-small',
-        'checkpoint': 'outputs/models/mode9_small_lb60/checkpoints/best_ic_model',
+        'checkpoint': 'outputs/models/deprecated/small_ma60_lb60_pd10_ic108/checkpoints/best_ic_model',
         'data_dir': 'finetune/data/ma60_norm/windowed_lb60_pd10',
         'lookback': 60,
-        'max_context': 512,
-    },
-    'mode10': {
-        'model_type': 'small',
-        'pretrained': 'pretrained/Kronos-small',
-        'checkpoint': 'outputs/models/mode10_small_lb246/checkpoints/best_ic_model',
-        'data_dir': 'finetune/data/ma60_norm/windowed_lb246_pd10',
-        'lookback': 246,
         'max_context': 512,
     },
 }
@@ -181,8 +194,8 @@ def evaluate_model(model, tokenizer, all_data, test_indices, lookback, pred_len=
 
 def main():
     parser = argparse.ArgumentParser(description='Evaluate Mode7/8/9/10 models')
-    parser.add_argument('--mode', type=str, nargs='+', default=['mode7', 'mode8', 'mode9'],
-                        help='Modes to evaluate')
+    parser.add_argument('--mode', type=str, nargs='+', default=['final_mini', 'final_small'],
+                        help='Modes to evaluate (e.g., final_mini, final_small, experiments_base)')
     parser.add_argument('--n-samples', type=int, default=500)
     parser.add_argument('--seed', type=int, default=42)
     args = parser.parse_args()

@@ -42,9 +42,9 @@ TOKENIZER_MA60 = 'outputs/tokenizers/ma60_tokenizer_base_v1/checkpoints/best_mod
 
 # 预归一化数据路径（支持窗口化随机分配和传统时间截断两种格式）
 DATA_PATHS = {
-    'train': 'finetune/data/ma60_norm/windowed_lb400_pd10/train_data.pkl',
-    'val': 'finetune/data/ma60_norm/windowed_lb400_pd10/val_data.pkl',
-    'test': 'finetune/data/ma60_norm/windowed_lb400_pd10/test_data.pkl',
+    'train': 'finetune/data/ma60_norm/block_lb400_pd10/train_data.pkl',
+    'val': 'finetune/data/ma60_norm/block_lb400_pd10/val_data.pkl',
+    'test': 'finetune/data/ma60_norm/block_lb400_pd10/test_data.pkl',
 }
 
 # Predictor 预训练路径
@@ -462,7 +462,7 @@ def train_model(model, tokenizer, device, config, save_dir, val_data=None):
     )
 
     best_val_loss = float('inf')
-    best_ic = -999
+    best_combined = -999
     patience_counter = 0
 
     # 预计算 bit_mask 用于 soft decode（只需一次）
@@ -484,7 +484,7 @@ def train_model(model, tokenizer, device, config, save_dir, val_data=None):
     codebook_dim = tokenizer_module.codebook_dim
     q_scale = 1.0 / (codebook_dim ** 0.5)
 
-    history = {'train_loss': [], 'val_loss': [], 'ic': [], 'lr': []}
+    history = {'train_loss': [], 'val_loss': [], 'ic': [], 'da': [], 'combined': [], 'lr': []}
 
     for epoch_idx in range(config.epochs):
         epoch_start = time.time()
@@ -593,7 +593,11 @@ def train_model(model, tokenizer, device, config, save_dir, val_data=None):
         current_ic = 0
         if traj_result:
             current_ic = traj_result.get('close_trajectory_ic', 0)
+            current_da = traj_result.get('da_score', 0)
+            current_combined = traj_result.get('combined_score', 0)
             history['ic'].append(current_ic)
+            history['da'].append(current_da)
+            history['combined'].append(current_combined)
 
             # 各特征的 Trajectory IC 汇总
             print(f"\n  {'Feature':<8} {'Traj_IC':>8} {'RankIC':>8}")
@@ -614,18 +618,21 @@ def train_model(model, tokenizer, device, config, save_dir, val_data=None):
                       f"{traj_result.get(f'vol_da{suffix}', 0):>7.0%} "
                       f"{traj_result.get(f'amt_da{suffix}', 0):>7.0%}")
 
-        # IC 滑动均值（用于决策，减少噪声）
-        ic_window = 3
-        if len(history['ic']) >= ic_window:
-            ic_smoothed = np.mean(history['ic'][-ic_window:])
+            # 综合评分
+            print(f"\n  DA_score: {current_da:.4f}, Combined_score: {current_combined:.4f}")
+
+        # Combined score 滑动均值（用于决策）
+        combined_window = 3
+        if len(history['combined']) >= combined_window:
+            combined_smoothed = np.mean(history['combined'][-combined_window:])
         else:
-            ic_smoothed = current_ic
+            combined_smoothed = current_combined if traj_result else 0
 
         epoch_time = time.time() - epoch_start
         total_time = time.time() - start_time
 
         print(f"Train: {avg_train_loss:.4f}, Val: {avg_val_loss:.4f}")
-        print(f"Trajectory IC (close): {current_ic:.4f}, IC_smoothed: {ic_smoothed:.4f} (best: {best_ic:.4f})")
+        print(f"IC: {current_ic:.4f}, DA: {current_da:.4f}, Combined: {current_combined:.4f} (smoothed: {combined_smoothed:.4f}, best: {best_combined:.4f})")
         print(f"Time: {format_time(epoch_time)}, Total: {format_time(total_time)}")
 
         print(f"[LR] {current_lr:.6f}")
@@ -645,13 +652,13 @@ def train_model(model, tokenizer, device, config, save_dir, val_data=None):
             model.module.save_pretrained(save_path)
             print(f"[VAL LOSS SAVED] {best_val_loss:.4f}")
 
-        if ic_smoothed > best_ic:
-            best_ic = ic_smoothed
+        if combined_smoothed > best_combined:
+            best_combined = combined_smoothed
             patience_counter = 0
             improved = True
-            ic_save_path = f"{save_dir}/checkpoints/best_ic_model"
-            model.module.save_pretrained(ic_save_path)
-            print(f"[IC SAVED] {best_ic:.4f}")
+            best_save_path = f"{save_dir}/checkpoints/best_combined_model"
+            model.module.save_pretrained(best_save_path)
+            print(f"[COMBINED SAVED] {best_combined:.4f}")
 
         if not improved:
             patience_counter += 1
@@ -672,7 +679,7 @@ def train_model(model, tokenizer, device, config, save_dir, val_data=None):
 
     return {
         'best_val_loss': best_val_loss,
-        'best_ic': best_ic,
+        'best_combined': best_combined,
         'epochs_trained': epoch_idx + 1,
         'history': history,
     }
@@ -688,7 +695,15 @@ def main():
                         help='Resume from checkpoint path (e.g. outputs/models/ma60_predictor_v1/checkpoints/best_ic_model)')
     parser.add_argument('--save-folder', type=str, default='mode2_lb400_pd10',
                         help='Save folder name')
+    parser.add_argument('--use-block', action='store_true',
+                        help='Use block-stratified dataset (block_lb400_pd10)')
     args = parser.parse_args()
+
+    # 根据参数选择数据集
+    if args.use_block:
+        DATA_PATHS['train'] = 'finetune/data/ma60_norm/block_lb400_pd10/train_data.pkl'
+        DATA_PATHS['val'] = 'finetune/data/ma60_norm/block_lb400_pd10/val_data.pkl'
+        DATA_PATHS['test'] = 'finetune/data/ma60_norm/block_lb400_pd10/test_data.pkl'
 
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
@@ -784,7 +799,7 @@ def main():
         'config': TRAINING_PARAMS,
         'result': {
             'best_val_loss': result['best_val_loss'],
-            'best_ic': result['best_ic'],
+            'best_combined': result['best_combined'],
             'epochs_trained': result['epochs_trained'],
         }
     }
@@ -795,7 +810,7 @@ def main():
     print("\n" + "="*60)
     print("Training completed!")
     print(f"Best Val Loss: {result['best_val_loss']:.4f}")
-    print(f"Best IC: {result['best_ic']:.4f}")
+    print(f"Best Combined Score: {result['best_combined']:.4f}")
     print(f"Epochs: {result['epochs_trained']}")
     print(f"Saved to: {save_dir}")
     print("="*60)

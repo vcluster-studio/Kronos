@@ -35,19 +35,47 @@ MODELS_DIR = 'outputs/models'
 FEATURE_NAMES = ['open', 'high', 'low', 'close', 'vol', 'amt']
 
 MODEL_CONFIGS = {
-    'mode2_mini_lb400': {'model_type': 'mini', 'lookback': 400, 'max_context': 2048},
-    'mode2_lb400_pd10': {'model_type': 'mini', 'lookback': 400, 'max_context': 2048},
-    'mode7_base_lb400': {'model_type': 'base', 'lookback': 400, 'max_context': 512},
-    'mode8_small_lb400': {'model_type': 'small', 'lookback': 400, 'max_context': 512},
-    'mode9_small_lb60': {'model_type': 'small', 'lookback': 60, 'max_context': 512},
-    'mode10_small_lb246': {'model_type': 'small', 'lookback': 246, 'max_context': 512},
-    # Full window 归一化模型（mode1）
-    'mode1_global': {
+    # ===== final/ 最佳模型 =====
+    'final_mini': {
+        'model_type': 'mini', 'lookback': 400, 'max_context': 2048,
+        'model_path': 'outputs/models/final/mini/best_ic_model',
+    },
+    'final_small': {
+        'model_type': 'small', 'lookback': 246, 'max_context': 512,
+        'model_path': 'outputs/models/final/small/best_ic_model',
+    },
+
+    # ===== archived/ 训练方式探索 =====
+    'archived_mini_fw': {
         'model_type': 'mini', 'lookback': 200, 'max_context': 2048,
         'norm_mode': 'full_window',
-        'model_path': 'outputs/models/archived/mode1_global_predictor/best_ic_model',
+        'model_path': 'outputs/models/archived/mini_fw_lb200_pd10_ic180/best_ic_model',
         'tokenizer_path': 'pretrained/Kronos-Tokenizer-2k',
         'data_path': 'finetune/data/global_norm/full_series/test_data.pkl',
+    },
+    'archived_mini_ma20': {
+        'model_type': 'mini', 'lookback': 400, 'max_context': 2048,
+        'model_path': 'outputs/models/archived/mini_ma20_lb400_pd10_ic153/best_ic_model',
+    },
+
+    # ===== deprecated/ 低IC模型（保留兼容旧名称）=====
+    'mode2_mini_lb400': {
+        'model_type': 'mini', 'lookback': 400, 'max_context': 2048,
+        'model_path': 'outputs/models/deprecated/mini_ma60_lb400_pd10_ic131/checkpoints/best_ic_model',
+    },
+    'mode8_small_lb400': {
+        'model_type': 'small', 'lookback': 400, 'max_context': 512,
+        'model_path': 'outputs/models/deprecated/small_ma60_lb400_pd10_ic145/checkpoints/best_ic_model',
+    },
+    'mode9_small_lb60': {
+        'model_type': 'small', 'lookback': 60, 'max_context': 512,
+        'model_path': 'outputs/models/deprecated/small_ma60_lb60_pd10_ic108/checkpoints/best_ic_model',
+    },
+
+    # ===== experiments/ 进行中实验 =====
+    'experiments_base': {
+        'model_type': 'base', 'lookback': 400, 'max_context': 512,
+        'model_path': 'outputs/models/experiments/base_ma60_lb400_ddp/checkpoints/best_ic_model',
     },
 }
 

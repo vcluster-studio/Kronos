@@ -1123,6 +1123,8 @@ def main():
     parser.add_argument('--norm-mode', type=str, default='ma60',
                         choices=['ma60', 'full_window'],
                         help='Normalization mode: ma60 (pre-normalized) or full_window (dynamic)')
+    parser.add_argument('--use-block', action='store_true',
+                        help='Use block-stratified dataset (block_lb400_pd10) instead of time-split')
     args = parser.parse_args()
 
     # 动态构建数据路径（基于norm_mode）
@@ -1130,6 +1132,8 @@ def main():
         args.lookback = 200 if args.norm_mode == 'full_window' else 400
     if args.norm_mode == 'full_window':
         data_dir = 'finetune/data/global_norm/full_series'
+    elif args.use_block:
+        data_dir = 'finetune/data/ma60_norm/block_lb400_pd10'
     else:
         data_dir = f'finetune/data/ma60_norm/windowed_lb{args.lookback}_pd10'
     data_paths = {

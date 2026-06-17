@@ -1,9 +1,6 @@
 # Kronos Training - Docker Requirements
 # Minimal dependencies for training and evaluation only
-#
-# Pretrained weights are mounted from host, NOT downloaded inside container.
-# However, huggingface_hub is still required for from_pretrained() model loading.
-# PyTorch installed separately via --index-url for CUDA support
+# PyTorch installed via base image (pytorch/pytorch:2.7.0-cuda12.6)
 
 numpy>=2.0
 pandas>=2.2
@@ -13,4 +10,3 @@ huggingface_hub>=0.33.0
 safetensors>=0.6.0
 tqdm>=4.67
 matplotlib>=3.9
-flask>=3.0
