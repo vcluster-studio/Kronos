@@ -45,10 +45,14 @@ from model.kronos import KronosTokenizer, Kronos, auto_regressive_inference
 # 配置
 # ============================================================================
 
-# MA60 tokenizer 路径
-TOKENIZER_MA60 = 'outputs/tokenizers/ma60_tokenizer_base_v1/checkpoints/best_model'
+# MA60 tokenizer 路径（使用 outputs/tokenizers/final 中的 MA60 微调版）
+TOKENIZER_MA60 = {
+    'mini': 'outputs/tokenizers/final/2k-MA60',
+    'small': 'outputs/tokenizers/final/base-MA60',
+    'base': 'outputs/tokenizers/final/base-MA60',
+}
 
-# Full window 归一化使用的 tokenizer（pretrained，按模型类型匹配）
+# Full window 归一化使用的 tokenizer（pretrained 原始预训练版）
 TOKENIZER_FULL_WINDOW = {
     'mini': 'pretrained/Kronos-Tokenizer-2k',
     'small': 'pretrained/Kronos-Tokenizer-base',
@@ -290,7 +294,7 @@ def quick_trajectory_ic_test(model, tokenizer, device, val_data, n_samples=500,
         - trajectory_rank_ics: 各特征的 trajectory rank IC
         - da_by_step: 各步各特征的 direction accuracy
     """
-    from finetune.predictor.shared.eval import FEATURE_NAMES
+    from finetune.predictor.shared.eval import FEATURE_NAMES, calculate_da_score, calculate_combined_score
 
     model.eval()
 
@@ -367,13 +371,17 @@ def quick_trajectory_ic_test(model, tokenizer, device, val_data, n_samples=500,
                     actual_traj = actual[:, fi]
 
                     if len(pred_traj) >= 3:
-                        traj_ic = np.corrcoef(pred_traj, actual_traj)[0, 1]
-                        if np.isfinite(traj_ic):
-                            trajectory_ics[fn].append(traj_ic)
+                        # 检查轨迹是否有足够方差（避免除0警告）
+                        pred_std = np.std(pred_traj)
+                        actual_std = np.std(actual_traj)
+                        if pred_std > 1e-8 and actual_std > 1e-8:
+                            traj_ic = np.corrcoef(pred_traj, actual_traj)[0, 1]
+                            if np.isfinite(traj_ic):
+                                trajectory_ics[fn].append(traj_ic)
 
-                        traj_ric, _ = spearmanr(pred_traj, actual_traj)
-                        if np.isfinite(traj_ric):
-                            trajectory_rics[fn].append(traj_ric)
+                            traj_ric, _ = spearmanr(pred_traj, actual_traj)
+                            if np.isfinite(traj_ric):
+                                trajectory_rics[fn].append(traj_ric)
 
                 # 计算 DA（各步各特征）
                 for step_idx in range(pred_len):
@@ -452,13 +460,17 @@ def quick_trajectory_ic_test(model, tokenizer, device, val_data, n_samples=500,
                     actual_traj = actual[:, fi]
 
                     if len(pred_traj) >= 3:
-                        traj_ic = np.corrcoef(pred_traj, actual_traj)[0, 1]
-                        if np.isfinite(traj_ic):
-                            trajectory_ics[fn].append(traj_ic)
+                        # 检查轨迹是否有足够方差（避免除0警告）
+                        pred_std = np.std(pred_traj)
+                        actual_std = np.std(actual_traj)
+                        if pred_std > 1e-8 and actual_std > 1e-8:
+                            traj_ic = np.corrcoef(pred_traj, actual_traj)[0, 1]
+                            if np.isfinite(traj_ic):
+                                trajectory_ics[fn].append(traj_ic)
 
-                        traj_ric, _ = spearmanr(pred_traj, actual_traj)
-                        if np.isfinite(traj_ric):
-                            trajectory_rics[fn].append(traj_ric)
+                            traj_ric, _ = spearmanr(pred_traj, actual_traj)
+                            if np.isfinite(traj_ric):
+                                trajectory_rics[fn].append(traj_ric)
 
                 # 计算 DA
                 for step_idx in range(pred_len):
@@ -508,7 +520,7 @@ def quick_trajectory_ic_test_distributed(model, tokenizer, device, val_data,
         da_by_step: 各步各特征的DA列表
         n_evaluated: 实际评估的窗口数
     """
-    from finetune.predictor.shared.eval import FEATURE_NAMES
+    from finetune.predictor.shared.eval import FEATURE_NAMES, calculate_da_score, calculate_combined_score
 
     model.eval()
     tokenizer.eval()
@@ -620,13 +632,17 @@ def quick_trajectory_ic_test_distributed(model, tokenizer, device, val_data,
                 actual_traj = actual[:, fi]
 
                 if len(pred_traj) >= 3:
-                    traj_ic = np.corrcoef(pred_traj, actual_traj)[0, 1]
-                    if np.isfinite(traj_ic):
-                        trajectory_ics[fn].append(traj_ic)
+                    # 检查轨迹是否有足够方差（避免除0警告）
+                    pred_std = np.std(pred_traj)
+                    actual_std = np.std(actual_traj)
+                    if pred_std > 1e-8 and actual_std > 1e-8:
+                        traj_ic = np.corrcoef(pred_traj, actual_traj)[0, 1]
+                        if np.isfinite(traj_ic):
+                            trajectory_ics[fn].append(traj_ic)
 
-                    traj_ric, _ = spearmanr(pred_traj, actual_traj)
-                    if np.isfinite(traj_ric):
-                        trajectory_rics[fn].append(traj_ric)
+                        traj_ric, _ = spearmanr(pred_traj, actual_traj)
+                        if np.isfinite(traj_ric):
+                            trajectory_rics[fn].append(traj_ric)
 
             # DA
             for step_idx in range(pred_len):
@@ -648,7 +664,7 @@ def aggregate_ic_results(local_ics, local_rics, local_da, pred_len,
 
     使用加权平均：IC = sum(IC_i * n_i) / sum(n_i)
     """
-    from finetune.predictor.shared.eval import FEATURE_NAMES
+    from finetune.predictor.shared.eval import FEATURE_NAMES, calculate_da_score, calculate_combined_score
 
     result = {}
 
@@ -710,6 +726,19 @@ def aggregate_ic_results(local_ics, local_rics, local_da, pred_len,
             result[f'{fn}_da_step{step_idx+1}'] = total_da / total_n if total_n > 0 else 0.0
 
     result['n_samples'] = total_n
+
+    # 计算 DA_score 和 Combined_score
+    close_ic = result.get('close_trajectory_ic', 0)
+    # 需要从各步DA重建da_by_step结构用于计算
+    da_by_step = [{f: [] for f in FEATURE_NAMES} for _ in range(pred_len)]
+    for step_idx in range(pred_len):
+        for fn in FEATURE_NAMES:
+            # 使用聚合后的DA值（这里用单个值表示平均值）
+            da_by_step[step_idx][fn] = [result[f'{fn}_da_step{step_idx+1}']]
+    da_score = calculate_da_score(da_by_step, pred_len)
+    combined_score = calculate_combined_score(close_ic, da_score)
+    result['da_score'] = da_score
+    result['combined_score'] = combined_score
 
     return result
 
@@ -795,6 +824,7 @@ def train_model(model, tokenizer, device, config, save_dir, data_paths=None, val
 
     best_val_loss = float('inf')
     best_ic = -999
+    best_combined = -999
     patience_counter = 0
 
     # 预计算 bit_mask 用于 soft decode（只需一次）
@@ -814,7 +844,7 @@ def train_model(model, tokenizer, device, config, save_dir, data_paths=None, val
     codebook_dim = tokenizer_module.codebook_dim
     q_scale = 1.0 / (codebook_dim ** 0.5)
 
-    history = {'train_loss': [], 'val_loss': [], 'ic': [], 'lr': []}
+    history = {'train_loss': [], 'val_loss': [], 'ic': [], 'da': [], 'combined': [], 'lr': []}
 
     for epoch_idx in range(config.epochs):
         epoch_start = time.time()
@@ -1024,6 +1054,13 @@ def train_model(model, tokenizer, device, config, save_dir, data_paths=None, val
                       f"{traj_result.get(f'vol_da{suffix}', 0):>7.0%} "
                       f"{traj_result.get(f'amt_da{suffix}', 0):>7.0%}")
 
+            # 综合评分
+            current_da = traj_result.get('da_score', 0)
+            current_combined = traj_result.get('combined_score', 0)
+            history['da'].append(current_da)
+            history['combined'].append(current_combined)
+            print(f"\n  DA_score: {current_da:.4f}, Combined_score: {current_combined:.4f}")
+
         # 评估完成后再同步（确保所有rank完成）
         if use_ddp:
             dist.barrier()
@@ -1076,6 +1113,19 @@ def train_model(model, tokenizer, device, config, save_dir, data_paths=None, val
                 unwrapped_model.save_pretrained(ic_save_path)
                 print(f"[IC SAVED] {best_ic:.4f}")
 
+        # Combined score 保存
+        if len(history['combined']) >= ic_window:
+            combined_smoothed = np.mean(history['combined'][-ic_window:])
+        else:
+            combined_smoothed = current_combined if 'current_combined' in dir() else 0
+
+        if combined_smoothed > best_combined:
+            best_combined = combined_smoothed
+            if is_main:
+                combined_save_path = f"{save_dir}/checkpoints/best_combined_model"
+                unwrapped_model.save_pretrained(combined_save_path)
+                print(f"[COMBINED SAVED] {best_combined:.4f}")
+
         if not improved:
             patience_counter += 1
 
@@ -1099,6 +1149,7 @@ def train_model(model, tokenizer, device, config, save_dir, data_paths=None, val
     return {
         'best_val_loss': best_val_loss,
         'best_ic': best_ic,
+        'best_combined': best_combined,
         'epochs_trained': epoch_idx + 1,
         'history': history,
     }
@@ -1115,7 +1166,9 @@ def main():
     parser.add_argument('--lr', type=float, default=0.003)
     parser.add_argument('--weight-decay', type=float, default=0.01)
     parser.add_argument('--n-samples', type=int, default=-1,
-                        help='Number of samples for IC evaluation (-1 for full)')
+                        help='Number of samples for validation and IC evaluation (-1 for full)')
+    parser.add_argument('--train-samples', type=int, default=-1,
+                        help='Number of training samples per epoch (-1 for full dataset)')
     parser.add_argument('--resume', type=str, default=None,
                         help='Resume from checkpoint path')
     parser.add_argument('--save-folder', type=str, default=None,
@@ -1157,7 +1210,7 @@ def main():
         print("="*60)
         print(f"World size: {world_size}")
         print(f"Norm mode: {args.norm_mode}")
-        print(f"Tokenizer: {TOKENIZER_FULL_WINDOW[args.model] if args.norm_mode == 'full_window' else TOKENIZER_MA60}")
+        print(f"Tokenizer: {TOKENIZER_FULL_WINDOW[args.model] if args.norm_mode == 'full_window' else TOKENIZER_MA60[args.model]}")
         print(f"Model: {MODEL_PATHS[args.model]}")
         print(f"Data: {data_paths['train']}")
         print(f"Device: {device}")
@@ -1172,11 +1225,11 @@ def main():
     if is_main:
         os.makedirs(os.path.join(save_dir, 'checkpoints'), exist_ok=True)
 
-    # 加载 tokenizer（根据norm_mode选择）
+    # 加载 tokenizer（根据norm_mode和model类型选择）
     if args.norm_mode == 'full_window':
         tokenizer_path = os.path.join(project_root, TOKENIZER_FULL_WINDOW[args.model])
     else:
-        tokenizer_path = os.path.join(project_root, TOKENIZER_MA60)
+        tokenizer_path = os.path.join(project_root, TOKENIZER_MA60[args.model])
     tokenizer = KronosTokenizer.from_pretrained(tokenizer_path)
     tokenizer.eval().to(device)
     if is_main:
@@ -1216,8 +1269,8 @@ def main():
     config.weight_decay = args.weight_decay
     config.adam_beta1 = TRAINING_PARAMS['adam_beta1']
     config.adam_beta2 = TRAINING_PARAMS['adam_beta2']
-    config.n_train_iter = -1  # 全量训练
-    config.n_val_iter = -1    # 全量验证
+    config.n_train_iter = args.train_samples if args.train_samples > 0 else -1  # -1为全量
+    config.n_val_iter = args.n_samples  # 与 IC 评估统一采样
     config.early_stopping_patience = TRAINING_PARAMS['early_stopping_patience']
     config.early_stopping_grace_period = TRAINING_PARAMS['early_stopping_grace_period']
     config.ic_test_samples = args.n_samples
@@ -1260,6 +1313,7 @@ def main():
             'result': {
                 'best_val_loss': result['best_val_loss'],
                 'best_ic': result['best_ic'],
+                'best_combined': result['best_combined'],
                 'epochs_trained': result['epochs_trained'],
             }
         }
@@ -1271,6 +1325,7 @@ def main():
         print("Training completed!")
         print(f"Best Val Loss: {result['best_val_loss']:.4f}")
         print(f"Best IC: {result['best_ic']:.4f}")
+        print(f"Best Combined: {result['best_combined']:.4f}")
         print(f"Epochs: {result['epochs_trained']}")
         print(f"Saved to: {save_dir}")
         print("="*60)
