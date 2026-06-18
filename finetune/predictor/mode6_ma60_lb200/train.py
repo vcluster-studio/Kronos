@@ -240,13 +240,17 @@ def quick_trajectory_ic_test(model, tokenizer, device, val_data, n_samples=500,
                     actual_traj = actual[:, fi]
 
                     if len(pred_traj) >= 3:
-                        traj_ic = np.corrcoef(pred_traj, actual_traj)[0, 1]
-                        if np.isfinite(traj_ic):
-                            trajectory_ics[fn].append(traj_ic)
+                        # 检查轨迹方差，避免除零警告
+                        pred_std = np.std(pred_traj)
+                        actual_std = np.std(actual_traj)
+                        if pred_std > 1e-8 and actual_std > 1e-8:
+                            traj_ic = np.corrcoef(pred_traj, actual_traj)[0, 1]
+                            if np.isfinite(traj_ic):
+                                trajectory_ics[fn].append(traj_ic)
 
-                        traj_ric, _ = spearmanr(pred_traj, actual_traj)
-                        if np.isfinite(traj_ric):
-                            trajectory_rics[fn].append(traj_ric)
+                            traj_ric, _ = spearmanr(pred_traj, actual_traj)
+                            if np.isfinite(traj_ric):
+                                trajectory_rics[fn].append(traj_ric)
 
                 for step_idx in range(pred_len):
                     for fi, fn in enumerate(FEATURE_NAMES):
@@ -319,13 +323,17 @@ def quick_trajectory_ic_test(model, tokenizer, device, val_data, n_samples=500,
                     actual_traj = actual[:, fi]
 
                     if len(pred_traj) >= 3:
-                        traj_ic = np.corrcoef(pred_traj, actual_traj)[0, 1]
-                        if np.isfinite(traj_ic):
-                            trajectory_ics[fn].append(traj_ic)
+                        # 检查轨迹方差，避免除零警告
+                        pred_std = np.std(pred_traj)
+                        actual_std = np.std(actual_traj)
+                        if pred_std > 1e-8 and actual_std > 1e-8:
+                            traj_ic = np.corrcoef(pred_traj, actual_traj)[0, 1]
+                            if np.isfinite(traj_ic):
+                                trajectory_ics[fn].append(traj_ic)
 
-                        traj_ric, _ = spearmanr(pred_traj, actual_traj)
-                        if np.isfinite(traj_ric):
-                            trajectory_rics[fn].append(traj_ric)
+                            traj_ric, _ = spearmanr(pred_traj, actual_traj)
+                            if np.isfinite(traj_ric):
+                                trajectory_rics[fn].append(traj_ric)
 
                 for step_idx in range(pred_len):
                     for fi, fn in enumerate(FEATURE_NAMES):

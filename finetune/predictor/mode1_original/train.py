@@ -279,9 +279,13 @@ def quick_ic_test(model, tokenizer, device, val_data, n_samples=500, lookback=90
                     actual_traj = np.array(actual_traj_by_feature[fn])
 
                     if len(pred_traj) >= 3:
-                        traj_ic = np.corrcoef(pred_traj, actual_traj)[0, 1]
-                        if np.isfinite(traj_ic):
-                            trajectory_ics[fn].append(traj_ic)
+                        # 检查轨迹方差，避免除零警告
+                        pred_std = np.std(pred_traj)
+                        actual_std = np.std(actual_traj)
+                        if pred_std > 1e-8 and actual_std > 1e-8:
+                            traj_ic = np.corrcoef(pred_traj, actual_traj)[0, 1]
+                            if np.isfinite(traj_ic):
+                                trajectory_ics[fn].append(traj_ic)
 
             n += 1
 

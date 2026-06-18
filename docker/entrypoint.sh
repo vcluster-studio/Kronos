@@ -22,23 +22,44 @@ show_help() {
     echo "命令:"
     echo "  train       单GPU训练"
     echo "  train-ddp   多GPU DDP训练"
-    echo "  eval        评估模型"
-    echo "  inference   推理预测"
+    echo "  eval        单GPU评估"
+    echo "  eval-ddp    多GPU DDP评估"
     echo "  shell       进入shell"
     echo ""
-    echo "挂载卷:"
-    echo "  -v /path/to/data:/app/data"
-    echo "  -v /path/to/models:/app/models"
-    echo "  -v /path/to/tokenizers:/app/tokenizers"
-    echo "  -v /path/to/pretrained:/app/pretrained"
-    echo "  -v /path/to/outputs:/app/outputs"
+    echo "通用参数:"
+    echo "  --model NAME        模型类型: mini/small/base (默认mini)"
+    echo "  --lookback N        回看窗口大小 (默认400)"
+    echo "  --epochs N          训练轮数 (默认50)"
+    echo "  --batch-size N      批大小 (默认16)"
+    echo "  --lr FLOAT          学习率 (默认0.003)"
+    echo "  --weight-decay F    权重衰减 (默认0.01)"
+    echo "  --train-samples N   每epoch训练样本数 (-1为全量)"
+    echo "  --n-samples N       验证+IC评估样本数 (-1为全量)"
+    echo "  --norm-mode MODE    归一化模式: ma60/full_window (默认ma60)"
+    echo "  --use-block         使用block分层数据集"
+    echo "  --resume PATH       恢复训练的checkpoint路径"
+    echo "  --save-folder NAME  输出文件夹名"
+    echo ""
+    echo "Eval专用参数:"
+    echo "  --models NAME       预定义模型名 (如 latest_mini_lb400)"
+    echo "  --model-path PATH   直接指定checkpoint路径"
+    echo "  --test-data PATH    测试数据路径"
+    echo "  --checkpoint NAME   checkpoint类型 (如 best_combined_model)"
+    echo "  --output PATH       输出JSON文件路径"
+    echo "  --seed N            随机种子 (默认42)"
     echo ""
     echo "示例:"
     echo "  # 单GPU训练"
-    echo "  docker run -v ./finetune/data:/app/data -v ./outputs:/app/output kronos:latest train --model mini"
+    echo "  docker run kronos:latest train --use-block --epochs 50"
+    echo ""
+    echo "  # 多GPU DDP训练"
+    echo "  docker run kronos:latest train-ddp --use-block --model small --epochs 50"
+    echo ""
+    echo "  # 单GPU评估"
+    echo "  docker run kronos:latest eval --models latest_mini_lb400 --n-samples 500"
     echo ""
     echo "  # 多GPU评估"
-    echo "  docker run --gpus all -v ./outputs/models:/app/models kronos:latest eval --quick 1000"
+    echo "  docker run kronos:latest eval-ddp --model-path outputs/models/xxx/checkpoints/best_ic_model"
 }
 
 case "$1" in
@@ -50,29 +71,20 @@ case "$1" in
     train)
         shift
         python /app/finetune/predictor/mode2_ma60_t0/train.py \
-            --tokenizer ${TOKENIZER_DIR}/ma60_tokenizer_base_v1/checkpoints/best_model \
-            --data_path ${DATA_DIR}/ma60_norm/windowed_lb400_pd10 \
-            --save_dir ${OUTPUT_DIR}/models \
             $@
         ;;
 
     train-ddp)
         shift
-        # 获取GPU数量
         NUM_GPUS=${NUM_GPUS:-$(nvidia-smi -L | wc -l)}
         torchrun --nproc_per_node=${NUM_GPUS} \
             /app/finetune/predictor/mode2_ma60_t0/train_ddp.py \
-            --tokenizer ${TOKENIZER_DIR}/ma60_tokenizer_base_v1/checkpoints/best_model \
-            --data_path ${DATA_DIR}/ma60_norm/windowed_lb400_pd10 \
-            --save_dir ${OUTPUT_DIR}/models \
             $@
         ;;
 
     eval)
         shift
-        python /app/finetune/predictor/shared/eval_all_models.py \
-            --model_dir ${MODEL_DIR} \
-            --output ${OUTPUT_DIR}/eval_results.json \
+        python /app/finetune/predictor/eval_all.py \
             $@
         ;;
 
@@ -81,16 +93,6 @@ case "$1" in
         NUM_GPUS=${NUM_GPUS:-$(nvidia-smi -L | wc -l)}
         torchrun --nproc_per_node=${NUM_GPUS} \
             /app/finetune/predictor/shared/eval_ddp.py \
-            --model_dir ${MODEL_DIR} \
-            --output ${OUTPUT_DIR}/eval_results.json \
-            $@
-        ;;
-
-    inference)
-        shift
-        python /app/finetune/predictor/mode2_ma60_t0/inference.py \
-            --model ${MODEL_DIR}/$2 \
-            --tokenizer ${TOKENIZER_DIR}/ma60_tokenizer_base_v1/checkpoints/best_model \
             $@
         ;;
 

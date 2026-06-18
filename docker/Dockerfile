@@ -61,4 +61,4 @@ ENV PYTHONPATH=/app
 RUN python -c "import torch; print(f'PyTorch {torch.__version__}, CUDA available: {torch.cuda.is_available()}')"
 
 ENTRYPOINT ["bash", "/app/entrypoint.sh"]
-CMD ["--help"]
+CMD ["shell"]

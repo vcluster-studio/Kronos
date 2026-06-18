@@ -21,60 +21,67 @@ from model.kronos import KronosTokenizer, Kronos, auto_regressive_inference
 DEVICE = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 FEATURE_NAMES = ['open', 'high', 'low', 'close', 'vol', 'amt']
 
-# 模型配置（已更新到新目录结构）
+# 模型配置
 MODEL_CONFIGS = {
+    # ===== 最新训练模型 =====
+    'latest_mini_lb400': {
+        'model_type': 'mini',
+        'pretrained': 'pretrained/Kronos-mini',
+        'checkpoint': 'outputs/models/mode_mini_lb400/checkpoints/best_combined_model',
+        'tokenizer': 'outputs/tokenizers/final/2k-MA60',
+        'data_dir': 'finetune/data/ma60_norm/block_lb400_pd10',
+        'test_data': 'finetune/data/ma60_norm/block_lb400_pd10/final_test_data.pkl',  # 最终测试集
+        'lookback': 400,
+        'max_context': 2048,
+    },
+    'latest_mini_lb400_ic': {
+        'model_type': 'mini',
+        'pretrained': 'pretrained/Kronos-mini',
+        'checkpoint': 'outputs/models/mode_mini_lb400/checkpoints/best_ic_model',
+        'tokenizer': 'outputs/tokenizers/final/2k-MA60',
+        'data_dir': 'finetune/data/ma60_norm/block_lb400_pd10',
+        'test_data': 'finetune/data/ma60_norm/block_lb400_pd10/final_test_data.pkl',
+        'lookback': 400,
+        'max_context': 2048,
+    },
+
     # ===== final/ 最佳模型 =====
     'final_mini': {
         'model_type': 'mini',
         'pretrained': 'pretrained/Kronos-mini',
-        'checkpoint': 'outputs/models/final/mini/best_ic_model',
-        'data_dir': 'finetune/data/ma60_norm/windowed_lb400_pd10',
+        'checkpoint': 'outputs/models/final/mini',
+        'tokenizer': 'outputs/tokenizers/final/2k-MA60',
+        'data_dir': 'finetune/data/ma60_norm/block_lb400_pd10',
         'lookback': 400,
         'max_context': 2048,
     },
     'final_small': {
         'model_type': 'small',
         'pretrained': 'pretrained/Kronos-small',
-        'checkpoint': 'outputs/models/final/small/best_ic_model',
-        'data_dir': 'finetune/data/ma60_norm/windowed_lb246_pd10',
-        'lookback': 246,
-        'max_context': 512,
-    },
-
-    # ===== experiments/ 进行中实验 =====
-    'experiments_base': {
-        'model_type': 'base',
-        'pretrained': 'pretrained/Kronos-base',
-        'checkpoint': 'outputs/models/experiments/base_ma60_lb400_ddp/checkpoints/best_ic_model',
-        'data_dir': 'finetune/data/ma60_norm/windowed_lb400_pd10',
+        'checkpoint': 'outputs/models/final/small',
+        'tokenizer': 'outputs/tokenizers/final/base-MA60',
+        'data_dir': 'finetune/data/ma60_norm/block_lb400_pd10',
         'lookback': 400,
-        'max_context': 512,
-    },
-
-    # ===== deprecated/ 低IC模型（保留旧名称兼容）=====
-    'mode8': {
-        'model_type': 'small',
-        'pretrained': 'pretrained/Kronos-small',
-        'checkpoint': 'outputs/models/deprecated/small_ma60_lb400_pd10_ic145/checkpoints/best_ic_model',
-        'data_dir': 'finetune/data/ma60_norm/windowed_lb400_pd10',
-        'lookback': 400,
-        'max_context': 512,
-    },
-    'mode9': {
-        'model_type': 'small',
-        'pretrained': 'pretrained/Kronos-small',
-        'checkpoint': 'outputs/models/deprecated/small_ma60_lb60_pd10_ic108/checkpoints/best_ic_model',
-        'data_dir': 'finetune/data/ma60_norm/windowed_lb60_pd10',
-        'lookback': 60,
         'max_context': 512,
     },
 }
 
-TOKENIZER_PATH = 'outputs/tokenizers/ma60_tokenizer_base_v1/checkpoints/best_model'
+# 默认tokenizer
+DEFAULT_TOKENIZER_PATH = 'outputs/tokenizers/final/2k-MA60'
 
 
-def load_data(data_dir):
-    test_path = os.path.join(project_root, data_dir, 'test_data.pkl')
+def load_data(data_dir, test_data_path=None):
+    """加载测试数据
+
+    Args:
+        data_dir: 数据目录（用于默认 test_data.pkl）
+        test_data_path: 直接指定的测试数据路径（优先使用）
+    """
+    if test_data_path:
+        test_path = os.path.join(project_root, test_data_path)
+    else:
+        test_path = os.path.join(project_root, data_dir, 'test_data.pkl')
+
     with open(test_path, 'rb') as f:
         test_raw = pickle.load(f)
 
@@ -159,13 +166,17 @@ def evaluate_model(model, tokenizer, all_data, test_indices, lookback, pred_len=
                 actual_traj = actual[:, fi]
 
                 if len(pred_traj) >= 3:
-                    traj_ic = np.corrcoef(pred_traj, actual_traj)[0, 1]
-                    if np.isfinite(traj_ic):
-                        trajectory_ics[fn].append(traj_ic)
+                    # 检查轨迹是否有足够方差（避免除0警告）
+                    pred_std = np.std(pred_traj)
+                    actual_std = np.std(actual_traj)
+                    if pred_std > 1e-8 and actual_std > 1e-8:
+                        traj_ic = np.corrcoef(pred_traj, actual_traj)[0, 1]
+                        if np.isfinite(traj_ic):
+                            trajectory_ics[fn].append(traj_ic)
 
-                    traj_ric, _ = spearmanr(pred_traj, actual_traj)
-                    if np.isfinite(traj_ric):
-                        trajectory_rics[fn].append(traj_ric)
+                        traj_ric, _ = spearmanr(pred_traj, actual_traj)
+                        if np.isfinite(traj_ric):
+                            trajectory_rics[fn].append(traj_ric)
 
             for step_idx in range(pred_len):
                 for fi, fn in enumerate(FEATURE_NAMES):
@@ -193,10 +204,25 @@ def evaluate_model(model, tokenizer, all_data, test_indices, lookback, pred_len=
 
 
 def main():
-    parser = argparse.ArgumentParser(description='Evaluate Mode7/8/9/10 models')
-    parser.add_argument('--mode', type=str, nargs='+', default=['final_mini', 'final_small'],
-                        help='Modes to evaluate (e.g., final_mini, final_small, experiments_base)')
-    parser.add_argument('--n-samples', type=int, default=500)
+    parser = argparse.ArgumentParser(description='Evaluate Kronos models')
+    # 预定义模式
+    parser.add_argument('--models', type=str, nargs='+', default=['latest_mini_lb400'],
+                        help='Predefined models (e.g., latest_mini_lb400, final_mini)')
+    # 参数化路径（可覆盖mode配置）
+    parser.add_argument('--model-path', type=str, default=None,
+                        help='Direct model checkpoint path (overrides mode)')
+    parser.add_argument('--model-type', type=str, default='mini', choices=['mini', 'small', 'base'],
+                        help='Model type for tokenizer selection')
+    parser.add_argument('--tokenizer-path', type=str, default=None,
+                        help='Direct tokenizer path (overrides default)')
+    parser.add_argument('--test-data', type=str, default=None,
+                        help='Direct test data path (overrides mode)')
+    parser.add_argument('--n-samples', type=int, default=-1,
+                        help='Number of samples to evaluate (-1 for full test set)')
+    parser.add_argument('--checkpoint', type=str, default='best_combined_model',
+                        help='Checkpoint type for predefined models')
+    parser.add_argument('--output', type=str, default=None,
+                        help='Output JSON file')
     parser.add_argument('--seed', type=int, default=42)
     args = parser.parse_args()
 
@@ -204,15 +230,28 @@ def main():
     print("Model Evaluation - Trajectory IC on Test Set")
     print("=" * 70)
 
-    # Load tokenizer
-    tokenizer = KronosTokenizer.from_pretrained(os.path.join(project_root, TOKENIZER_PATH))
-    tokenizer.eval().to(DEVICE)
-
     rng = np.random.RandomState(args.seed)
 
     results = {}
 
-    for mode in args.mode:
+    # 如果指定了直接路径，使用参数化配置
+    if args.model_path:
+        config = {
+            'model_type': args.model_type,
+            'pretrained': f'pretrained/Kronos-{args.model_type}',
+            'checkpoint': args.model_path,
+            'tokenizer': args.tokenizer_path or (f'outputs/tokenizers/final/2k-MA60' if args.model_type == 'mini' else 'outputs/tokenizers/final/base-MA60'),
+            'data_dir': 'finetune/data/ma60_norm/block_lb400_pd10',
+            'test_data': args.test_data,
+            'lookback': 400,
+            'max_context': 2048 if args.model_type == 'mini' else 512,
+        }
+        modes = ['custom']
+        MODEL_CONFIGS['custom'] = config  # 添加临时配置
+    else:
+        modes = args.models
+
+    for mode in modes:
         if mode not in MODEL_CONFIGS:
             print(f"Unknown mode: {mode}")
             continue
@@ -222,21 +261,46 @@ def main():
         print(f"{mode.upper()} - {config['model_type']} + lb{config['lookback']}")
         print(f"{'='*70}")
 
+        # Load tokenizer (model-specific)
+        tokenizer_path = config.get('tokenizer', DEFAULT_TOKENIZER_PATH)
+        tokenizer = KronosTokenizer.from_pretrained(os.path.join(project_root, tokenizer_path))
+        tokenizer.eval().to(DEVICE)
+        print(f"Tokenizer: {tokenizer_path}")
+
+        # Load model
+        print(f"{mode.upper()} - {config['model_type']} + lb{config['lookback']}")
+        print(f"{'='*70}")
+
         # Load model
         model = Kronos.from_pretrained(os.path.join(project_root, config['pretrained']))
         model.eval().to(DEVICE)
 
         # Load checkpoint
-        checkpoint_path = os.path.join(project_root, config['checkpoint'])
-        safetensors_path = os.path.join(checkpoint_path, "model.safetensors")
+        if args.checkpoint and mode != 'custom':
+            # 使用 --checkpoint 参数覆盖预定义模型的checkpoint类型
+            base_checkpoint = config['checkpoint']
+            # 如果原路径包含 checkpoints/，替换为新的checkpoint类型
+            if '/checkpoints/' in base_checkpoint:
+                checkpoint_path = base_checkpoint.rsplit('/checkpoints/', 1)[0] + '/checkpoints/' + args.checkpoint
+            else:
+                checkpoint_path = base_checkpoint
+        else:
+            checkpoint_path = config['checkpoint']
+
+        checkpoint_full_path = os.path.join(project_root, checkpoint_path)
+        safetensors_path = os.path.join(checkpoint_full_path, "model.safetensors")
         if os.path.exists(safetensors_path):
             from safetensors.torch import load_file
             state_dict = load_file(safetensors_path)
             model.load_state_dict(state_dict, strict=False)
             print(f"Loaded: {safetensors_path}")
+        else:
+            print(f"Checkpoint not found: {safetensors_path}")
 
-        # Load data
-        all_data, test_indices = load_data(config['data_dir'])
+        # Load data (使用最终测试集或默认测试集)
+        test_data_path = config.get('test_data')
+        all_data, test_indices = load_data(config['data_dir'], test_data_path)
+        print(f"Test data: {test_data_path or config['data_dir'] + '/test_data.pkl'}")
         print(f"Test windows: {len(test_indices)}")
 
         # Evaluate
@@ -274,6 +338,14 @@ def main():
         da1 = res['close_da_step1']
         print(f"{mode:<10} {config['model_type']:<10} {config['lookback']:<8} {ic:<10.4f} {da1:<10.1%}")
     print("=" * 70)
+
+    # 保存结果
+    if args.output:
+        import json
+        output_path = os.path.join(project_root, args.output)
+        with open(output_path, 'w') as f:
+            json.dump(results, f, indent=2)
+        print(f"\nResults saved to: {output_path}")
 
 
 if __name__ == '__main__':

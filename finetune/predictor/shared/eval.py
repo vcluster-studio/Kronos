@@ -176,13 +176,17 @@ def evaluate_full_window(model, tokenizer, test_data, lookback, predict, n_sampl
             actual_traj = y[:, fi]
 
             if len(pred_traj) >= 3:
-                traj_ic = np.corrcoef(pred_traj, actual_traj)[0, 1]
-                if np.isfinite(traj_ic):
-                    trajectory_ics[fn].append(traj_ic)
+                # 检查轨迹方差，避免除零警告
+                pred_std = np.std(pred_traj)
+                actual_std = np.std(actual_traj)
+                if pred_std > 1e-8 and actual_std > 1e-8:
+                    traj_ic = np.corrcoef(pred_traj, actual_traj)[0, 1]
+                    if np.isfinite(traj_ic):
+                        trajectory_ics[fn].append(traj_ic)
 
-                traj_ric, _ = spearmanr(pred_traj, actual_traj)
-                if np.isfinite(traj_ric):
-                    trajectory_rics[fn].append(traj_ric)
+                    traj_ric, _ = spearmanr(pred_traj, actual_traj)
+                    if np.isfinite(traj_ric):
+                        trajectory_rics[fn].append(traj_ric)
 
         # 各步 MAE 和 DA
         for step_idx in range(predict):
@@ -293,13 +297,17 @@ def evaluate_ma60(model, tokenizer, all_data, indices, lookback, predict, n_samp
             actual_traj = actual[:, fi]
 
             if len(pred_traj) >= 3:
-                traj_ic = np.corrcoef(pred_traj, actual_traj)[0, 1]
-                if np.isfinite(traj_ic):
-                    trajectory_ics[fn].append(traj_ic)
+                # 检查轨迹方差，避免除零警告
+                pred_std = np.std(pred_traj)
+                actual_std = np.std(actual_traj)
+                if pred_std > 1e-8 and actual_std > 1e-8:
+                    traj_ic = np.corrcoef(pred_traj, actual_traj)[0, 1]
+                    if np.isfinite(traj_ic):
+                        trajectory_ics[fn].append(traj_ic)
 
-                traj_ric, _ = spearmanr(pred_traj, actual_traj)
-                if np.isfinite(traj_ric):
-                    trajectory_rics[fn].append(traj_ric)
+                    traj_ric, _ = spearmanr(pred_traj, actual_traj)
+                    if np.isfinite(traj_ric):
+                        trajectory_rics[fn].append(traj_ric)
 
         # 各步 MAE 和 DA
         for step_idx in range(predict):
@@ -418,13 +426,17 @@ def evaluate_ma60_with_buckets(model, tokenizer, all_data, indices, lookback, pr
             actual_traj = actual[:, fi]
 
             if len(pred_traj) >= 3:
-                traj_ic = np.corrcoef(pred_traj, actual_traj)[0, 1]
-                if np.isfinite(traj_ic):
-                    trajectory_ics[fn].append(traj_ic)
+                # 检查轨迹方差，避免除零警告
+                pred_std = np.std(pred_traj)
+                actual_std = np.std(actual_traj)
+                if pred_std > 1e-8 and actual_std > 1e-8:
+                    traj_ic = np.corrcoef(pred_traj, actual_traj)[0, 1]
+                    if np.isfinite(traj_ic):
+                        trajectory_ics[fn].append(traj_ic)
 
-                traj_ric, _ = spearmanr(pred_traj, actual_traj)
-                if np.isfinite(traj_ric):
-                    trajectory_rics[fn].append(traj_ric)
+                    traj_ric, _ = spearmanr(pred_traj, actual_traj)
+                    if np.isfinite(traj_ric):
+                        trajectory_rics[fn].append(traj_ric)
 
         # MAE/DA by step
         for step_idx in range(predict):

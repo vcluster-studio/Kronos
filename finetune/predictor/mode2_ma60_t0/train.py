@@ -37,8 +37,27 @@ from model.kronos import KronosTokenizer, Kronos, auto_regressive_inference
 # 配置
 # ============================================================================
 
-# MA60 tokenizer 路径
-TOKENIZER_MA60 = 'outputs/tokenizers/ma60_tokenizer_base_v1/checkpoints/best_model'
+# Tokenizer 路径
+# MA60 模式：使用 outputs/tokenizers/final 中的 MA60 微调版
+# Full_window 模式：使用 pretrained 中的原始预训练版
+TOKENIZER_MA60 = {
+    'mini': 'outputs/tokenizers/final/2k-MA60',
+    'small': 'outputs/tokenizers/final/base-MA60',
+    'base': 'outputs/tokenizers/final/base-MA60',
+}
+
+TOKENIZER_FULL_WINDOW = {
+    'mini': 'pretrained/Kronos-Tokenizer-2k',
+    'small': 'pretrained/Kronos-Tokenizer-base',
+    'base': 'pretrained/Kronos-Tokenizer-base',
+}
+
+# 模型路径
+MODEL_PATHS = {
+    'mini': 'pretrained/Kronos-mini',
+    'small': 'pretrained/Kronos-small',
+    'base': 'pretrained/Kronos-base',
+}
 
 # 预归一化数据路径（支持窗口化随机分配和传统时间截断两种格式）
 DATA_PATHS = {
@@ -46,9 +65,6 @@ DATA_PATHS = {
     'val': 'finetune/data/ma60_norm/block_lb400_pd10/val_data.pkl',
     'test': 'finetune/data/ma60_norm/block_lb400_pd10/test_data.pkl',
 }
-
-# Predictor 预训练路径
-PREDICTOR_PRETRAINED = 'pretrained/Kronos-mini'
 
 # 训练参数
 TRAINING_PARAMS = {
@@ -201,7 +217,7 @@ def quick_trajectory_ic_test(model, tokenizer, device, val_data, n_samples=500,
         - trajectory_rank_ics: 各特征的 trajectory rank IC
         - da_by_step: 各步各特征的 direction accuracy
     """
-    from finetune.predictor.shared.eval import FEATURE_NAMES
+    from finetune.predictor.shared.eval import FEATURE_NAMES, calculate_da_score, calculate_combined_score
 
     model.eval()
 
@@ -275,13 +291,17 @@ def quick_trajectory_ic_test(model, tokenizer, device, val_data, n_samples=500,
                     actual_traj = actual[:, fi]
 
                     if len(pred_traj) >= 3:
-                        traj_ic = np.corrcoef(pred_traj, actual_traj)[0, 1]
-                        if np.isfinite(traj_ic):
-                            trajectory_ics[fn].append(traj_ic)
+                        # 检查轨迹是否有足够方差（避免除0警告）
+                        pred_std = np.std(pred_traj)
+                        actual_std = np.std(actual_traj)
+                        if pred_std > 1e-8 and actual_std > 1e-8:
+                            traj_ic = np.corrcoef(pred_traj, actual_traj)[0, 1]
+                            if np.isfinite(traj_ic):
+                                trajectory_ics[fn].append(traj_ic)
 
-                        traj_ric, _ = spearmanr(pred_traj, actual_traj)
-                        if np.isfinite(traj_ric):
-                            trajectory_rics[fn].append(traj_ric)
+                            traj_ric, _ = spearmanr(pred_traj, actual_traj)
+                            if np.isfinite(traj_ric):
+                                trajectory_rics[fn].append(traj_ric)
 
                 # 计算 DA（各步各特征）
                 for step_idx in range(pred_len):
@@ -357,13 +377,17 @@ def quick_trajectory_ic_test(model, tokenizer, device, val_data, n_samples=500,
                     actual_traj = actual[:, fi]
 
                     if len(pred_traj) >= 3:
-                        traj_ic = np.corrcoef(pred_traj, actual_traj)[0, 1]
-                        if np.isfinite(traj_ic):
-                            trajectory_ics[fn].append(traj_ic)
+                        # 检查轨迹是否有足够方差（避免除0警告）
+                        pred_std = np.std(pred_traj)
+                        actual_std = np.std(actual_traj)
+                        if pred_std > 1e-8 and actual_std > 1e-8:
+                            traj_ic = np.corrcoef(pred_traj, actual_traj)[0, 1]
+                            if np.isfinite(traj_ic):
+                                trajectory_ics[fn].append(traj_ic)
 
-                        traj_ric, _ = spearmanr(pred_traj, actual_traj)
-                        if np.isfinite(traj_ric):
-                            trajectory_rics[fn].append(traj_ric)
+                            traj_ric, _ = spearmanr(pred_traj, actual_traj)
+                            if np.isfinite(traj_ric):
+                                trajectory_rics[fn].append(traj_ric)
 
                 # 计算 DA
                 for step_idx in range(pred_len):
@@ -390,6 +414,13 @@ def quick_trajectory_ic_test(model, tokenizer, device, val_data, n_samples=500,
         for fn in FEATURE_NAMES:
             da_list = da_by_step[step_idx][fn]
             result[f'{fn}_da_step{step_idx+1}'] = float(np.mean(da_list)) if da_list else 0.0
+
+    # 计算 DA_score 和 Combined_score
+    close_ic = result.get('close_trajectory_ic', 0)
+    da_score = calculate_da_score(da_by_step, pred_len)
+    combined_score = calculate_combined_score(close_ic, da_score)
+    result['da_score'] = da_score
+    result['combined_score'] = combined_score
 
     return result
 
@@ -687,17 +718,32 @@ def train_model(model, tokenizer, device, config, save_dir, val_data=None):
 
 def main():
     parser = argparse.ArgumentParser(description='MA60 Predictor Training')
-    parser.add_argument('--epochs', type=int, default=30)
+    parser.add_argument('--model', type=str, default='mini', choices=['mini', 'small', 'base'],
+                        help='Model type: mini (4.1M), small (24.7M), base (102M)')
+    parser.add_argument('--lookback', type=int, default=400,
+                        help='Lookback window size')
+    parser.add_argument('--epochs', type=int, default=50)
     parser.add_argument('--batch-size', type=int, default=16)
     parser.add_argument('--lr', type=float, default=0.003)
-    parser.add_argument('--n-samples', type=int, default=500)
+    parser.add_argument('--weight-decay', type=float, default=0.01)
+    parser.add_argument('--n-samples', type=int, default=-1,
+                        help='Number of samples for validation and IC evaluation (-1 for full)')
+    parser.add_argument('--train-samples', type=int, default=-1,
+                        help='Number of training samples per epoch (-1 for full dataset)')
     parser.add_argument('--resume', type=str, default=None,
-                        help='Resume from checkpoint path (e.g. outputs/models/ma60_predictor_v1/checkpoints/best_ic_model)')
-    parser.add_argument('--save-folder', type=str, default='mode2_lb400_pd10',
-                        help='Save folder name')
+                        help='Resume from checkpoint path')
+    parser.add_argument('--save-folder', type=str, default=None,
+                        help='Save folder name (default: mode_{model}_lb{lookback})')
+    parser.add_argument('--norm-mode', type=str, default='ma60',
+                        choices=['ma60', 'full_window'],
+                        help='Normalization mode')
     parser.add_argument('--use-block', action='store_true',
                         help='Use block-stratified dataset (block_lb400_pd10)')
     args = parser.parse_args()
+
+    # 默认保存文件夹名
+    if args.save_folder is None:
+        args.save_folder = f"mode_{args.model}_lb{args.lookback}"
 
     # 根据参数选择数据集
     if args.use_block:
@@ -705,13 +751,22 @@ def main():
         DATA_PATHS['val'] = 'finetune/data/ma60_norm/block_lb400_pd10/val_data.pkl'
         DATA_PATHS['test'] = 'finetune/data/ma60_norm/block_lb400_pd10/test_data.pkl'
 
+    # 选择 tokenizer（按归一化模式）
+    if args.norm_mode == 'ma60':
+        tokenizer_path = TOKENIZER_MA60[args.model]
+    else:
+        tokenizer_path = TOKENIZER_FULL_WINDOW[args.model]
+
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
     print("\n" + "="*60)
-    print("MA60 Predictor Training")
+    print(f"MA60 Predictor Training - {args.model}")
     print("="*60)
-    print(f"Tokenizer: {TOKENIZER_MA60}")
+    print(f"Tokenizer: {tokenizer_path}")
+    print(f"Model: {MODEL_PATHS[args.model]}")
     print(f"Data: {DATA_PATHS['train']}")
+    print(f"Lookback: {args.lookback}")
+    print(f"Norm mode: {args.norm_mode}")
     print(f"Device: {device}")
     if args.resume:
         print(f"Resume from: {args.resume}")
@@ -723,18 +778,18 @@ def main():
     save_dir = os.path.join(project_root, "outputs/models", args.save_folder)
     os.makedirs(os.path.join(save_dir, 'checkpoints'), exist_ok=True)
 
-    # 加载 tokenizer
-    tokenizer = KronosTokenizer.from_pretrained(os.path.join(project_root, TOKENIZER_MA60))
+    # 加载 tokenizer（按归一化模式）
+    tokenizer = KronosTokenizer.from_pretrained(os.path.join(project_root, tokenizer_path))
     tokenizer.eval().to(device)
-    print(f"Tokenizer loaded from: {TOKENIZER_MA60}")
+    print(f"Tokenizer loaded from: {tokenizer_path}")
 
     # 加载 predictor (支持 resume)
     if args.resume:
         predictor_path = args.resume
         print(f"Predictor loaded from (resume): {predictor_path}")
     else:
-        predictor_path = os.path.join(project_root, PREDICTOR_PRETRAINED)
-        print(f"Predictor loaded from: {PREDICTOR_PRETRAINED}")
+        predictor_path = os.path.join(project_root, MODEL_PATHS[args.model])
+        print(f"Predictor loaded from: {MODEL_PATHS[args.model]}")
     model = Kronos.from_pretrained(predictor_path)
     model.to(device)
     print(f"Model size: {get_model_size(model):.2f}M")
@@ -760,17 +815,21 @@ def main():
 
     config = Config()
     config.seed = TRAINING_PARAMS['seed']
-    config.lookback = TRAINING_PARAMS['lookback']
+    config.lookback = args.lookback
     config.predict = TRAINING_PARAMS['predict']
     config.clip = TRAINING_PARAMS['clip']
     config.batch_size = args.batch_size
     config.epochs = args.epochs
     config.learning_rate = args.lr
-    config.weight_decay = TRAINING_PARAMS['weight_decay']
+    config.weight_decay = args.weight_decay
     config.adam_beta1 = TRAINING_PARAMS['adam_beta1']
     config.adam_beta2 = TRAINING_PARAMS['adam_beta2']
-    config.n_train_iter = 2000 * config.batch_size  # 32000
-    config.n_val_iter = 400 * config.batch_size      # 6400
+    # 训练/验证采样数量
+    if args.train_samples > 0:
+        config.n_train_iter = args.train_samples
+    else:
+        config.n_train_iter = 2000 * config.batch_size  # 默认 32000
+    config.n_val_iter = args.n_samples  # 与 IC 评估统一采样
     config.early_stopping_patience = TRAINING_PARAMS['early_stopping_patience']
     config.early_stopping_grace_period = TRAINING_PARAMS['early_stopping_grace_period']
     config.ic_test_samples = args.n_samples
@@ -794,9 +853,17 @@ def main():
 
     # 保存结果
     summary = {
-        'tokenizer': TOKENIZER_MA60,
+        'tokenizer': tokenizer_path,
+        'model': args.model,
+        'lookback': args.lookback,
+        'norm_mode': args.norm_mode,
         'data_path': DATA_PATHS['train'],
-        'config': TRAINING_PARAMS,
+        'config': {
+            'epochs': args.epochs,
+            'batch_size': args.batch_size,
+            'lr': args.lr,
+            'weight_decay': args.weight_decay,
+        },
         'result': {
             'best_val_loss': result['best_val_loss'],
             'best_combined': result['best_combined'],

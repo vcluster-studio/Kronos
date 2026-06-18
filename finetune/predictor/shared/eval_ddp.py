@@ -15,7 +15,6 @@ import pickle
 import torch
 import torch.distributed as dist
 import numpy as np
-from scipy.stats import spearmanr
 from tqdm import tqdm
 
 script_dir = os.path.dirname(os.path.abspath(__file__))
@@ -23,59 +22,48 @@ project_root = os.path.dirname(os.path.dirname(os.path.dirname(script_dir)))
 sys.path.insert(0, project_root)
 
 from model.kronos import Kronos, KronosTokenizer, auto_regressive_inference
+from scipy.stats import spearmanr
 
 # ============================================================================
 # 配置
 # ============================================================================
 
-TOKENIZER_PATH = 'outputs/tokenizers/ma60_tokenizer_base_v1/checkpoints/best_model'
-DATA_DIR_TEMPLATE = 'finetune/data/ma60_norm/windowed_lb{lookback}_pd10'
+TOKENIZER_PATHS = {
+    'mini': 'outputs/tokenizers/final/2k-MA60',
+    'small': 'outputs/tokenizers/final/base-MA60',
+    'base': 'outputs/tokenizers/final/base-MA60',
+}
+DATA_DIR = 'finetune/data/ma60_norm/block_lb400_pd10'
+FINAL_TEST_DATA = 'finetune/data/ma60_norm/block_lb400_pd10/final_test_data.pkl'
 MODELS_DIR = 'outputs/models'
 
 FEATURE_NAMES = ['open', 'high', 'low', 'close', 'vol', 'amt']
 
 MODEL_CONFIGS = {
+    # ===== 最新训练模型（最终测试集）=====
+    'latest_mini_lb400': {
+        'model_type': 'mini', 'lookback': 400, 'max_context': 2048,
+        'model_path': 'outputs/models/mode_mini_lb400/checkpoints/best_combined_model',
+        'tokenizer': 'outputs/tokenizers/final/2k-MA60',
+        'test_data': FINAL_TEST_DATA,
+    },
+    'latest_mini_lb400_ic': {
+        'model_type': 'mini', 'lookback': 400, 'max_context': 2048,
+        'model_path': 'outputs/models/mode_mini_lb400/checkpoints/best_ic_model',
+        'tokenizer': 'outputs/tokenizers/final/2k-MA60',
+        'test_data': FINAL_TEST_DATA,
+    },
+
     # ===== final/ 最佳模型 =====
     'final_mini': {
         'model_type': 'mini', 'lookback': 400, 'max_context': 2048,
-        'model_path': 'outputs/models/final/mini/best_ic_model',
+        'model_path': 'outputs/models/final/mini',
+        'tokenizer': 'outputs/tokenizers/final/2k-MA60',
     },
     'final_small': {
-        'model_type': 'small', 'lookback': 246, 'max_context': 512,
-        'model_path': 'outputs/models/final/small/best_ic_model',
-    },
-
-    # ===== archived/ 训练方式探索 =====
-    'archived_mini_fw': {
-        'model_type': 'mini', 'lookback': 200, 'max_context': 2048,
-        'norm_mode': 'full_window',
-        'model_path': 'outputs/models/archived/mini_fw_lb200_pd10_ic180/best_ic_model',
-        'tokenizer_path': 'pretrained/Kronos-Tokenizer-2k',
-        'data_path': 'finetune/data/global_norm/full_series/test_data.pkl',
-    },
-    'archived_mini_ma20': {
-        'model_type': 'mini', 'lookback': 400, 'max_context': 2048,
-        'model_path': 'outputs/models/archived/mini_ma20_lb400_pd10_ic153/best_ic_model',
-    },
-
-    # ===== deprecated/ 低IC模型（保留兼容旧名称）=====
-    'mode2_mini_lb400': {
-        'model_type': 'mini', 'lookback': 400, 'max_context': 2048,
-        'model_path': 'outputs/models/deprecated/mini_ma60_lb400_pd10_ic131/checkpoints/best_ic_model',
-    },
-    'mode8_small_lb400': {
         'model_type': 'small', 'lookback': 400, 'max_context': 512,
-        'model_path': 'outputs/models/deprecated/small_ma60_lb400_pd10_ic145/checkpoints/best_ic_model',
-    },
-    'mode9_small_lb60': {
-        'model_type': 'small', 'lookback': 60, 'max_context': 512,
-        'model_path': 'outputs/models/deprecated/small_ma60_lb60_pd10_ic108/checkpoints/best_ic_model',
-    },
-
-    # ===== experiments/ 进行中实验 =====
-    'experiments_base': {
-        'model_type': 'base', 'lookback': 400, 'max_context': 512,
-        'model_path': 'outputs/models/experiments/base_ma60_lb400_ddp/checkpoints/best_ic_model',
+        'model_path': 'outputs/models/final/small',
+        'tokenizer': 'outputs/tokenizers/final/base-MA60',
     },
 }
 
@@ -236,13 +224,17 @@ def evaluate_windows(model, tokenizer, test_data, indices, lookback, predict,
                 actual_traj = actual[:, fi]
 
                 if len(pred_traj) >= 3:
-                    traj_ic = np.corrcoef(pred_traj, actual_traj)[0, 1]
-                    if np.isfinite(traj_ic):
-                        trajectory_ics[fn].append(traj_ic)
+                    # 检查轨迹方差，避免除0警告
+                    pred_std = np.std(pred_traj)
+                    actual_std = np.std(actual_traj)
+                    if pred_std > 1e-8 and actual_std > 1e-8:
+                        traj_ic = np.corrcoef(pred_traj, actual_traj)[0, 1]
+                        if np.isfinite(traj_ic):
+                            trajectory_ics[fn].append(traj_ic)
 
-                    traj_ric, _ = spearmanr(pred_traj, actual_traj)
-                    if np.isfinite(traj_ric):
-                        trajectory_rics[fn].append(traj_ric)
+                        traj_ric, _ = spearmanr(pred_traj, actual_traj)
+                        if np.isfinite(traj_ric):
+                            trajectory_rics[fn].append(traj_ric)
 
             # DA by step
             for step_idx in range(predict):
@@ -336,9 +328,14 @@ def aggregate_results(local_ics, local_rics, local_da, predict, world_size, devi
     return results
 
 
-def evaluate_model_ddp(model_name, checkpoint_type='best_ic_model',
+def evaluate_model_ddp(model_name, checkpoint_type='best_ic_model', n_samples=-1, seed=42,
                        rank=0, local_rank=0, world_size=1, device='cuda'):
-    """多GPU评估单个模型"""
+    """多GPU评估单个模型
+
+    Args:
+        n_samples: 评估样本数，-1为全量
+        seed: 随机种子
+    """
 
     if model_name not in MODEL_CONFIGS:
         if rank == 0:
@@ -351,16 +348,14 @@ def evaluate_model_ddp(model_name, checkpoint_type='best_ic_model',
     norm_mode = cfg.get('norm_mode', 'ma60')
     max_context = cfg.get('max_context', 2048)
 
-    # 数据路径（支持自定义或模板）
-    if 'data_path' in cfg:
-        test_path = os.path.join(project_root, cfg['data_path'])
+    # 数据路径（优先使用配置中的test_data）
+    if 'test_data' in cfg:
+        test_path = os.path.join(project_root, cfg['test_data'])
     else:
-        data_dir = DATA_DIR_TEMPLATE.format(lookback=lookback)
-        test_path = os.path.join(project_root, data_dir, 'test_data.pkl')
+        test_path = os.path.join(project_root, DATA_DIR, 'test_data.pkl')
 
-    # 模型路径（支持自定义或模板）
+    # 模型路径
     if 'model_path' in cfg:
-        # 如果自定义路径已包含 checkpoint 目录（含 config.json），直接使用
         full_model_path = os.path.join(project_root, cfg['model_path'])
         if os.path.isdir(full_model_path) and os.path.exists(os.path.join(full_model_path, 'config.json')):
             model_path = full_model_path
@@ -369,11 +364,10 @@ def evaluate_model_ddp(model_name, checkpoint_type='best_ic_model',
     else:
         model_path = os.path.join(project_root, MODELS_DIR, model_name, 'checkpoints', checkpoint_type)
 
-    # Tokenizer路径（支持自定义或默认MA60）
-    if 'tokenizer_path' in cfg:
-        tokenizer_path = os.path.join(project_root, cfg['tokenizer_path'])
-    else:
-        tokenizer_path = os.path.join(project_root, TOKENIZER_PATH)
+    # Tokenizer路径（按模型类型选择）
+    model_type = cfg.get('model_type', 'mini')
+    tokenizer_key = cfg.get('tokenizer', TOKENIZER_PATHS.get(model_type, TOKENIZER_PATHS['mini']))
+    tokenizer_path = os.path.join(project_root, tokenizer_key)
 
     if rank == 0:
         print(f"\n{'='*80}")
@@ -383,6 +377,8 @@ def evaluate_model_ddp(model_name, checkpoint_type='best_ic_model',
         print(f"Model: {model_path}")
         print(f"Data: {test_path}")
         print(f"Tokenizer: {tokenizer_path}")
+        if n_samples > 0:
+            print(f"Samples: {n_samples} (per GPU: {n_samples // world_size})")
         print(f"{'='*80}")
 
     # 加载tokenizer
@@ -408,6 +404,28 @@ def evaluate_model_ddp(model_name, checkpoint_type='best_ic_model',
 
     if rank == 0:
         print(f"Total test windows: {len(all_indices)}")
+
+    # 采样限制
+    if n_samples > 0 and n_samples < len(all_indices):
+        # 随机采样（rank 0采样后广播给所有rank）
+        if rank == 0:
+            rng = np.random.RandomState(seed)
+            sampled_indices = rng.choice(len(all_indices), size=n_samples, replace=False)
+            sampled_indices = [all_indices[i] for i in sampled_indices]
+            sampled_indices_tensor = torch.tensor([len(sampled_indices)], device=device)
+        else:
+            sampled_indices_tensor = torch.tensor([0], device=device)
+
+        if world_size > 1:
+            dist.broadcast(sampled_indices_tensor, src=0)
+
+        # 每个rank需要知道采样数量，然后本地重新生成相同的采样（用相同seed）
+        rng = np.random.RandomState(seed)
+        sampled_idx_positions = rng.choice(len(all_indices), size=n_samples, replace=False)
+        all_indices = [all_indices[i] for i in sampled_idx_positions]
+
+        if rank == 0:
+            print(f"Sampled windows: {len(all_indices)}")
 
     # 分片：每个rank处理一部分
     per_rank = len(all_indices) // world_size
@@ -471,14 +489,42 @@ def print_full_result(result, predict=10, title="Evaluation Results"):
 
 def main():
     parser = argparse.ArgumentParser(description='Multi-GPU evaluation on test set')
+    # 预定义模式
     parser.add_argument('--models', type=str, nargs='+',
-                        default=['mode2_mini_lb400'],
-                        help='Models to evaluate')
-    parser.add_argument('--checkpoint', type=str, default='best_ic_model',
-                        help='Checkpoint type')
+                        default=['latest_mini_lb400'],
+                        help='Predefined models to evaluate')
+    # 参数化路径
+    parser.add_argument('--model-path', type=str, default=None,
+                        help='Direct model checkpoint path')
+    parser.add_argument('--model-type', type=str, default='mini', choices=['mini', 'small', 'base'],
+                        help='Model type')
+    parser.add_argument('--tokenizer-path', type=str, default=None,
+                        help='Direct tokenizer path')
+    parser.add_argument('--test-data', type=str, default=None,
+                        help='Direct test data path')
+    parser.add_argument('--n-samples', type=int, default=-1,
+                        help='Number of samples to evaluate (-1 for full test set)')
+    parser.add_argument('--checkpoint', type=str, default='best_combined_model',
+                        help='Checkpoint type for predefined models')
     parser.add_argument('--output', type=str, default=None,
                         help='Output JSON file')
+    parser.add_argument('--seed', type=int, default=42)
     args = parser.parse_args()
+
+    # 如果指定了直接路径，添加临时配置
+    if args.model_path:
+        custom_config = {
+            'model_type': args.model_type,
+            'lookback': 400,
+            'max_context': 2048 if args.model_type == 'mini' else 512,
+            'model_path': args.model_path,
+            'tokenizer': args.tokenizer_path or (f'outputs/tokenizers/final/2k-MA60' if args.model_type == 'mini' else 'outputs/tokenizers/final/base-MA60'),
+            'test_data': args.test_data or FINAL_TEST_DATA,
+        }
+        MODEL_CONFIGS['custom'] = custom_config
+        models_to_eval = ['custom']
+    else:
+        models_to_eval = args.models
 
     # DDP setup
     rank, local_rank, world_size, use_ddp = setup_ddp()
@@ -489,10 +535,12 @@ def main():
 
     results = {}
 
-    for model_name in args.models:
+    for model_name in models_to_eval:
         result = evaluate_model_ddp(
             model_name,
             checkpoint_type=args.checkpoint,
+            n_samples=args.n_samples,
+            seed=args.seed,
             rank=rank,
             local_rank=local_rank,
             world_size=world_size,
