@@ -152,6 +152,9 @@ def evaluate(
     ic_lists = {f: [] for f in FEATURE_NAMES}
     da_by_step = [{f: [] for f in FEATURE_NAMES} for _ in range(config.predict)]
 
+    # 收集 actual_dir 统计（用于计算 naive DA）
+    actual_dir_by_step = [[] for _ in range(config.predict)]  # 仅 close
+
     amplitude_rates = []
     limit_results = {'pred_limit': [], 'actual_limit': []}
 
@@ -238,6 +241,10 @@ def evaluate(
                     actual_dir = (actual[step_idx, fi] - baseline[fi]) > 0
                     da_by_step[step_idx][fn].append(pred_dir == actual_dir)
 
+                    # 收集 close 的 actual_dir（用于 naive DA）
+                    if fn == 'close':
+                        actual_dir_by_step[step_idx].append(actual_dir)
+
             # 振幅误差率
             pred_amp = pred_raw[0, 1] - pred_raw[0, 2]  # high - low
             actual_amp = actual[0, 1] - actual[0, 2]
@@ -257,29 +264,45 @@ def evaluate(
     for fn in FEATURE_NAMES:
         ics = ic_lists[fn]
         if ics:
+            ics_arr = np.array(ics)
+            n = len(ics)
             ic_result[fn] = {
-                'mean': float(np.mean(ics)),
-                'std': float(np.std(ics)),
-                'p50': float(np.percentile(ics, 50)),
-                'n': len(ics),
+                'mean': float(np.mean(ics_arr)),
+                'std': float(np.std(ics_arr)) if n >= 2 else 0.0,
+                'p25': float(np.percentile(ics_arr, 25)) if n >= 4 else None,
+                'p50': float(np.percentile(ics_arr, 50)),
+                'p75': float(np.percentile(ics_arr, 75)) if n >= 4 else None,
+                'n': n,
             }
         else:
-            ic_result[fn] = {'mean': 0.0, 'std': 0.0, 'p50': None, 'n': 0}
+            ic_result[fn] = {'mean': 0.0, 'std': 0.0, 'p25': None, 'p50': None, 'p75': None, 'n': 0}
 
     da_result = {}
+    naive_da_by_step = {}  # {step_idx: naive_da}
     for step_idx in range(config.predict):
         step_result = {}
         for fn in FEATURE_NAMES:
             da_list = da_by_step[step_idx][fn]
             if da_list:
+                da_arr = np.array(da_list)
+                n = len(da_list)
                 step_result[fn] = {
-                    'mean': float(np.mean(da_list)),
-                    'std': float(np.std(da_list)),
-                    'n': len(da_list),
+                    'mean': float(np.mean(da_arr)),
+                    'std': float(np.std(da_arr)) if n >= 2 else 0.0,
+                    'p50': float(np.percentile(da_arr, 50)),
+                    'n': n,
                 }
             else:
-                step_result[fn] = {'mean': 0.0, 'std': 0.0, 'n': 0}
+                step_result[fn] = {'mean': 0.0, 'std': 0.0, 'p50': None, 'n': 0}
         da_result[f'step{step_idx + 1}'] = step_result
+
+        # 计算 naive DA（多数方向比例）
+        actual_dirs = actual_dir_by_step[step_idx]
+        if actual_dirs:
+            up_ratio = np.mean(actual_dirs)
+            naive_da_by_step[step_idx] = float(max(up_ratio, 1 - up_ratio))
+        else:
+            naive_da_by_step[step_idx] = 0.5
 
     # 振幅统计
     amplitude_result = {
@@ -295,7 +318,7 @@ def evaluate(
         np.array(limit_results['actual_limit'])
     )
 
-    return ic_result, da_result, amplitude_result, limit_result
+    return ic_result, da_result, amplitude_result, limit_result, naive_da_by_step
 
 
 # ============================================================================
@@ -361,7 +384,7 @@ def main():
             config.norm_mode, model_type, device, args.checkpoint
         )
 
-        ic_result, da_result, amplitude_result, limit_result = evaluate(
+        ic_result, da_result, amplitude_result, limit_result, naive_da_by_step = evaluate(
             model, tokenizer, test_data, config, device,
             n_samples=args.n_samples,
             seed=args.seed,
@@ -371,6 +394,7 @@ def main():
         # 输出报告
         report = format_metrics_report(
             ic_result, da_result, amplitude_result, limit_result,
+            naive_da_by_step=naive_da_by_step,
             predict=config.predict
         )
         print(report)

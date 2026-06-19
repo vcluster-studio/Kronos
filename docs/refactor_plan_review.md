@@ -742,3 +742,115 @@ E1 修正为去趋势口径后，IC 量级下降（虚高成分消失）、波�
 
 **结论**：v6 的无条件批准维持。A1 已从"执行时注意项"升级为方案显式任务（§1.6.7 等），不再是两不管缝隙。本节为最终增量审核，无新增阻断问题。
 
+---
+
+## 十九、代码预审（v8，代码初步完成后）
+
+**预审日期**: 2026-06-19
+**预审对象**: 已落盘的新代码 `finetune/predictor/core/` + 入口脚本（train/eval/backtest/preprocess.py）
+**预审性质**: 代码仍在修补细节，本节为预审快照，核实方案硬约束的实际落实情况，不替代正式验收。
+
+### 19.1 已落盘代码盘点
+
+| 模块 | 文件 | 状态 |
+|------|------|------|
+| core/ | config.py, paths.py, schema.py, normalization.py, splitting.py, dataset.py, metrics.py, utils.py, test_metrics.py | ✅ 齐全 |
+| 入口 | train.py, eval.py, backtest.py, preprocess.py | ✅ 齐全 |
+| tokenizer 训练入口 | `finetune/tokenizer/train.py` | ❌ 不存在 |
+| preprocess 子目录 | `finetune/preprocess/` | ❌ 不存在（仅有 predictor/preprocess.py 单文件） |
+
+### 19.2 硬约束落实核实
+
+| 硬约束 | 核实结果 | 证据 |
+|--------|----------|------|
+| train/eval 共用 core/metrics | ✅ | train.py:55-69、eval.py:48-63、backtest.py:37-45 均 import core.metrics |
+| 禁直接 np.corrcoef/spearmanr | ✅ | 三入口均无直接调用 |
+| traj IC 用去趋势序列 | ✅ | train.py:307-311、eval.py:227-230 均 `detrend_to_baseline` 后再 `safe_trajectory_ic` |
+| backtest IC 不混算 | ✅ | backtest.py:200-211 逐股票算再聚合 |
+| checkpoint 用去趋势 IC | ✅ | train.py:531 `ic_smoothed > best_ic`，ic 来自去趋势口径 |
+| R1 区间语义 no-leakage | ✅ | splitting.py 扫描线区间相交检查（行279） |
+| R2 create_target_blocks 按时间轴 | ✅ | splitting.py:114,126 按 target_start 排序切块 + min 防超界 |
+| R7 min_periods=1 | ✅ | normalization.py:75 默认 1，注释对齐 dataset.py:185 |
+| R11 validate 调用 | ✅ | config.py:41 `__post_init__` 调 validate() |
+| S2 ArtifactConfig.model_type | ✅ | config.py:133 |
+| min_samples 无 +1 | ✅ | config.py:40 |
+| LR=0.01 | ✅ | config.py:84 |
+
+**架构与度量口径主体已落实**，与方案 §1.6 高度一致。以下为预审发现的具体问题。
+
+### 19.3 预审发现的问题
+
+#### P1. 🔴 `compute_naive_da` 硬编码返回 0.5，E2 excess DA 失去意义
+
+**位置**: `core/metrics.py:204-240`、`format_metrics_report:669`
+
+`compute_naive_da` 的 docstring 写了一大段纠结（"持平预测认为不变""threshold 很难定"），最终：
+```python
+# 简化定义：naive DA = 50%（随机二分类的期望）
+return 0.5
+```
+`format_metrics_report:669` 也写死 `naive_da = 0.5`。
+
+**问题**：E2 的设计意图是「model DA − naive DA 让数字可解读」，naive baseline 应是**持平预测（persistence: pred == baseline）在实际数据上的 DA**，即实际方向中「与 baseline 同向」的比例。这可从 actual 序列直接统计，不需要 threshold。硬编码 0.5 使 `excess_da = model_da - 0.5` 退化为 DA 的平移，既不是"持平朴素预测"对照，也无法判断 model DA 是否真优于朴素预测——A 股多数日子涨，naive DA（看多）本就 >50%，用 0.5 会高估 excess。
+
+**要求**：实现真实的 naive DA——对每个样本，naive 预测 = baseline 持平，naive DA = (actual_dir == 持平方向) 的比例。或明确声明 naive = persistence 并实现 persistence 预测的 DA。禁止用 0.5 占位。
+
+#### P2. 🔴 tokenizer 训练入口缺失（R3 未落地）
+
+**位置**: `finetune/tokenizer/train.py` 不存在
+
+方案 §1.5 定义了 `train_tokenizer` 函数 + CLI，Phase 2 第 5 条要求新增该入口。实际未建。后果：`outputs/tokenizers/{norm_mode}/{model_type}` 路径键控设计无产生流程，`validate_tokenizer_consistency`（§1.5）无对象可校验。预测器训练时 `resolve_tokenizer_path` 会指向不存在的 tokenizer。
+
+**要求**：补 `finetune/tokenizer/train.py`，或若暂时复用现有 `finetune/train_tokenizer.py`，需在方案中说明迁移路径与 per-norm_mode 适配。
+
+#### P3. 🟡 eval.py IC 聚合未走 `aggregate_ic`，DDP 场景丢分布
+
+**位置**: `eval.py:256-265`
+
+eval.py 单卡 IC 聚合用本地 `np.mean/np.std/p50`，未调用 `core/metrics.py:aggregate_ic`（该函数含 all_gather 分布聚合）。后果：
+- 若 eval.py 支持 DDP（方案 §6.2 宣称支持 `torchrun`），多卡时各 rank 只算本地，未 all_gather 完整列表 → 分布统计错误。
+- eval.py 未报 p25/p75（只 mean/std/p50），低于 §1.6.3 要求。
+
+**要求**：确认 eval.py 是否 DDP；若是，改用 `aggregate_ic`；补 p25/p75。
+
+#### P4. 🟡 train.py 未输出 excess DA（仅 import 未调用）
+
+**位置**: train.py:61 import `excess_da` 但训练循环未调用
+
+训练监控只报 DA_score，看不到 excess DA。E2 的可解读性在训练阶段缺失。
+
+**要求**：训练日志补 excess DA（需先修 P1 的 naive_da）。
+
+#### P5. 🟡 Phase -1 待办项在代码中"占位未定稿"
+
+**位置**: config.py:86,96,101-102
+
+- `early_stopping_patience=12`（注释"需重新确认"，未确认）
+- `ic_patience_reset=True`（v7 §1.6.7 要求 Phase -1 定稿保留/移除，代码默认 True 但无审视记录）
+- `combined_ic_weight=0.6/da_weight=0.4`（注释"需重新标定"，未标定）
+
+这些是 Phase -1 度量口径定稿的产物，代码先占了默认值。**可接受**（代码先行），但 Phase -1 必须用去趋势口径实际跑 IC 曲线后确认这些值，否则 v7 §1.6.7 的审视要求未真正完成。
+
+**要求**：Phase -1 执行时记录这些参数的最终值与依据，写入 summary.json。
+
+#### P6. ⚪ BacktestSchema / amplitude 用 pred_raw[0] 单根
+
+**位置**: eval.py:242-243 `pred_amp = pred_raw[0,1] - pred_raw[0,2]`
+
+振幅误差率只用 predict 段第 1 根的 high-low，未用整段。振幅是"日内"概念，单根合理，但 §1.6.5 描述为"预测振幅÷实际振幅"未明确单根 vs 整段。非缺陷，建议在文档或注释明确口径。
+
+### 19.4 预审结论
+
+| 类别 | 状态 |
+|------|------|
+| 架构落实（R1/R2/R7/R11/S2/B4） | ✅ 全部落地 |
+| 度量口径主体（E1/E8/可懂指标） | ✅ 落地 |
+| E2 excess DA | 🔴 naive_da 占位 0.5，需实修 |
+| R3 tokenizer 入口 | 🔴 缺失 |
+| E4 聚合分布 | 🟡 eval.py 未用 aggregate_ic |
+| Phase -1 定稿项 | 🟡 代码占位，待实际确认 |
+
+**预审判断**：代码主体质量良好，方案硬约束大部分已真正落实（非文档空话）。**阻断正式验收的硬伤是 P1（naive_da 占位）与 P2（tokenizer 入口缺失）**；P3/P4 影响度量完整性；P5 是 Phase -1 待办。代码修补细节时应优先处理 P1/P2。
+
+**不改变 v7 的执行批准**：方案层面已批准，本节为代码预审，问题在实现层，需在代码修补阶段解决 P1/P2 后再做正式验收。
+

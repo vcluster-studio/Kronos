@@ -203,41 +203,38 @@ def excess_da(model_da: float, naive_da: float) -> float:
 
 def compute_naive_da(actual_values: np.ndarray, baseline: np.ndarray) -> float:
     """
-    计算 naive DA（持平预测的 DA）
+    计算 naive DA（多数方向预测的 DA）
+
+    naive baseline 策略：预测多数方向（假设市场延续多数趋势）。
+    naive DA = max(上涨比例, 下跌比例)
+
+    例如：
+    - 实际上涨 60% → naive DA = 60%（预测全部涨）
+    - 实际上涨 50% → naive DA = 50%（涨跌对半）
+    - 实际上涨 30% → naive DA = 70%（预测全部跌）
+
+    模型 DA 超过 naive DA 才有意义（excess > 0 = 真 alpha）。
 
     Args:
-        actual_values: 实际值序列 (pred_len, n_features) 或 (pred_len,)
+        actual_values: 实际值序列 (pred_len,) 或 (pred_len, n_features)
         baseline: lookback 末根值，标量或 (n_features,)
 
     Returns:
-        持平预测的 DA = 实际方向中与 baseline 同向的比例
+        naive DA = 多数方向的比例
     """
     actual_values = np.asarray(actual_values)
     baseline = np.asarray(baseline)
 
-    # 方向：实际值 > baseline 为正向
+    # 方向：actual > baseline 为上涨
     actual_dir = actual_values > baseline
-    # 持平预测的方向：永远认为「不变」，即与 baseline 比较
-    # 持平预测的 DA = actual 与 baseline 同向的比例
-    # 即：actual > baseline 且持平预测说「不变」（baseline 方向）
-    # 这里简化：naive DA = 实际涨的比例（若 baseline 为起点）
 
-    # 更准确：持平预测认为「不变」，即预测方向永远为 0（不涨不跌）
-    # 所以 naive DA = actual 不变（与 baseline 相同）的比例
-    # 但实际几乎不会精确不变，所以 naive DA ≈ 0
+    # 上涨比例（True 的比例）
+    up_ratio = np.mean(actual_dir)
 
-    # 标准定义：naive baseline 是「持平预测」
-    # 持平预测永远预测「不涨不跌」
-    # DA 衡量「方向对错」，持平预测对「不变」样本正确，对「涨/跌」样本错误
-    # naive DA = 实际不变的比例
+    # naive DA = 多数方向的比例
+    naive_da = max(up_ratio, 1 - up_ratio)
 
-    # 实际操作：计算 actual 与 baseline 的差异比例
-    # naive_da ≈ (abs(actual - baseline) < threshold).mean()
-    # 但 threshold 很难定
-
-    # 简化定义：naive DA = 50%（随机二分类的期望）
-    # 这是最通用的 baseline
-    return 0.5
+    return float(naive_da)
 
 
 # ============================================================================
@@ -644,6 +641,7 @@ def format_metrics_report(
     da_result: Dict[str, Dict[str, float]],
     amplitude_result: Dict[str, float] = None,
     limit_result: Dict[str, float] = None,
+    naive_da_by_step: Dict[int, float] = None,
     predict: int = 10
 ) -> str:
     """
@@ -660,6 +658,7 @@ def format_metrics_report(
         da_result: {step: {feature: {mean, std, p50, n}}}
         amplitude_result: {mean_rate, std_rate, perfect_pct, usable_pct}
         limit_result: {hit_rate, n_pred_limit, n_actual_limit}
+        naive_da_by_step: {step_idx: naive_da} 各步的 naive DA（多数方向比例）
         predict: 预测步数
 
     Returns:
@@ -672,20 +671,20 @@ def format_metrics_report(
 
     # 1. 可懂指标：方向胜率（close）
     lines.append("\n[Direction Accuracy - close]")
-    lines.append(f"{'Step':<6} {'DA':>8} {'std':>8} {'p50':>8} {'excess':>8}")
-
-    # 计算 naive DA（简化为 50%）
-    naive_da = 0.5
+    lines.append(f"{'Step':<6} {'DA':>8} {'std':>8} {'p50':>8} {'naive':>8} {'excess':>8}")
 
     for step_idx in range(predict):
         step_key = f'step{step_idx + 1}'
+        # 获取该步的 naive DA（如果提供）
+        naive_da = naive_da_by_step.get(step_idx, 0.5) if naive_da_by_step else 0.5
+
         if step_key in da_result and 'close' in da_result[step_key]:
             da_info = da_result[step_key]['close']
             da_mean = da_info.get('mean', 0)
             da_std = da_info.get('std', 0)
             da_p50 = da_info.get('p50', da_mean)
             excess = excess_da(da_mean, naive_da)
-            lines.append(f"+{step_idx+1:<5} {da_mean:>8.1%} {da_std:>8.1%} {da_p50:>8.1%} {excess:>8.1%}")
+            lines.append(f"+{step_idx+1:<5} {da_mean:>8.1%} {da_std:>8.1%} {da_p50:>8.1%} {naive_da:>8.1%} {excess:>8.1%}")
 
     # 2. 可懂指标：振幅误差率
     if amplitude_result:

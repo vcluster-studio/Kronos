@@ -165,6 +165,8 @@ def update_training_info(info_path: str, epoch: int, metrics: dict, is_best: boo
         'train_loss': metrics.get('train_loss', 0),
         'val_loss': metrics.get('val_loss', 0),
         'ic': metrics.get('ic', 0),
+        'da_score': metrics.get('da_score', 0),
+        'excess_da': metrics.get('excess_da', 0),
         'combined': metrics.get('combined', 0),
         'lr': metrics.get('lr', 0),
         'time': datetime.now().isoformat(),
@@ -230,6 +232,9 @@ def evaluate_trajectory_ic(
     local_ics = {f: [] for f in FEATURE_NAMES}
     local_rics = {f: [] for f in FEATURE_NAMES}
     local_da = [{f: [] for f in FEATURE_NAMES} for _ in range(config.predict)]
+
+    # 收集 actual_dir 统计（用于计算 naive DA）
+    local_actual_dir = [[] for _ in range(config.predict)]  # 仅 close
 
     for (symbol, window_start) in local_indices:
         d = val_data[symbol]
@@ -322,6 +327,10 @@ def evaluate_trajectory_ic(
                     actual_dir = (actual[step_idx, fi] - baseline[fi]) > 0
                     local_da[step_idx][fn].append(pred_dir == actual_dir)
 
+                    # 收集 close 的 actual_dir（用于 naive DA）
+                    if fn == 'close':
+                        local_actual_dir[step_idx].append(actual_dir)
+
         except Exception as e:
             continue
 
@@ -329,6 +338,33 @@ def evaluate_trajectory_ic(
     if world_size > 1:
         ic_result = aggregate_ic(local_ics, world_size, device, rank == 0)
         da_result = aggregate_da(local_da, world_size, device, config.predict, rank == 0)
+
+        # 聚合 actual_dir 统计计算 naive DA
+        naive_da_by_step = {}
+        if rank == 0:
+            # 收集各 rank 的 up_ratio
+            for step_idx in range(config.predict):
+                local_up_count = sum(local_actual_dir[step_idx])
+                local_n = len(local_actual_dir[step_idx])
+
+                # all_gather 统计
+                up_count_tensor = torch.tensor([local_up_count], device=device)
+                n_tensor = torch.tensor([local_n], device=device)
+
+                gathered_up = [torch.zeros_like(up_count_tensor) for _ in range(world_size)]
+                gathered_n = [torch.zeros_like(n_tensor) for _ in range(world_size)]
+
+                dist.all_gather(gathered_up, up_count_tensor)
+                dist.all_gather(gathered_n, n_tensor)
+
+                total_up = sum(t.item() for t in gathered_up)
+                total_n = sum(t.item() for t in gathered_n)
+
+                if total_n > 0:
+                    up_ratio = total_up / total_n
+                    naive_da_by_step[step_idx] = float(max(up_ratio, 1 - up_ratio))
+                else:
+                    naive_da_by_step[step_idx] = 0.5
     else:
         # 单卡直接聚合
         ic_result = {}
@@ -359,7 +395,17 @@ def evaluate_trajectory_ic(
                     step_result[fn] = {'mean': 0.0, 'std': 0.0, 'n': 0}
             da_result[f'step{step_idx + 1}'] = step_result
 
-    return ic_result, da_result
+        # 计算 naive DA（多数方向比例）
+        naive_da_by_step = {}
+        for step_idx in range(config.predict):
+            actual_dirs = local_actual_dir[step_idx]
+            if actual_dirs:
+                up_ratio = np.mean(actual_dirs)
+                naive_da_by_step[step_idx] = float(max(up_ratio, 1 - up_ratio))
+            else:
+                naive_da_by_step[step_idx] = 0.5
+
+    return ic_result, da_result, naive_da_by_step
 
 
 # ============================================================================
@@ -417,6 +463,8 @@ def train(
         'train_loss': [],
         'val_loss': [],
         'ic': [],
+        'da_score': [],
+        'excess_da': [],
         'combined': [],
         'lr': [],
     }
@@ -475,7 +523,7 @@ def train(
         history['lr'].append(current_lr)
 
         # Trajectory IC 评估
-        ic_result, da_result = evaluate_trajectory_ic(
+        ic_result, da_result, naive_da_by_step = evaluate_trajectory_ic(
             model, tokenizer, val_data, val_indices, config,
             device, world_size, rank,
             n_samples=-1,  # 全量评估
@@ -485,18 +533,28 @@ def train(
         if is_main:
             current_ic = ic_result.get('close', {}).get('mean', 0)
 
-            # 计算 DA_score
+            # 计算 DA_score 和 excess_da
             da_by_step = [{f: [da_result[f'step{s+1}'].get(f, {}).get('mean', 0)] for f in FEATURE_NAMES} for s in range(config.predict)]
             da_score = calculate_da_score(da_by_step, config.predict)
+
+            # 计算 excess DA（平均 excess）
+            excess_da_avg = 0.0
+            for step_idx in range(config.predict):
+                da_mean = da_result.get(f'step{step_idx + 1}', {}).get('close', {}).get('mean', 0)
+                naive_da = naive_da_by_step.get(step_idx, 0.5)
+                excess_da_avg += (da_mean - naive_da)
+            excess_da_avg /= config.predict
 
             # Combined score（权重 0.6/0.4）
             current_combined = calculate_combined_score(current_ic, da_score)
 
             history['ic'].append(current_ic)
+            history['da_score'].append(da_score)
+            history['excess_da'].append(excess_da_avg)
             history['combined'].append(current_combined)
 
             print(f"\n  Trajectory IC (close, detrended): {current_ic:.4f}")
-            print(f"  DA_score: {da_score:.4f}, Combined: {current_combined:.4f}")
+            print(f"  DA_score: {da_score:.4f}, Excess DA: {excess_da_avg:+.1%}, Combined: {current_combined:.4f}")
 
             # IC 滑动均值
             ic_window = 3
@@ -565,6 +623,8 @@ def train(
                     'train_loss': avg_train_loss,
                     'val_loss': avg_val_loss,
                     'ic': current_ic,
+                    'da_score': da_score,
+                    'excess_da': excess_da_avg,
                     'combined': current_combined,
                     'lr': current_lr,
                 })
