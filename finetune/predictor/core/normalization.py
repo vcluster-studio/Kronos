@@ -123,14 +123,14 @@ class SlidingMANormalizer:
                 rolling_mean[:self.min_periods-1] = expanding_mean
                 rolling_std[:self.min_periods-1] = expanding_std
 
-            # 填充 std=0 的点（使用 expanding std 或设为 1）
-            zero_std_mask = rolling_std < 1e-8
+            # 填充 std=0 或 NaN 的点（min_periods=1 时首个点 rolling std 为 NaN）
+            zero_std_mask = ~np.isfinite(rolling_std) | (rolling_std < 1e-8)
             if zero_std_mask.any():
                 # 使用 expanding std 填充
                 expanding_std_full = s.expanding(min_periods=1).std().values
                 rolling_std[zero_std_mask] = expanding_std_full[zero_std_mask]
-                # 如果仍为 0（单点），设为 1（保持原值）
-                rolling_std[rolling_std < 1e-8] = 1.0
+                # 如果仍为 0 或 NaN（单点），设为 1（保持原值）
+                rolling_std[~np.isfinite(rolling_std) | (rolling_std < 1e-8)] = 1.0
 
             means[:, fi] = rolling_mean
             stds[:, fi] = rolling_std + 1e-5

@@ -24,6 +24,7 @@ import argparse
 import pickle
 import numpy as np
 import pandas as pd
+from collections import defaultdict
 from datetime import datetime
 from typing import Dict, List, Any, Tuple
 from tqdm import tqdm
@@ -274,58 +275,121 @@ def create_backtest_samples(
     return samples
 
 
-def save_backtest_samples(samples: Dict[str, Any], output_path: str):
-    """保存 backtest 样本"""
-    ensure_dir(output_path)
-    with open(output_path, 'wb') as f:
+def save_backtest_samples(
+    samples: Dict[str, Any],
+    samples_path: str,
+    config: DataConfig,
+    backtest_raw_path: str
+):
+    """
+    保存 backtest 样本与元数据
+
+    输出：
+      - samples.pkl：backtest 样本
+      - meta.pkl：backtest 元数据（样本数、context/target 来源、时间区间、fingerprint）
+    """
+    ensure_dir(samples_path)
+    with open(samples_path, 'wb') as f:
         pickle.dump(samples, f)
-    print(f"Saved {len(samples)} backtest samples to {output_path}")
+    print(f"Saved {len(samples)} backtest samples to {samples_path}")
+
+    # 统计 target 时间区间（所有样本的 target 段索引范围）
+    target_start_dates = []
+    target_end_dates = []
+    for s in samples.values():
+        lb = s['lookback']
+        pd_ = s['predict']
+        idx = s['index']
+        target_start_dates.append(idx[-pd_])
+        target_end_dates.append(idx[-1])
+
+    meta_path = get_meta_path(
+        config.norm_mode, config.lookback, config.predict, role='backtest'
+    )
+    ensure_dir(meta_path)
+    safe_save_json({
+        'norm_mode': config.norm_mode,
+        'lookback': config.lookback,
+        'predict': config.predict,
+        'role': 'backtest',
+        'n_samples': len(samples),
+        'context_source': 'kline_daily_raw.pkl (末尾 lookback+required_history 根)',
+        'target_source': os.path.basename(backtest_raw_path),
+        'target_start': str(min(target_start_dates)) if target_start_dates else None,
+        'target_end': str(max(target_end_dates)) if target_end_dates else None,
+        'backtest_raw_fingerprint': compute_fingerprint(backtest_raw_path),
+        'created_at': datetime.now().isoformat(),
+    }, meta_path)
+    print(f"Saved backtest meta to {meta_path}")
 
 
 def save_split_data(
     split_samples: List[SampleSchema],
     output_path: str,
-    config: DataConfig
+    config: DataConfig,
+    raw_data: Dict[str, Any]
 ):
     """
-    保存分割数据
+    保存分割数据（可直接使用的归一化数据）
+
+    存储格式（与旧 ma60_norm pkl 一致，dataset 拿来即用）：
+        {symbol: {
+            'normalized': (T, 6),   # 整条序列归一化
+            'means': (T, 6),
+            'stds': (T, 6),
+            'original': (T, 6),     # 原始数据
+            'index': (T,),          # 时间戳
+            'windows': (N,),        # 该 split 的窗口起点索引
+        }}
+
+    每只股票存一条完整归一化序列，windows 标记该 split 实际用到的窗口起点。
+    dataset 按 windows 起点从 normalized 切片。
 
     Args:
         split_samples: 分割后的样本列表
         output_path: 输出路径
         config: DataConfig
+        raw_data: 原始数据（用于按股票归一化整条序列）
     """
-    # 转换为存储格式（按 symbol 组织）
-    data_by_symbol = {}
-
+    # 按股票收集窗口起点
+    windows_by_symbol = defaultdict(list)
     for sample in split_samples:
-        if sample.symbol not in data_by_symbol:
-            data_by_symbol[sample.symbol] = {
-                'samples': [],
-                'windows': [],
-            }
+        windows_by_symbol[sample.symbol].append(sample.window_start)
 
-        data_by_symbol[sample.symbol]['samples'].append(sample_to_dict(sample))
-        data_by_symbol[sample.symbol]['windows'].append(sample.window_start)
+    normalizer = NormalizerFactory.create(config.norm_mode, clip=config.clip)
 
-    # 存储格式：保留原始数据 + 窗口索引
-    # 注意：这里只存储索引，原始数据仍在 raw 文件中
-    # 实际加载时需要从 raw 读取数据并按索引切片
+    data_by_symbol = {}
+    for symbol, windows in windows_by_symbol.items():
+        raw = raw_data.get(symbol)
+        if raw is None:
+            continue
 
-    ensure_dir(output_path)
+        # 取整条原始序列
+        if hasattr(raw, 'columns'):
+            values = raw.values.astype(np.float32)
+            index = raw.index
+        else:
+            values = np.asarray(raw['values'], dtype=np.float32)
+            index = raw['index']
 
-    # 存储为窗口索引格式（轻量）
-    window_indices = {}
-    for symbol, d in data_by_symbol.items():
-        window_indices[symbol] = {
-            'windows': d['windows'],
-            'split': split_samples[0].split if split_samples else 'unknown',
+        # 归一化整条序列（sliding_ma 依赖前缀历史，整条归一化保证边界一致）
+        normalized, means, stds = normalizer.normalize(values)
+
+        data_by_symbol[symbol] = {
+            'normalized': normalized.astype(np.float32),
+            'means': means.astype(np.float32),
+            'stds': stds.astype(np.float32),
+            'original': values,
+            'index': index,
+            'windows': np.array(sorted(set(windows)), dtype=np.int64),
         }
 
+    ensure_dir(output_path)
     with open(output_path, 'wb') as f:
-        pickle.dump(window_indices, f)
+        pickle.dump(data_by_symbol, f)
 
-    print(f"Saved {len(split_samples)} samples to {output_path}")
+    n_samples = sum(len(d['windows']) for d in data_by_symbol.values())
+    print(f"Saved {n_samples} samples ({len(data_by_symbol)} symbols) to {output_path}")
 
 
 def save_meta(
@@ -438,7 +502,7 @@ def preprocess(
             config.split_mode,
             split_name
         )
-        save_split_data(split_samples, output_path, config)
+        save_split_data(split_samples, output_path, config, raw_data)
 
     # 6. 保存元数据
     save_meta(config, train, val, test, raw_path, leakage_passed)
@@ -462,7 +526,7 @@ def preprocess(
             bt_output_path = get_backtest_data_path(
                 config.norm_mode, config.lookback, config.predict
             )
-            save_backtest_samples(bt_samples, bt_output_path)
+            save_backtest_samples(bt_samples, bt_output_path, config, backtest_raw_path)
         else:
             print(f"\n[Backtest] 跳过：{backtest_raw_path} 不存在")
 
