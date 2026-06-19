@@ -283,21 +283,27 @@ def aggregate_ic(
             lengths = [t.item() for t in gathered_n]
             total_n = sum(lengths)
 
-            # 准备发送缓冲区（padding 到最大长度）
+            # 空 rank 边界：所有 rank 的 local_list 全空时 max_len=0，
+            # all_gather 空 tensor 在个别 NCCL 版本会异常，跳过。
+            # 该判断不依赖 rank（lengths 各 rank 一致），所有 rank 同步进入。
             max_len = max(lengths) if lengths else 0
-            send_buffer = torch.zeros(max_len, device=device)
-            for i, val in enumerate(local_list):
-                send_buffer[i] = val
+            if max_len == 0:
+                full_list = []
+            else:
+                # 准备发送缓冲区（padding 到最大长度）
+                send_buffer = torch.zeros(max_len, device=device)
+                for i, val in enumerate(local_list):
+                    send_buffer[i] = val
 
-            # all_gather
-            gathered_buffers = [torch.zeros(max_len, device=device) for _ in range(world_size)]
-            dist.all_gather(gathered_buffers, send_buffer)
+                # all_gather
+                gathered_buffers = [torch.zeros(max_len, device=device) for _ in range(world_size)]
+                dist.all_gather(gathered_buffers, send_buffer)
 
-            # 重组完整列表
-            full_list = []
-            for rank_idx, buf in enumerate(gathered_buffers):
-                for i in range(lengths[rank_idx]):
-                    full_list.append(buf[i].item())
+                # 重组完整列表
+                full_list = []
+                for rank_idx, buf in enumerate(gathered_buffers):
+                    for i in range(lengths[rank_idx]):
+                        full_list.append(buf[i].item())
         else:
             full_list = list(local_list)
             total_n = n_local
@@ -367,19 +373,22 @@ def aggregate_da(
                 lengths = [t.item() for t in gathered_n]
                 total_n = sum(lengths)
 
-                # gather 内容
+                # 空 rank 边界：max_len=0 时跳过 all_gather（同 aggregate_ic）
                 max_len = max(lengths) if lengths else 0
-                send_buffer = torch.zeros(max_len, device=device)
-                for i, val in enumerate(local_list):
-                    send_buffer[i] = val
+                if max_len == 0:
+                    full_list = []
+                else:
+                    send_buffer = torch.zeros(max_len, device=device)
+                    for i, val in enumerate(local_list):
+                        send_buffer[i] = val
 
-                gathered_buffers = [torch.zeros(max_len, device=device) for _ in range(world_size)]
-                dist.all_gather(gathered_buffers, send_buffer)
+                    gathered_buffers = [torch.zeros(max_len, device=device) for _ in range(world_size)]
+                    dist.all_gather(gathered_buffers, send_buffer)
 
-                full_list = []
-                for rank_idx, buf in enumerate(gathered_buffers):
-                    for i in range(lengths[rank_idx]):
-                        full_list.append(buf[i].item())
+                    full_list = []
+                    for rank_idx, buf in enumerate(gathered_buffers):
+                        for i in range(lengths[rank_idx]):
+                            full_list.append(buf[i].item())
             else:
                 full_list = list(local_list)
                 total_n = n_local

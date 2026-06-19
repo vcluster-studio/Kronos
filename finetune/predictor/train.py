@@ -443,16 +443,14 @@ def train(
             token_out = [token_seq_0[:, 1:], token_seq_1[:, 1:]]
 
             # Forward
-            if use_ddp:
-                s1_logits, s2_logits = model.module(token_seq_0, token_seq_1, x_stamp)
-                recon_loss, _, _ = model.module.head.compute_loss(
-                    s1_logits[:, :-1, :], s2_logits[:, :-1, :], token_out[0], token_out[1]
-                )
-            else:
-                s1_logits, s2_logits = model(token_seq_0, token_seq_1, x_stamp)
-                recon_loss, _, _ = model.head.compute_loss(
-                    s1_logits[:, :-1, :], s2_logits[:, :-1, :], token_out[0], token_out[1]
-                )
+            # DDP 模式必须走 model(...) 触发梯度 all-reduce hook；
+            # model.module(...) 绕过 DDP 会导致各卡梯度不同步。
+            # head.compute_loss 仍需 model.module.head 访问子模块。
+            s1_logits, s2_logits = model(token_seq_0, token_seq_1, x_stamp)
+            head = model.module.head if use_ddp else model.head
+            recon_loss, _, _ = head.compute_loss(
+                s1_logits[:, :-1, :], s2_logits[:, :-1, :], token_out[0], token_out[1]
+            )
 
             optimizer.zero_grad()
             recon_loss.backward()
@@ -548,10 +546,18 @@ def train(
                 patience_counter += 1
 
             # Early stopping（§1.6.7: patience=12 需审视）
-            if epoch_idx >= train_config.early_stopping_grace_period:
-                if patience_counter >= train_config.early_stopping_patience:
-                    print(f"\n[EARLY STOP] No improvement for {patience_counter} epochs")
-                    break
+            # DDP 同步：rank 0 算 stop 决定，broadcast 给所有 rank，一起 break。
+            # 否则只 rank 0 退出循环，其他 rank 在下一 epoch 的 all_gather 永久阻塞 → NCCL 超时。
+            stop_flag = torch.zeros(1, dtype=torch.float32, device=device)
+            if is_main:
+                if epoch_idx >= train_config.early_stopping_grace_period:
+                    if patience_counter >= train_config.early_stopping_patience:
+                        print(f"\n[EARLY STOP] No improvement for {patience_counter} epochs")
+                        stop_flag[0] = 1.0
+            if use_ddp:
+                dist.broadcast(stop_flag, src=0)
+            if stop_flag[0] > 0:
+                break
 
             # 更新 training_info
             if info_path:
