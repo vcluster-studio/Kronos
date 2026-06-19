@@ -1,5 +1,20 @@
 """
-Kronos Predictor Training Script - with early stopping and IC monitoring
+[LEGACY] Kronos Predictor Training Script - with early stopping and IC monitoring
+
+此脚本已标记为 legacy，建议迁移到新的统一入口：
+    python finetune/predictor/train.py --model mini --epochs 50
+
+新入口提供以下改进：
+  - DDP 多卡支持
+  - 去趋势 trajectory IC（正确口径）
+  - 可懂指标三件套（方向胜率/振幅误差率/涨跌停命中率）
+  - Target-based split（无数据泄露）
+
+此脚本的问题：
+  - 单卡训练，不支持 DDP
+  - 度量口径与评估不一致
+
+---
 
 Usage:
     python -u finetune/train_predictor.py --model mini --dataset mid

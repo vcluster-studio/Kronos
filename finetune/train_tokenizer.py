@@ -1,5 +1,12 @@
 """
-Kronos Tokenizer Training Script - with early stopping
+[LEGACY] Kronos Tokenizer Training Script - with early stopping
+
+此脚本已标记为 legacy，建议迁移到新的统一入口：
+    python finetune/predictor/train.py --model mini
+
+新入口使用预训练 tokenizer 或从 norm_mode 选择对应 tokenizer。
+
+---
 
 Usage:
     python -u finetune/train_tokenizer.py --dataset mid

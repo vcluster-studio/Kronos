@@ -1,5 +1,20 @@
 """
-Kronos Predictor Training Script - DDP多卡版本
+[LEGACY] Kronos Predictor Training Script - DDP多卡版本
+
+此脚本已标记为 legacy，建议迁移到新的统一入口：
+    python finetune/predictor/train.py --norm-mode sliding_ma60 --model mini
+
+新入口提供以下改进：
+  - 去趋势 trajectory IC（正确口径）
+  - 可懂指标三件套（方向胜率/振幅误差率/涨跌停命中率）
+  - Target-based split（无数据泄露）
+
+此脚本的问题：
+  - trajectory IC 用原始价格序列计算（口径错误）
+  - window-index splitting 可能导致数据泄露
+  - 度量口径与 eval_ddp.py 不一致
+
+---
 
 支持两种归一化模式：
   - ma60: 使用 MA60 预归一化数据 + MA60 tokenizer（默认）

@@ -2,130 +2,135 @@
 
 ## 概述
 
-Kronos 提供完整的微调管道，支持在自有数据上适配模型。本指南以中国A股市场为例，使用 Qlib 准备数据。
+Kronos 提供完整的微调管道，支持在自有数据上适配模型。本指南以中国A股市场为例。
 
 ## 微调流程
 
 ### 流程概览
 
 1. **配置**: 设置路径和超参数
-2. **数据准备**: 使用 Qlib 处理和划分数据
+2. **数据预处理**: 从原始数据生成训练样本
 3. **分词器微调**: 适配数据分布
 4. **预测器微调**: 针对预测任务优化
-5. **回测评估**: 验证模型性能
+5. **评估与回测**: 验证模型性能
 
 ---
 
-## 环境准备
+## 新统一入口（推荐）
 
-### 安装 Qlib
+### 数据预处理
 
 ```bash
-pip install pyqlib
+python finetune/predictor/preprocess.py \
+    --norm-mode sliding_ma60 \
+    --lookback 400 \
+    --predict 10 \
+    --split-mode block \
+    --validate
 ```
 
-### 配置 Qlib 数据
-
-按照 [Qlib 官方指南](https://github.com/microsoft/qlib) 下载并设置本地数据。
-
----
-
-## 步骤 1: 配置实验
-
-编辑 `finetune/config.py`：
-
-### 关键配置项
-
-```python
-# 数据路径
-qlib_data_path = "~/.qlib/qlib_data/cn_data"  # Qlib数据目录
-dataset_path = "./data/processed_datasets"     # 处理后数据保存路径
-save_path = "./outputs/models"                 # 模型保存路径
-
-# 时间范围
-train_time_range = ["2011-01-01", "2022-12-31"]
-val_time_range = ["2022-09-01", "2024-06-30"]
-test_time_range = ["2024-04-01", "2025-06-05"]
-
-# 模型参数
-lookback_window = 90    # 回看窗口
-predict_window = 10     # 预测窗口
-max_context = 512       # 最大上下文
-
-# 训练参数
-epochs = 30
-batch_size = 50
-tokenizer_learning_rate = 2e-4
-predictor_learning_rate = 4e-5
-
-# 预训练模型路径
-pretrained_tokenizer_path = "NeoQuasar/Kronos-Tokenizer-base"
-pretrained_predictor_path = "NeoQuasar/Kronos-small"
-```
-
----
-
-## 步骤 2: 数据预处理
+### 训练
 
 ```bash
-python finetune/qlib_data_preprocess.py
+# 单卡
+python finetune/predictor/train.py \
+    --norm-mode sliding_ma60 \
+    --lookback 400 \
+    --predict 10 \
+    --split-mode block \
+    --model mini \
+    --epochs 50 \
+    --lr 0.01
+
+# 多卡 DDP
+torchrun --nproc_per_node=4 \
+    finetune/predictor/train.py \
+    --norm-mode sliding_ma60 \
+    --model mini
 ```
 
-这将生成：
-- `train_data.pkl`
-- `val_data.pkl`
-- `test_data.pkl`
+### 评估
+
+```bash
+# 单卡
+python finetune/predictor/eval.py \
+    --norm-mode sliding_ma60 \
+    --model mini \
+    --n-samples 1000
+
+# 多卡 DDP
+torchrun --nproc_per_node=4 \
+    finetune/predictor/eval.py \
+    --norm-mode sliding_ma60 \
+    --model mini
+```
+
+### 回测
+
+```bash
+python finetune/predictor/backtest.py \
+    --norm-mode sliding_ma60 \
+    --model mini \
+    --n-samples 1000
+```
+
+### 关键改进
+
+新入口提供以下改进：
+- **去趋势 trajectory IC**: 正确口径，不受价格趋势污染
+- **可懂指标三件套**: 方向胜率、振幅误差率、涨跌停命中率
+- **Target-based split**: 按 target 区间分割，无数据泄露
+- **Runtime 归一化**: pkl 存原始数据，运行时归一化
 
 ---
 
-## 步骤 3: 微调分词器
+## 配置参考
 
-```bash
-# 使用 2 个 GPU
-torchrun --standalone --nproc_per_node=2 finetune/train_tokenizer.py
-```
+### 数据配置（DataConfig）
 
-分词器微调将使量化器适配目标市场的数据分布。
+| 参数 | 默认值 | 说明 |
+|------|--------|------|
+| norm_mode | sliding_ma60 | 归一化模式 |
+| lookback | 400 | 回看窗口 |
+| predict | 10 | 预测窗口 |
+| split_mode | block | 分割模式 |
+| clip | 5.0 | 数据裁剪阈值 |
+
+### 训练配置（TrainConfig）
+
+| 参数 | 默认值 | 说明 |
+|------|--------|------|
+| model_type | mini | 模型类型 |
+| epochs | 50 | 训练轮数 |
+| batch_size | 16 | 批大小 |
+| learning_rate | 0.01 | 学习率（从大值起步） |
+| early_stopping_patience | 12 | 早停耐心值 |
+
+### 归一化模式
+
+| norm_mode | 含义 |
+|-----------|------|
+| full_window | 基于 lookback 窗口归一化 |
+| sliding_ma20 | MA20 滑动归一化 |
+| sliding_ma60 | MA60 滑动归一化 |
+| sliding_ma120 | MA120 滑动归一化 |
 
 ---
 
-## 步骤 4: 微调预测器
+## 旧入口（Legacy）
 
-```bash
-# 使用 2 个 GPU
-torchrun --standalone --nproc_per_node=2 finetune/train_predictor.py
-```
+以下入口已标记为 legacy，建议迁移到新统一入口：
 
-最佳模型将保存到配置的路径。
+- `finetune/predictor/mode*/train_ddp.py`
+- `finetune/predictor/shared/eval_ddp.py`
+- `finetune/predictor/simple_backtest.py`
+- `finetune/train_tokenizer.py`
+- `finetune/train_predictor.py`
 
----
-
-## 步骤 5: 回测评估
-
-```bash
-python finetune/qlib_test.py --device cuda:0
-```
-
-回测将输出：
-- 策略表现分析
-- 累计收益曲线图
-
----
-
-## CSV 格式微调
-
-对于非 Qlib 数据，可使用 `finetune_csv/` 目录的脚本：
-
-```bash
-python finetune_csv/train_sequential.py
-```
-
-### CSV 数据格式
-
-CSV 文件应包含以下列：
-- `timestamps`: 时间戳
-- `open`, `high`, `low`, `close`: OHLC数据
-- `volume`, `amount`: 成交量和成交额（可选）
+旧入口的问题：
+- trajectory IC 用原始价格序列计算（口径错误）
+- window-index splitting 导致数据泄露
+- 度量口径不一致（train/eval 用不同函数）
 
 ---
 
@@ -147,20 +152,4 @@ CSV 文件应包含以下列：
 
 ### 数据处理
 
-根据数据源调整 `QlibDataset` 的数据加载和预处理逻辑。
-
----
-
-## 微调配置参考
-
-| 参数 | 默认值 | 说明 |
-|------|--------|------|
-| epochs | 30 | 训练轮数 |
-| batch_size | 50 | 批大小 |
-| accumulation_steps | 1 | 梯度累积步数 |
-| clip | 5.0 | 数据裁剪阈值 |
-| tokenizer_learning_rate | 2e-4 | 分词器学习率 |
-| predictor_learning_rate | 4e-5 | 预测器学习率 |
-| adam_beta1 | 0.9 | Adam beta1 |
-| adam_beta2 | 0.95 | Adam beta2 |
-| adam_weight_decay | 0.1 | 权重衰减 |
+根据数据源调整数据加载和预处理逻辑。

@@ -1,5 +1,18 @@
 """
-批量回测脚本 - 使用 final_test_data.pkl 验证因子分值效果
+[LEGACY] 批量回测脚本 - 使用 final_test_data.pkl 验证因子分值效果
+
+此脚本已标记为 legacy，建议迁移到新的统一入口：
+    python finetune/predictor/backtest.py --model mini --n-samples 100
+
+新入口提供以下改进：
+  - Per-stock IC aggregation（不跨股票混算）
+  - 可懂指标三件套（方向胜率/振幅误差率/涨跌停命中率）
+  - 配置化 sigmoid 参数
+
+此脚本的问题：
+  - IC 跨股票混算（受 beta/时期效应污染）
+
+---
 
 用法：
     python finetune/predictor/simple_backtest.py --n-samples 100   # 快速测试

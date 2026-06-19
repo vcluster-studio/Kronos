@@ -1,5 +1,18 @@
 """
-多GPU并行评估脚本 - 全量测试集评估
+[LEGACY] 多GPU并行评估脚本 - 全量测试集评估
+
+此脚本已标记为 legacy，建议迁移到新的统一入口：
+    python finetune/predictor/eval.py --norm-mode sliding_ma60 --model mini
+
+新入口提供以下改进：
+  - 去趋势 trajectory IC（正确口径）
+  - 可懂指标三件套（方向胜率/振幅误差率/涨跌停命中率）
+  - excess DA（超额方向准确率）
+
+此脚本的问题：
+  - trajectory IC 用原始价格序列计算（口径错误）
+
+---
 
 利用DDP并行加速全量评估，每个GPU处理部分窗口。
 
