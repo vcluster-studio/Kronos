@@ -109,8 +109,8 @@ class SlidingMANormalizer:
             s = pd.Series(series[:, fi])
 
             # rolling mean/std，min_periods=1 与现有实现一致
-            rolling_mean = s.rolling(window=self.window, min_periods=self.min_periods).mean().values
-            rolling_std = s.rolling(window=self.window, min_periods=self.min_periods).std().values
+            rolling_mean = s.rolling(window=self.window, min_periods=self.min_periods).mean().values.copy()
+            rolling_std = s.rolling(window=self.window, min_periods=self.min_periods).std().values.copy()
 
             # 前若干点（min_periods 之前）的 expanding 处理
             # min_periods=1 时，第一个点用自己的值作为 mean，std=0

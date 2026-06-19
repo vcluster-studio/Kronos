@@ -49,7 +49,6 @@ from finetune.predictor.core.paths import (
     get_training_info_path,
     get_summary_path,
     get_split_data_path,
-    get_legacy_data_path,
     ensure_dir,
 )
 from finetune.predictor.core.dataset import KronosDataset, KronosWindowedDataset, collate_fn
@@ -654,13 +653,9 @@ def main():
 
     set_seed(config.seed)
 
-    # 数据路径（兼容旧格式）
-    if args.use_block or args.split_mode == 'block':
-        train_path = get_legacy_data_path('ma60', args.lookback, 'train')
-        val_path = get_legacy_data_path('ma60', args.lookback, 'val')
-    else:
-        train_path = get_split_data_path(config.norm_mode, config.lookback, config.predict, config.split_mode, 'train')
-        val_path = get_split_data_path(config.norm_mode, config.lookback, config.predict, config.split_mode, 'val')
+    # 数据路径（由 preprocess.py 预先生成）
+    train_path = get_split_data_path(config.norm_mode, config.lookback, config.predict, config.split_mode, 'train')
+    val_path = get_split_data_path(config.norm_mode, config.lookback, config.predict, config.split_mode, 'val')
 
     if is_main:
         print(f"\n{'=' * 60}")

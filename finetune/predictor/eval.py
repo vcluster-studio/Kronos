@@ -43,7 +43,7 @@ from finetune.predictor.core.paths import (
     get_tokenizer_path,
     get_model_path,
     get_checkpoint_path,
-    get_legacy_data_path,
+    get_split_data_path,
 )
 from finetune.predictor.core.metrics import (
     FEATURE_NAMES,
@@ -331,12 +331,8 @@ def main():
         split_mode=args.split_mode,
     )
 
-    # 数据路径
-    if args.use_block or args.split_mode == 'block':
-        test_path = get_legacy_data_path('ma60', args.lookback, 'final_test')
-    else:
-        from finetune.predictor.core.paths import get_split_data_path
-        test_path = get_split_data_path(config.norm_mode, config.lookback, config.predict, config.split_mode, 'test')
+    # 数据路径（由 preprocess.py 预先生成）
+    test_path = get_split_data_path(config.norm_mode, config.lookback, config.predict, config.split_mode, 'test')
 
     print(f"\n{'=' * 60}")
     print(f"Kronos Predictor Evaluation (Detrended IC)")

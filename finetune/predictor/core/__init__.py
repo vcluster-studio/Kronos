@@ -21,6 +21,7 @@ from .config import (
 
 from .paths import (
     get_raw_path,
+    get_backtest_raw_path,
     get_split_data_path,
     get_backtest_data_path,
     get_meta_path,
@@ -30,7 +31,6 @@ from .paths import (
     get_training_info_path,
     get_summary_path,
     ensure_dir,
-    get_legacy_data_path,
 )
 
 from .schema import (
@@ -117,6 +117,7 @@ __all__ = [
 
     # Paths
     'get_raw_path',
+    'get_backtest_raw_path',
     'get_split_data_path',
     'get_backtest_data_path',
     'get_meta_path',
@@ -126,7 +127,6 @@ __all__ = [
     'get_training_info_path',
     'get_summary_path',
     'ensure_dir',
-    'get_legacy_data_path',
 
     # Schema
     'SampleSchema',

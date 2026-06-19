@@ -30,7 +30,10 @@ from model.kronos import Kronos, KronosTokenizer, auto_regressive_inference
 from safetensors.torch import load_file
 
 from finetune.predictor.core.config import BacktestConfig
-from finetune.predictor.core.paths import get_legacy_data_path
+from finetune.predictor.core.paths import (
+    get_backtest_data_path,
+    get_tokenizer_path,
+)
 from finetune.predictor.core.metrics import (
     safe_corrcoef,
     safe_spearmanr,
@@ -47,9 +50,6 @@ from finetune.predictor.core.utils import get_device
 # 配置
 # ============================================================================
 
-LOOKBACK = 400
-PREDICT = 10
-
 
 # ============================================================================
 # 回测函数
@@ -61,10 +61,9 @@ def backtest(
     test_data,
     config: BacktestConfig,
     device: torch.device,
-    raw_data=None,
     n_samples: int = 100,
     seed: int = 42,
-    norm_mode: str = 'ma60'
+    norm_mode: str = 'sliding_ma60'
 ):
     """
     回测（正确口径）
@@ -72,94 +71,61 @@ def backtest(
     关键：
     - per-stock IC（不跨股票混算）
     - sigmoid 参数从配置读取
+    - 样本由 preprocess.py 生成，统一格式：{symbol: {normalized, means, stds, original, index, lookback, predict}}
     """
     model.eval()
     tokenizer.eval()
 
     rng = np.random.RandomState(seed)
 
-    # 构建窗口
-    if norm_mode == 'ma60':
-        windows = []
-        for sym, d in test_data.items():
-            if 'windows' in d:
-                for start in d['windows']:
-                    windows.append((sym, int(start)))
-            else:
-                seq_len = len(d['normalized'])
-                if seq_len >= LOOKBACK + PREDICT:
-                    windows.append((sym, seq_len - LOOKBACK - PREDICT))
-    else:
-        # full_window 需要从 raw 借用历史
-        windows = [(sym, 0) for sym in test_data.keys()]
+    # 每只股票一个窗口（preprocess 已拼好 context+target）
+    symbols = list(test_data.keys())
 
     # 抽样
-    if n_samples > 0 and n_samples < len(windows):
-        indices = rng.choice(len(windows), size=n_samples, replace=False)
-        windows = [windows[i] for i in indices]
+    if n_samples > 0 and n_samples < len(symbols):
+        indices = rng.choice(len(symbols), size=n_samples, replace=False)
+        symbols = [symbols[i] for i in indices]
 
     # 结果收集（per-symbol）
     results_by_symbol = {}
 
-    for (sym, start) in tqdm(windows, desc="Backtesting"):
+    for sym in tqdm(symbols, desc="Backtesting"):
         d = test_data[sym]
 
         try:
-            if norm_mode == 'ma60':
-                end = start + LOOKBACK + PREDICT
-                x_norm = d['normalized'][start:start + LOOKBACK].astype(np.float32)
-                means = d['means'][start:end]
-                stds = d['stds'][start:end]
-                original = d['original'][start:end]
-                timestamps = d['index'][start:end]
-                baseline = original[LOOKBACK - 1]
-                baseline_close = original[LOOKBACK - 1, 3]
-            else:
-                # full_window: 从 raw 借用历史
-                raw = raw_data.get(sym)
-                if raw is None:
-                    continue
+            lookback = d['lookback']
+            predict = d['predict']
+            # 序列布局：[required_history? + lookback + predict]
+            # normalized/original/index 长度 = required_history + lookback + predict
+            # lookback 段起始 = len - lookback - predict
+            seq_len = len(d['normalized'])
+            ctx_start = seq_len - lookback - predict
+            target_start = ctx_start + lookback
 
-                # 找到 test 在 raw 中的位置
-                test_start_date = d.index[0]
-                raw_idx = raw['index']
-                test_pos = None
-                for i, dt in enumerate(raw_idx):
-                    if dt == test_start_date:
-                        test_pos = i
-                        break
+            x_norm = d['normalized'][ctx_start:target_start].astype(np.float32)
+            means = d['means']
+            stds = d['stds']
+            original = d['original']
+            timestamps = d['index']
 
-                if test_pos is None or test_pos < LOOKBACK:
-                    continue
-
-                window_start = test_pos - LOOKBACK
-                window_values = raw['values'][window_start:test_pos + PREDICT]
-                window_ts = raw['index'][window_start:test_pos + PREDICT]
-
-                x_raw = window_values[:LOOKBACK]
-                x_mean = np.mean(x_raw, axis=0)
-                x_std = np.std(x_raw, axis=0) + 1e-5
-                x_norm = np.clip((x_raw - x_mean) / x_std, -5.0, 5.0)
-
-                baseline = window_values[LOOKBACK - 1]
-                baseline_close = window_values[LOOKBACK - 1, 3]
-                timestamps = window_ts
+            baseline = original[target_start - 1]
+            baseline_close = original[target_start - 1, 3]
 
             # 时间戳
             x_stamp = np.stack([
-                timestamps[:LOOKBACK].minute.values,
-                timestamps[:LOOKBACK].hour.values,
-                timestamps[:LOOKBACK].weekday.values,
-                timestamps[:LOOKBACK].day.values,
-                timestamps[:LOOKBACK].month.values,
+                timestamps[ctx_start:target_start].minute.values,
+                timestamps[ctx_start:target_start].hour.values,
+                timestamps[ctx_start:target_start].weekday.values,
+                timestamps[ctx_start:target_start].day.values,
+                timestamps[ctx_start:target_start].month.values,
             ], axis=1).astype(np.float32)
 
             y_stamp = np.stack([
-                timestamps[LOOKBACK:LOOKBACK + PREDICT].minute.values,
-                timestamps[LOOKBACK:LOOKBACK + PREDICT].hour.values,
-                timestamps[LOOKBACK:LOOKBACK + PREDICT].weekday.values,
-                timestamps[LOOKBACK:LOOKBACK + PREDICT].day.values,
-                timestamps[LOOKBACK:LOOKBACK + PREDICT].month.values,
+                timestamps[target_start:target_start + predict].minute.values,
+                timestamps[target_start:target_start + predict].hour.values,
+                timestamps[target_start:target_start + predict].weekday.values,
+                timestamps[target_start:target_start + predict].day.values,
+                timestamps[target_start:target_start + predict].month.values,
             ], axis=1).astype(np.float32)
 
             with torch.no_grad():
@@ -171,7 +137,7 @@ def backtest(
                     tokenizer, model,
                     x_tensor, x_stamp_tensor, y_stamp_tensor,
                     max_context=2048,
-                    pred_len=PREDICT,
+                    pred_len=predict,
                     clip=5.0,
                     T=1.0,
                     top_p=0.9,
@@ -179,15 +145,11 @@ def backtest(
                     verbose=False
                 )
 
-                pred_norm = preds[0, LOOKBACK:LOOKBACK + PREDICT, :]
+                pred_norm = preds[0, -predict:, :]
 
-                # 反归一化
-                if norm_mode == 'ma60':
-                    pred_raw = pred_norm.cpu().numpy() * stds[LOOKBACK:] + means[LOOKBACK:]
-                    actual = original[LOOKBACK:LOOKBACK + PREDICT]
-                else:
-                    pred_raw = pred_norm.cpu().numpy() * x_std + x_mean
-                    actual = window_values[LOOKBACK:LOOKBACK + PREDICT]
+                # 反归一化（用 target 段的 means/stds）
+                pred_raw = pred_norm.cpu().numpy() * stds[target_start:target_start + predict] + means[target_start:target_start + predict]
+                actual = original[target_start:target_start + predict]
 
             # 增益计算（用 close）
             pred_close = pred_raw[0, 3]
@@ -319,8 +281,10 @@ def main():
     parser = argparse.ArgumentParser(description='Kronos Predictor Backtest')
     parser.add_argument('--model', type=str, default='final_models/Kronos-mini-MA60')
     parser.add_argument('--tokenizer', type=str, default=None)
-    parser.add_argument('--norm-mode', type=str, default='ma60',
-                        choices=['ma60', 'full_window'])
+    parser.add_argument('--norm-mode', type=str, default='sliding_ma60',
+                        choices=['full_window', 'sliding_ma20', 'sliding_ma60', 'sliding_ma120'])
+    parser.add_argument('--lookback', type=int, default=400)
+    parser.add_argument('--predict', type=int, default=10)
     parser.add_argument('--n-samples', type=int, default=100,
                         help='Number of samples (-1 for full)')
     parser.add_argument('--batch-size', type=int, default=64)
@@ -359,11 +323,8 @@ def main():
         state_dict = load_file(safetensors_path)
         model.load_state_dict(state_dict, strict=False)
 
-    # 数据
-    if args.norm_mode == 'ma60':
-        test_path = get_legacy_data_path('ma60', 400, 'final_test')
-    else:
-        test_path = 'finetune/data/global_norm/full_series/test_data.pkl'
+    # 数据：回测样本（由 preprocess.py 生成）+ 样本外 raw（full_window 借用历史）
+    test_path = get_backtest_data_path(args.norm_mode, args.lookback, args.predict)
 
     print(f"\n{'=' * 60}")
     print(f"Kronos Predictor Backtest")
@@ -379,18 +340,9 @@ def main():
     with open(test_path, 'rb') as f:
         test_data = pickle.load(f)
 
-    # full_window 需要 raw
-    raw_data = None
-    if args.norm_mode == 'full_window':
-        raw_path = 'data/kline_daily_raw.pkl'
-        if os.path.exists(raw_path):
-            with open(raw_path, 'rb') as f:
-                raw_data = pickle.load(f)
-
-    # 回测
+    # 回测（样本由 preprocess.py 预先生成，含 context+target）
     result = backtest(
         model, tokenizer, test_data, config, device,
-        raw_data=raw_data,
         n_samples=args.n_samples,
         seed=args.seed,
         norm_mode=args.norm_mode

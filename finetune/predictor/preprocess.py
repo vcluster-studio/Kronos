@@ -35,7 +35,9 @@ sys.path.insert(0, project_root)
 from finetune.predictor.core.config import DataConfig, parse_norm_mode
 from finetune.predictor.core.paths import (
     get_raw_path,
+    get_backtest_raw_path,
     get_split_data_path,
+    get_backtest_data_path,
     get_meta_path,
     ensure_dir,
 )
@@ -149,7 +151,7 @@ def create_samples_from_raw(
                     target_end=start + lookback + predict,
                     split='unknown',
                     values=values[i:i + window_size + required_history],
-                    index=index[i:i + window_size + required_history] if index else None,
+                    index=index[i:i + window_size + required_history] if index is not None else None,
                 )
                 samples.append(sample)
 
@@ -192,6 +194,92 @@ def apply_split(
 
     else:
         raise ValueError(f"Unknown split_mode: {config.split_mode}")
+
+
+def create_backtest_samples(
+    train_raw: Dict[str, Any],
+    backtest_raw: Dict[str, Any],
+    config: DataConfig
+) -> Dict[str, Any]:
+    """
+    生成 backtest 样本
+
+    每只股票一个样本：
+      - context（lookback）来自 train_raw（kline_daily_raw）末尾
+      - target（predict）来自 backtest_raw 开头
+      - 拼接 required_history + lookback + predict 的完整序列后归一化
+
+    Args:
+        train_raw: kline_daily_raw（提供 context）
+        backtest_raw: backtest_raw（提供 target）
+        config: DataConfig
+
+    Returns:
+        {symbol: {normalized, means, stds, original, index, lookback, predict}}
+    """
+    lookback = config.lookback
+    predict = config.predict
+    required_history = NormalizerFactory.get_required_history(config.norm_mode)
+    normalizer = NormalizerFactory.create(config.norm_mode, clip=config.clip)
+    context_len = lookback + required_history  # 从 train_raw 取的长度
+
+    samples = {}
+    skipped = 0
+
+    for symbol, bt_data in tqdm(backtest_raw.items(), desc="Backtest samples"):
+        train_data = train_raw.get(symbol)
+        if train_data is None:
+            skipped += 1
+            continue
+
+        train_values = train_data['values']
+        train_index = train_data['index']
+        bt_values = bt_data['values']
+        bt_index = bt_data['index']
+
+        # train_raw 不足以提供 context
+        if len(train_values) < context_len:
+            skipped += 1
+            continue
+        # backtest_raw 不足以提供 target
+        if len(bt_values) < predict:
+            skipped += 1
+            continue
+
+        # context = train_raw 末尾 context_len 根
+        ctx_values = train_values[-context_len:]
+        ctx_index = train_index[-context_len:]
+        # target = backtest_raw 前 predict 根
+        tgt_values = bt_values[:predict]
+        tgt_index = bt_index[:predict]
+
+        # 拼接完整序列：required_history + lookback + predict
+        full_values = np.concatenate([ctx_values, tgt_values], axis=0)
+        full_index = ctx_index.append(tgt_index)
+
+        # 归一化整个序列（sliding_ma 依赖前缀历史）
+        normalized, means, stds = normalizer.normalize(full_values)
+
+        samples[symbol] = {
+            'normalized': normalized.astype(np.float32),
+            'means': means.astype(np.float32),
+            'stds': stds.astype(np.float32),
+            'original': full_values.astype(np.float32),
+            'index': full_index,
+            'lookback': lookback,
+            'predict': predict,
+        }
+
+    print(f"Backtest samples: {len(samples)} (skipped {skipped})")
+    return samples
+
+
+def save_backtest_samples(samples: Dict[str, Any], output_path: str):
+    """保存 backtest 样本"""
+    ensure_dir(output_path)
+    with open(output_path, 'wb') as f:
+        pickle.dump(samples, f)
+    print(f"Saved {len(samples)} backtest samples to {output_path}")
 
 
 def save_split_data(
@@ -299,22 +387,28 @@ def save_meta(
 def preprocess(
     config: DataConfig,
     raw_path: str = None,
+    backtest_raw_path: str = None,
     train_end: int = None,
     val_end: int = None,
-    validate: bool = True
+    validate: bool = True,
+    skip_backtest: bool = False
 ):
     """
     预处理主流程
 
     Args:
         config: DataConfig
-        raw_path: 原始数据路径
+        raw_path: 训练原始数据路径（kline_daily_raw）
+        backtest_raw_path: 回测原始数据路径（backtest_raw）
         train_end: 时间分割训练边界
         val_end: 时间分割验证边界
         validate: 是否运行泄露检查
+        skip_backtest: 是否跳过 backtest 样本生成
     """
     if raw_path is None:
         raw_path = get_raw_path()
+    if backtest_raw_path is None:
+        backtest_raw_path = get_backtest_raw_path()
 
     # 1. 加载原始数据
     raw_data = load_raw_data(raw_path)
@@ -358,6 +452,20 @@ def preprocess(
     print(f"  Symbols: {stats['n_symbols']}")
     print(f"  Leakage check: {'PASSED' if leakage_passed else 'FAILED'}")
 
+    # 8. 生成 backtest 样本（context 来自 kline_daily_raw，target 来自 backtest_raw）
+    if not skip_backtest:
+        if os.path.exists(backtest_raw_path):
+            print(f"\n[Backtest] Loading backtest raw: {backtest_raw_path}")
+            with open(backtest_raw_path, 'rb') as f:
+                backtest_raw = pickle.load(f)
+            bt_samples = create_backtest_samples(raw_data, backtest_raw, config)
+            bt_output_path = get_backtest_data_path(
+                config.norm_mode, config.lookback, config.predict
+            )
+            save_backtest_samples(bt_samples, bt_output_path)
+        else:
+            print(f"\n[Backtest] 跳过：{backtest_raw_path} 不存在")
+
     return leakage_passed
 
 
@@ -370,13 +478,17 @@ def main():
     parser.add_argument('--split-mode', type=str, default='block',
                         choices=['time', 'block'])
     parser.add_argument('--raw-data', type=str, default=None,
-                        help='Raw data path (default: data/kline_daily_raw.pkl)')
+                        help='训练 raw 路径（默认 finetune/data/raw/kline_daily_raw.pkl）')
+    parser.add_argument('--backtest-raw', type=str, default=None,
+                        help='回测 raw 路径（默认 finetune/data/raw/backtest_raw.pkl）')
     parser.add_argument('--train-end', type=int, default=None,
                         help='Time split train boundary (target_end)')
     parser.add_argument('--val-end', type=int, default=None,
                         help='Time split val boundary (target_end)')
     parser.add_argument('--validate', action='store_true',
                         help='Run leakage check')
+    parser.add_argument('--skip-backtest', action='store_true',
+                        help='跳过 backtest 样本生成')
     parser.add_argument('--seed', type=int, default=42)
     args = parser.parse_args()
 
@@ -389,6 +501,7 @@ def main():
     )
 
     raw_path = args.raw_data or get_raw_path()
+    backtest_raw_path = args.backtest_raw or get_backtest_raw_path()
 
     if args.split_mode == 'time' and (args.train_end is None or args.val_end is None):
         parser.error("time split requires --train-end and --val-end")
@@ -401,15 +514,19 @@ def main():
     print(f"predict: {config.predict}")
     print(f"split_mode: {config.split_mode}")
     print(f"raw_data: {raw_path}")
+    print(f"backtest_raw: {backtest_raw_path}")
     print(f"validate: {args.validate}")
+    print(f"skip_backtest: {args.skip_backtest}")
     print("=" * 60)
 
     passed = preprocess(
         config,
         raw_path=raw_path,
+        backtest_raw_path=backtest_raw_path,
         train_end=args.train_end,
         val_end=args.val_end,
-        validate=args.validate
+        validate=args.validate,
+        skip_backtest=args.skip_backtest
     )
 
     if args.validate and not passed:

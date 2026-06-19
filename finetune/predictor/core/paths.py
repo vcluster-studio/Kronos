@@ -6,9 +6,10 @@ Kronos Predictor Core Paths Module
 统一路径管理，避免路径语义混乱。
 
 三类路径函数：
-1. split_data: 训练/验证/测试数据
-2. backtest: 回测数据
-3. meta: 元数据
+1. raw: 原始数据（训练 raw + 样本外 backtest raw）
+2. split_data: 训练/验证/测试数据（preprocess.py 生成）
+3. backtest: 回测样本数据（preprocess.py 生成）
+4. meta: 元数据
 """
 
 import os
@@ -20,12 +21,32 @@ PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(o
 
 def get_raw_path() -> str:
     """
-    获取原始数据路径（统一位置）
+    获取训练原始数据路径
 
     Returns:
-        "data/kline_daily_raw.pkl"
+        "finetune/data/raw/kline_daily_raw.pkl"
+
+    说明:
+        训练/验证/测试的输入源，覆盖 2018-01-02 ~ 2026-05-18。
+        backtest 的 context（lookback 历史）也由此文件提供。
     """
-    return os.path.join(PROJECT_ROOT, "data/kline_daily_raw.pkl")
+    return os.path.join(PROJECT_ROOT, "finetune/data/raw/kline_daily_raw.pkl")
+
+
+def get_backtest_raw_path() -> str:
+    """
+    获取回测原始数据路径
+
+    Returns:
+        "finetune/data/raw/backtest_raw.pkl"
+
+    说明:
+        回测 target 的输入源，覆盖 2026-05-19 ~ 2026-06-17。
+        与 kline_daily_raw.pkl 时间区间不重叠。
+        backtest 窗口 = kline_daily_raw 末尾 lookback 根（context）+ 本文件（target）。
+        结构：{symbol: {'values': (T,6), 'index': DatetimeIndex}}。
+    """
+    return os.path.join(PROJECT_ROOT, "finetune/data/raw/backtest_raw.pkl")
 
 
 def get_split_data_path(
@@ -66,7 +87,7 @@ def get_backtest_data_path(
     predict: int
 ) -> str:
     """
-    获取回测数据路径
+    获取回测样本路径
 
     Args:
         norm_mode: 归一化模式
@@ -219,39 +240,3 @@ def ensure_dir(path: str) -> str:
     if not os.path.exists(dir_path):
         os.makedirs(dir_path, exist_ok=True)
     return path
-
-
-# ============================================================================
-# 兼容旧路径（临时，重构完成后废弃）
-# ============================================================================
-
-def get_legacy_data_path(
-    norm_mode: str,
-    lookback: int,
-    split_name: str
-) -> str:
-    """
-    获取旧格式数据路径（兼容现有数据）
-
-    Args:
-        norm_mode: 'ma60' | 'global_norm'
-        lookback: 回看窗口
-        split_name: train/val/test/final_test
-
-    Returns:
-        旧格式路径
-    """
-    if norm_mode == 'ma60':
-        # MA60 预归一化数据
-        return os.path.join(
-            PROJECT_ROOT,
-            f"finetune/data/ma60_norm/block_lb{lookback}_pd10/{split_name}_data.pkl"
-        )
-    elif norm_mode == 'global_norm':
-        # Full window 归一化数据
-        return os.path.join(
-            PROJECT_ROOT,
-            f"finetune/data/global_norm/full_series/{split_name}_data.pkl"
-        )
-    else:
-        raise ValueError(f"Unknown legacy norm_mode: {norm_mode}")

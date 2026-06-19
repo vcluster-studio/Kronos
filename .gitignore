@@ -92,10 +92,16 @@ outputs/prediction_results/
 temp_removed/
 
 # Finetune data (preprocessed datasets)
-finetune/data/
+finetune/data/processed/*
+!finetune/data/processed/.gitkeep
+finetune/data/raw/*
+!finetune/data/raw/.gitkeep
 
-# Raw data (SQL, CSV etc.)
-data/
+# Raw data (SQL, CSV etc.) — 保留 data/ 下的生成脚本与 README
+data/*
+!data/.gitkeep
+!data/*.py
+!data/README.md
 
 # Exported kline data (large)
 finetune_csv/
