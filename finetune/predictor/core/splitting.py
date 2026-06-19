@@ -222,13 +222,20 @@ def validate_no_leakage(
     test_samples: List[SampleSchema]
 ) -> bool:
     """
-    验证 target 时间区间无重叠（区间语义，非元组语义）
+    验证 target 时间区间无跨 split 重叠（区间语义）
 
     区间 [s, e) 不相交: e1 <= s2 或 e2 <= s1
+    同 split 内相邻样本 target 重叠是允许的（block 内滑动样本本就重叠），
+    只检查跨 split（train/val、train/test、val/test）的 target 相交。
 
     这是 target-based splitting 的正确守卫。
-    元组 disjoint 只能抓「完全重复的 target 窗口」，抓不到「时间区间相交」。
     本项目 lb60 曾因 window-index splitting 导致 100% target 泄露。
+
+    算法（扫描线，O(N log N)）：
+    1. 按股票分组，每只股票把三个 split 的区间合并为 (start, end, split)
+    2. 按 start 排序
+    3. 扫描时维护每个 split 已见区间的最大 end
+    4. 新区间进来，若其它 split 的 max_end > 新区间 start，则相交（泄露）
 
     Args:
         train_samples: 训练集样本
@@ -241,37 +248,44 @@ def validate_no_leakage(
     Raises:
         AssertionError 如果发现泄露
     """
-    def get_symbols(samples):
-        return set(s.symbol for s in samples)
+    from collections import defaultdict
 
-    def get_intervals(samples, symbol):
-        return [(s.target_start, s.target_end) for s in samples if s.symbol == symbol]
+    # 按股票收集 (start, end, split)
+    by_symbol = defaultdict(list)
+    for s in train_samples:
+        by_symbol[s.symbol].append((s.target_start, s.target_end, 'train'))
+    for s in val_samples:
+        by_symbol[s.symbol].append((s.target_start, s.target_end, 'val'))
+    for s in test_samples:
+        by_symbol[s.symbol].append((s.target_start, s.target_end, 'test'))
 
-    all_symbols = get_symbols(train_samples) | get_symbols(val_samples) | get_symbols(test_samples)
+    split_names = ('train', 'val', 'test')
 
-    pairs = [
-        (train_samples, val_samples, "train/val"),
-        (train_samples, test_samples, "train/test"),
-        (val_samples, test_samples, "val/test"),
-    ]
+    for sym, intervals in by_symbol.items():
+        if not intervals:
+            continue
 
-    for samples_a, samples_b, pair_name in pairs:
-        for sym in all_symbols:
-            intervals_a = get_intervals(samples_a, sym)
-            intervals_b = get_intervals(samples_b, sym)
+        # 按 start 排序（start 相同按 end 排序）
+        intervals.sort(key=lambda x: (x[0], x[1]))
 
-            if intervals_a and intervals_b:
-                if intervals_overlap(intervals_a, intervals_b):
-                    # 找到重叠的具体区间
-                    for s1, e1 in intervals_a:
-                        for s2, e2 in intervals_b:
-                            if not (e1 <= s2 or e2 <= s1):
-                                raise AssertionError(
-                                    f"{pair_name} target overlap for {sym}: "
-                                    f"[{s1}, {e1}) intersects [{s2}, {e2})"
-                                )
+        # 每个 split 已见区间的最大 end
+        max_end = {name: -1 for name in split_names}
 
-    print(f"No-leakage check passed (interval semantics) - {len(all_symbols)} stocks verified")
+        for start, end, split in intervals:
+            # 检查其它 split 是否有区间 end > start（即与新区间相交）
+            for other in split_names:
+                if other == split:
+                    continue
+                if max_end[other] > start:
+                    raise AssertionError(
+                        f"{split}/{other} target overlap for {sym}: "
+                        f"new [{start}, {end}) intersects existing end={max_end[other]}"
+                    )
+            # 更新本 split 的 max_end
+            if end > max_end[split]:
+                max_end[split] = end
+
+    print(f"No-leakage check passed (interval semantics) - {len(by_symbol)} stocks verified")
     return True
 
 

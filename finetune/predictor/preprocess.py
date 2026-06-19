@@ -485,8 +485,10 @@ def main():
                         help='Time split train boundary (target_end)')
     parser.add_argument('--val-end', type=int, default=None,
                         help='Time split val boundary (target_end)')
-    parser.add_argument('--validate', action='store_true',
-                        help='Run leakage check')
+    parser.add_argument('--validate', dest='validate', action='store_true', default=True,
+                        help='运行泄露检查（默认开启）')
+    parser.add_argument('--no-validate', dest='validate', action='store_false',
+                        help='跳过泄露检查')
     parser.add_argument('--skip-backtest', action='store_true',
                         help='跳过 backtest 样本生成')
     parser.add_argument('--seed', type=int, default=42)
