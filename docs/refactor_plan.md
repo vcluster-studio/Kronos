@@ -261,62 +261,88 @@ assert normalizer.fit_range <= context_end, "normalizer 使用了未来数据"
 
 ### 1.5 Tokenizer 训练与一致性
 
-**Tokenizer 训练入口**: 每个 norm_mode 需单独训练 tokenizer（归一化后分布不同）。
+#### 1.5.1 Tokenizer 设计澄清（关键）
+
+本项目的 tokenizer 是 **VQ-VAE 式分词器**（`KronosTokenizer`，`model/kronos.py`），其设计要点：
+
+1. **Tokenizer 是「微调」而非「从零训练」**。`KronosTokenizer` 无 `.train()` 类方法，只有 `from_pretrained`（继承 `PyTorchModelHubMixin`）。训练流程是：加载预训练 tokenizer → 用目标数据微调编码器/解码器权重 → `save_pretrained`。
+
+2. **Tokenizer 架构由 model_type 决定，不由 norm_mode 决定**。预训练 tokenizer 只有两个：
+   - `Kronos-Tokenizer-2k`（group_size=5，2048 context）→ **mini** 模型
+   - `Kronos-Tokenizer-base`（group_size=4，512 context）→ **small / base** 模型
+
+   `group_size`、context 长度是**架构超参**，预训练时定死，微调不改。tokenizer 与 model_type 绑定是因为 **predictor 的 token 维度必须与 tokenizer 输出匹配**（架构耦合），不是「vocab 三选一」。
+
+3. **vocab_size 不是微调参数**。codebook/vocab 在预训练时已定（2k tokenizer 的 vocab 由 `s1_bits/s2_bits/group_size` 决定）。微调只调编码器/解码器权重，不改 vocab。因此 `mini=2048/small=4096/base=8192` 的映射是**错误的**——实际是「mini 用 2k tokenizer，small 与 base 共用 base tokenizer」，不存在 small=4096。
+
+4. **norm_mode 影响 tokenizer，故不同 norm_mode 必须各自微调 tokenizer，不可复用**。原因：tokenizer 微调时，QlibDataset 按 norm_mode 归一化 OHLCV 后喂给 tokenizer；不同 norm_mode（如 full_window vs sliding_ma60）的归一化分布不同（均值/方差尺度、自相关结构不同），微调后的 tokenizer 编码器权重是针对该分布优化的。若把 sliding_ma60 微调的 tokenizer 用于 full_window 数据，编码失真。「tokenizer 与 predictor 必须同 norm_mode」的本质是**两者吃同一归一化分布的数据**——架构（model_type）匹配决定能对接，分布（norm_mode）匹配决定编码有效，两者缺一不可。因此 `{norm_mode}` 是 tokenizer 路径的必要键：同 model_type 下不同 norm_mode 的 tokenizer **架构相同、权重不同**，必须分别微调、分别存储、分别匹配。
+
+5. **微调损失**：`recon_loss = mse(z_pre, x) + mse(z, x)`（重建）+ `bsq_loss`（码本 commit），见 `deprecated/finetune/train_tokenizer.py:194-195`。这是权重微调，不是重新学习码本。
+
+> **对早期方案的纠正**：早期 §1.5 写的 `KronosTokenizer.train(data=, vocab_size=)` 是不存在的 API；`vocab_map={mini:2048, small:4096, base:8192}` 是杜撰映射；「每个 norm_mode 单独训练 tokenizer」的表述把「按 norm_mode 微调」误解为「按 norm_mode 从零建架构」。均已纠正。
+
+#### 1.5.2 Tokenizer 微调入口
 
 ```python
 # finetune/tokenizer/train.py
 
-def train_tokenizer(
+def finetune_tokenizer(
     norm_mode: str,
-    model_type: str,           # mini/small/base → vocab size 不同
-    raw_data_path: str,
+    model_type: str,            # mini → Kronos-Tokenizer-2k; small/base → Kronos-Tokenizer-base
+    data_path: str,             # 预处理后的训练数据（已含 norm_mode 归一化信息）
     output_dir: str,
-    vocab_size: int = None,    # mini=2048, small=4096, base=8192
-    sample_ratio: float = 0.1, # 用 10% 数据训练 tokenizer
+    epochs: int = 30,
+    batch_size: int = 16,
+    learning_rate: float = 0.001,
     seed: int = 42
 ):
     """
-    训练 tokenizer
+    微调 tokenizer（非从零训练）
 
     步骤：
-    1. 加载原始数据
-    2. 按 norm_mode 归一化
-    3. 抽样训练数据
-    4. 训练 tokenizer
-    5. 保存到 outputs/tokenizers/{norm_mode}/{model_type}/
+    1. 按 model_type 选预训练 tokenizer：
+       - mini → pretrained/Kronos-Tokenizer-2k
+       - small/base → pretrained/Kronos-Tokenizer-base
+    2. 加载数据，QlibDataset 按 norm_mode 归一化
+    3. 微调循环：recon_loss + bsq_loss，标准 backward
+    4. 保存到 outputs/tokenizers/{norm_mode}/{model_type}/
     """
-    # vocab_size 映射
-    vocab_map = {'mini': 2048, 'small': 4096, 'base': 8192}
-    vocab_size = vocab_size or vocab_map[model_type]
+    # 1. 选预训练 tokenizer（架构由 model_type 决定）
+    pretrained_map = {
+        'mini': 'pretrained/Kronos-Tokenizer-2k',
+        'small': 'pretrained/Kronos-Tokenizer-base',
+        'base': 'pretrained/Kronos-Tokenizer-base',
+    }
+    tokenizer = KronosTokenizer.from_pretrained(pretrained_map[model_type])
+    tokenizer.to(device)
 
-    # 加载并归一化
-    raw_data = pickle.load(open(raw_data_path, 'rb'))
-    normalizer = get_normalizer(norm_mode)
-    normalized_data = [normalizer.normalize(d['values']) for d in raw_data]
+    # 2. 数据按 norm_mode 归一化（QlibDataset/KronosDataset 内部处理）
+    dataset = KronosDataset(data, indices, config, mode='train')
 
-    # 抽样
-    rng = np.random.RandomState(seed)
-    n_samples = int(len(normalized_data) * sample_ratio)
-    sampled = rng.choice(normalized_data, n_samples, replace=False)
+    # 3. 微调循环
+    optimizer = torch.optim.AdamW(tokenizer.parameters(), lr=learning_rate, weight_decay=0.1)
+    for epoch in range(epochs):
+        for batch_x, _, _ in loader:
+            zs, bsq_loss, _, _ = tokenizer(batch_x)
+            z_pre, z = zs
+            recon_loss = F.mse_loss(z_pre, batch_x) + F.mse_loss(z, batch_x)
+            loss = (recon_loss + bsq_loss) / 2
+            optimizer.zero_grad()
+            loss.backward()
+            optimizer.step()
 
-    # 训练 tokenizer
-    tokenizer = KronosTokenizer.train(
-        data=sampled,
-        vocab_size=vocab_size,
-        max_length=lookback + predict
-    )
-
-    # 保存
+    # 4. 保存（架构=预训练，权重=微调后）
     output_path = f"outputs/tokenizers/{norm_mode}/{model_type}"
     tokenizer.save_pretrained(output_path)
 
-    # 记录 fingerprint
+    # 5. 记录元数据（vocab_size 来自预训练架构，非微调参数）
     meta = {
         'norm_mode': norm_mode,
         'model_type': model_type,
-        'vocab_size': vocab_size,
-        'data_fingerprint': compute_fingerprint(raw_data_path),
-        'sample_ratio': sample_ratio,
+        'pretrained_base': pretrained_map[model_type],  # 基础架构来源
+        'data_fingerprint': compute_fingerprint(data_path),
+        'learning_rate': learning_rate,
+        'epochs': epochs,
     }
     with open(f"{output_path}/meta.json", 'w') as f:
         json.dump(meta, f, indent=2)
@@ -327,12 +353,53 @@ def train_tokenizer(
 python finetune/tokenizer/train.py \
     --norm-mode sliding_ma60 \
     --model mini \
-    --sample-ratio 0.1
+    --epochs 30
 ```
 
-（默认使用 `data/kline_daily_raw.pkl`）
+（数据来自 `finetune/data/processed/{norm_mode}/...`，已按 norm_mode 预处理）
 
-**执行计划位置**: Phase 2 新增 tokenizer 训练模块，确保 Phase 4 训练 predictor 时有对应 tokenizer。
+#### 1.5.3 路径键控含义（澄清）
+
+`outputs/tokenizers/{norm_mode}/{model_type}/` 的含义：
+- `{model_type}` 决定**架构**（2k vs base，mini/small/base 三选其基础）；
+- `{norm_mode}` 标记**该 tokenizer 是用哪种归一化分布的数据微调的**。
+
+即同一 model_type 下，不同 norm_mode 的 tokenizer **架构相同、权重不同**（因微调数据分布不同）。predictor 训练时必须加载与自身 norm_mode + model_type 都匹配的 tokenizer（架构匹配 + 分布匹配）。
+
+#### 1.5.4 一致性校验
+
+训练 predictor 前必须验证：
+
+```python
+def validate_tokenizer_consistency(tokenizer_meta, predictor_config):
+    """验证 tokenizer 和 predictor 数据/架构一致性"""
+    # 架构匹配：model_type 决定 tokenizer 基础架构
+    assert tokenizer_meta['model_type'] == predictor_config.model_type, \
+        f"tokenizer model_type {tokenizer_meta['model_type']} != predictor {predictor_config.model_type}"
+    # 分布匹配：tokenizer 微调时的 norm_mode 必须与 predictor 训练 norm_mode 一致
+    assert tokenizer_meta['norm_mode'] == predictor_config.norm_mode, \
+        f"tokenizer norm_mode {tokenizer_meta['norm_mode']} != predictor {predictor_config.norm_mode}"
+    print("Tokenizer consistency check passed")
+```
+
+checkpoint 必须记录 tokenizer 信息：
+```json
+{
+  "data": {
+    "norm_mode": "sliding_ma60",
+    "data_fingerprint": "sha256:..."
+  },
+  "tokenizer": {
+    "path": "outputs/tokenizers/sliding_ma60/mini",
+    "pretrained_base": "pretrained/Kronos-Tokenizer-2k",
+    "data_fingerprint": "sha256:..."
+  }
+}
+```
+
+#### 1.5.5 执行计划位置
+
+Phase 2 新增 `finetune/tokenizer/train.py` 微调入口，确保 Phase 4 训练 predictor 时有「架构匹配 + 分布匹配」的 tokenizer。微调而非从零训练，故无需大规模数据/长训练，epochs≈30 即可（参考 `deprecated/finetune/train_tokenizer.py`）。
 
 ---
 

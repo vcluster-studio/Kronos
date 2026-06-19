@@ -854,3 +854,262 @@ eval.py 单卡 IC 聚合用本地 `np.mean/np.std/p50`，未调用 `core/metrics
 
 **不改变 v7 的执行批准**：方案层面已批准，本节为代码预审，问题在实现层，需在代码修补阶段解决 P1/P2 后再做正式验收。
 
+---
+
+## 二十、全面代码评审（v9，代码修补后）
+
+**评审日期**: 2026-06-19
+**评审范围**: `core/` 全部 9 模块 + train/eval/backtest/preprocess.py
+**评审方法**: 逐文件通读 + DDP 集体操作对称性逐个核查 + 归一化/splitting 泄露防线核实；agent 初筛后由评审人亲自核实关键指控，剔除误报。
+
+> 注：§19 预审后代码已修补——train.py 的 early stopping break（改 broadcast 同步）、DDP forward（改 `model(...)`）、naive DA（改真实 up_ratio 计算）均已修复。本节反映修补后现状。
+
+### 20.1 致命问题（🔴，阻断多卡训练）
+
+#### F1. `train.py:357-358` naive DA 的 all_gather 在 `if rank == 0:` 块内 → NCCL 死锁
+
+**证据**:
+```python
+# 行 338
+if world_size > 1:
+    ic_result = aggregate_ic(...)   # 行 339 所有 rank 执行 ✅
+    da_result = aggregate_da(...)   # 行 340 所有 rank 执行 ✅
+    naive_da_by_step = {}           # 行 343
+    if rank == 0:                   # 行 344 ← 只有 rank 0 进
+        for step_idx in range(config.predict):
+            ...
+            dist.all_gather(gathered_up, up_count_tensor)   # 行 357 ← 仅 rank 0
+            dist.all_gather(gathered_n, n_tensor)           # 行 358 ← 仅 rank 0
+```
+
+**后果**: 修 naive DA 时把 all_gather 放进了 `if rank == 0:` 块。rank 0 在行 357 等待所有 rank 参与 all_gather，但 rank 1/2/3 不进该块、已 return 出函数 → rank 0 永久阻塞 → **NCCL 超时**。与刚修的 early stopping 死锁同类（集体操作在 rank 条件分支内）。
+
+**修复**: all_gather 必须所有 rank 执行，只 rank 0 处理结果（仿 `aggregate_ic` 模式）：
+```python
+# 所有 rank 执行 all_gather
+for step_idx in range(config.predict):
+    ...  # 准备 tensor
+    dist.all_gather(gathered_up, up_count_tensor)   # 所有 rank
+    dist.all_gather(gathered_n, n_tensor)           # 所有 rank
+    if rank == 0:                                    # 只 rank 0 组装
+        naive_da_by_step[step_idx] = ...
+```
+
+#### F2. `train.py:519` validation loss 未实现，直接用 train loss
+
+**证据**: `avg_val_loss = avg_train_loss  # TODO: 实现 validation loss 计算`
+
+**后果**: `best_val_loss` 驱动的 `best_model` checkpoint 选择基于训练 loss（非验证 loss）→ best_model 是训练集拟合最好的，过拟合风险；early stopping 的 val_loss 改进途径实际是 train loss 改进，语义错位。
+
+**修复**: 实现真实 validation loss（在 val 集前向算 recon_loss，不反传）。
+
+#### F3. `train.py:786` val_indices 每股只取最后 1 个窗口 → val 集过小
+
+**证据**:
+```python
+# 行 784-789（val_indices 构建）
+elif hasattr(d, 'columns'):
+    if len(d) >= config.lookback + config.predict:
+        val_indices.append((symbol, len(d) - config.lookback - config.predict))  # 每股 1 个
+```
+
+**后果**: 每只股票 val 只评估最后 1 个窗口。若 5000 股则 val 仅 5000 样本，但 IC 统计需足够样本且跨股票分布；且只评最后窗口 = 只评最近时点，IC 不稳、不代表整体泛化。
+
+**修复**: val 应评该股票所有合法窗口（或按 preprocess 已切好的 val split 取，而非 main 里重新只取末尾）。
+
+### 20.2 重要问题（🟡）
+
+#### I1. `dataset.py:92-94` + `train.py:801` + `utils.py set_seed` 三者叠加 → DDP 各卡数据相同
+
+**证据**:
+- `dataset.py:92`: `if self.mode=='train': rand_idx = self.py_rng.randint(0, len); symbol, start = self.indices[rand_idx]` —— __getitem__ 忽略 DataLoader 传入的 idx，自己用 `self.py_rng` 随机采样。
+- `dataset.py:71`: `self.py_rng = np.random.RandomState(config.seed)` —— 所有 rank 同 seed。
+- `utils.py set_seed`: 所有 rank 同 seed。
+
+**后果**: DDP 各 rank 的 KronosDataset 用相同 seed → 每个 step 采到相同 (symbol, start) → 各卡训练数据完全相同 → DDP 数据并行失效（退化为梯度平均的同数据多卡）。加上 `__getitem__` 忽略 idx，DataLoader 的 RandomSampler 形同虚设。
+
+**修复**: (a) __getitem__ 应尊重传入 idx（用 DataLoader 的 sampler 控制顺序），不要自随机；(b) DDP 应用 `DistributedSampler` 或各 rank seed = config.seed + rank。
+
+#### I2. `normalization.py:112` SlidingMANormalizer 无 `shift(1)`，与旧 `dataset.py:183` 不一致
+
+**证据**:
+- 旧 `dataset.py:183`: `df_shifted = df.shift(1); rolling_mean = df_shifted.rolling(...).mean()` —— 排除当前点。
+- 新 `normalization.py:112`: `s.rolling(window, min_periods=1).mean()` —— **包含当前点**。
+
+**后果**: 旧实现"每个点用之前 N 步"（不含自身），新实现"用含自身的 N 步"。这不是未来泄露（rolling 是因果的，不含未来），但：(a) 与旧实现不一致 → Phase 4 等价性验证（与旧入口对齐）必失败；(b) 归一化当前点时用了当前点自身，归一化值"知道"当前水平，轻微降低预测难度。方案 §1.2 只承诺 min_periods=1 对齐，未提 shift(1)，但 feedback 强调"新旧数据输出一致"。
+
+**修复**: 明确选择——若要与旧实现完全对齐，加 `shift(1)`；若刻意改为含当前点，需在方案说明并放弃 Phase 4 的"与旧入口对齐"基准（改为新口径自洽）。
+
+#### I3. `eval.py` 完全无 DDP 支持，方案 §6.2 承诺未落地
+
+**证据**: `eval.py:348 device = get_device()`（无 local_rank），main() 无 `init_process_group`，evaluate 函数无 world_size/rank 参数。IC/DA 聚合用本地 `np.mean`（行 263-297）——单进程下正确，但无法 `torchrun` 多卡。
+
+**后果**: 方案 §6.2 宣称 eval 支持 `torchrun --nproc_per_node=N`，实际未实现。R6 残留。评估全量慢。
+
+**修复**: 若保留 DDP 评估承诺，eval.py 需加 DDP 初始化 + 用 `aggregate_ic`（含 all_gather）；若放弃，修正方案 §6.2 措辞。
+
+#### I4. `backtest.py:249` excess_da 硬编码 0.5，与 train.py 不一致
+
+**证据**: `result['excess_da'] = excess_da(model_da, 0.5)` —— 而 train.py 已改为真实 `max(up_ratio, 1-up_ratio)`。
+
+**后果**: train 与 backtest 的 excess DA 口径不一致；backtest 的 excess DA 仍是平移非真 baseline。
+
+**修复**: backtest 也算真实 naive DA。
+
+#### I5. `backtest.py:236-243` IC 聚合丢 p25/p75
+
+**证据**: 只算 mean/std/p50，无 p25/p75。
+
+**后果**: 违反 §1.6.3"聚合保留 mean/std/p25/p50/p75"。无法判断 backtest IC 稳健性。
+
+**修复**: 补 p25/p75。
+
+#### I6. `splitting.py:132` create_target_blocks 跨块窗口被丢弃
+
+**证据**: `if s.target_start >= current_block_start and s.target_end <= current_block_end:` —— 要求 target 完全在块内。target 跨块边界（block_size=50, predict=10 时常见）的窗口被丢弃。
+
+**后果**: 样本丢失（非泄露），数据利用率下降，块间 target 时间轴出现空洞。
+
+**修复**: 跨块窗口按 target_start 归入起始块（或 target 中点归入对应块），保证不丢样本且块间不相交。
+
+#### I7. `splitting.py:70-78` time_split 跨边界样本强分到 train → validate_no_leakage 崩溃
+
+**证据**: 行 57 `if s.target_end <= train_end: train`；跨边界样本（target_start<train_end<target_end）落 else 行 70 分到 train，其 target 跨入 val 区间。
+
+**后果**: validate_no_leakage 扫描线会检测到 train/val target 相交 → AssertionError 中止 preprocess（非静默泄露，但 preprocess 会崩）。
+
+**修复**: time_split 应丢弃跨 split 边界的样本，而非强分。
+
+#### I8. `train.py:740-743` tokenizer 静默 fallback，norm_mode 不匹配风险
+
+**证据**:
+```python
+tokenizer_path = get_tokenizer_path(config.norm_mode, train_config.model_type)
+if not os.path.exists(tokenizer_path):
+    tokenizer_path = 'outputs/tokenizers/final/2k-MA60' if args.model == 'mini' else '...'
+```
+
+**后果**: 新路径体系（`outputs/tokenizers/{norm_mode}/{model_type}`）不存在 → 总是 fallback 到 legacy tokenizer。legacy tokenizer 的 norm_mode 可能与 config 不匹配，违反 tokenizer-predictor 数据一致性（§1.5）。且静默 fallback 无警告。
+
+**修复**: R3 tokenizer 训练入口落地前，明确 fallback 规则并警告 norm_mode 不匹配；或修复 R3。
+
+#### I9. `train.py` 无 `--resume` 断点续训
+
+**证据**: CLI 无 --resume，model 直接 `Kronos.from_pretrained(pretrained)` 不加载 checkpoint。旧 `train_ddp.py` 有 --resume。
+
+**后果**: 训练中断无法续训，长训练风险。
+
+**修复**: 加 --resume 加载 latest checkpoint + optimizer/scheduler 状态。
+
+### 20.3 次要问题（⚪）
+
+| # | 位置 | 问题 |
+|---|------|------|
+| M1 | `metrics.py:204-240` `compute_naive_da` | 仍 `return 0.5`（train.py 绕过它自算，但该函数是死代码/误导，且 backtest 仍可能误用） |
+| M2 | `train.py:156` `update_training_info` | `safe_save_json.__wrapped__` 逻辑混乱，每次重读全 json 再写，频繁 IO |
+| M3 | `train.py:530` | `seed=config.seed + epoch_idx*9999` 但 `n_samples=-1` 全量，seed 无效 |
+| M4 | `train.py:537` | `da_by_step` 把聚合后标量包成单元素列表传 `calculate_da_score`，语义变形（设计是接原始 DA 列表） |
+| M5 | `splitting.py:141-147` | create_target_blocks 块间 assert O(块数²)，块数多时慢；可改扫描线 |
+| M6 | `utils.py safe_save_*` | 非原子写入，训练中 crash 可能损坏 training_info.json |
+| M7 | `dataset.py:92` | __getitem__ 忽略 idx 自随机，破坏 DataLoader sampler 语义（与 I1 同源） |
+
+### 20.4 agent 误报澄清（避免开发人员走弯路）
+
+| agent 指控 | 实际 | 结论 |
+|-----------|------|------|
+| `metrics.py aggregate_ic` padding 零值污染统计 | 重组时 `for i in range(lengths[rank_idx])` 只取有效长度，padding 零不入统计 | ❌ 误报 |
+| `calculate_combined_score` (ic+1)/2 丢失负相关 | 负 IC → 较低分（被惩罚），是合理归一化 | ❌ 误报（设计选择） |
+| `sigmoid_score` overflow | float64 上限 ~1e308，steepness=21 实际不溢出 | ❌ 误报 |
+| `normalization.py` 未来泄露 | rolling 是因果的（不含未来）；真实问题是 shift(1) 缺失（I2） | ⚠️ 定性过重，问题真实但非"未来泄露" |
+| `validate_no_leakage` O(n²) | 实为扫描线 O(N log N)；O(n²) 是 create_target_blocks 块间 assert（M5） | ❌ 误报（张冠李戴） |
+| `splitting.py:70` feature leakage | 实为 target 跨 split，被 no-leakage 拦截崩溃（I7），非静默泄露 | ⚠️ 现象真实，定性不准 |
+
+### 20.5 已正确落实（肯定）
+
+- train/eval/backtest 共用 `core/metrics`，无直接 corrcoef/spearmanr
+- traj IC 全走 `detrend_to_baseline` → `safe_trajectory_ic`（train.py:313、eval.py:227）
+- backtest IC 逐股票算再聚合（backtest.py:200）
+- checkpoint 选择用去趋势 IC
+- early stopping break 用 `dist.broadcast` 同步所有 rank（已修）
+- DDP forward 用 `model(...)`（已修）
+- naive DA 真实计算 `max(up_ratio, 1-up_ratio)`（train.py:365，已修；eval.py:303）
+- validate_no_leakage 扫描线区间语义正确
+- R1/R2/R7/R11/S2/min_samples/LR=0.01 落地
+- aggregate_ic/aggregate_da 的 all_gather 对称（行 339-340）
+
+### 20.6 修复优先级
+
+1. **F1**（all_gather 死锁）——多卡训练直接卡死，必须最先修。
+2. **I1**（DDP 各卡数据相同）——多卡训练正确性，与 F1 同优先级。
+3. **F2/F3**（val_loss 未实现 / val 集过小）——训练有效性，单卡也受影响。
+4. **I2**（shift(1)）——决定 Phase 4 等价性能否通过，需先定口径。
+5. **I3-I9**——评估回测完整性与一致性。
+6. **M1-M7**——代码质量。
+
+### 20.7 评审结论
+
+代码主体架构正确，方案硬约束大部分落实，DDP early stopping/forward/naive DA 已修补。**但 F1（naive DA all_gather 死锁）是修补时新引入的致命 bug，会使多卡训练在评估阶段卡死**——这是当前最紧迫的修复项。I1（DDP 数据同质）次之，使多卡训练即使不卡死也退化为同数据多卡。
+
+**单卡训练**受 F2/F3（val 失效）影响，best_model 选择失真，但不崩溃。
+
+**建议**: 修 F1 + I1 + F2/F3 后，多卡与单卡训练才可进入正式验收。I2 需先与方案对齐口径再修。
+
+---
+
+## 二十一、Tokenizer 训练方案纠正（v10）
+
+**纠正日期**: 2026-06-19
+**触发**: 用户指出 §1.5 tokenizer 训练方案有误，「没有理解这个项目关于 tokenizer 的设计」。并补充确认：「不同的 norm_mode 影响 tokenizer 模型，所以需要微调」。
+
+### 21.1 核实项目 tokenizer 真实设计
+
+核实对象：`model/kronos.py`（KronosTokenizer 类）、`deprecated/finetune/train_tokenizer.py`、`final_models/training_scripts/train_tokenizer_mini.py`、`pretrained/`、`outputs/tokenizers/`。
+
+**核实结论**：
+
+1. **`KronosTokenizer` 无 `.train()` 类方法**（`grep "def train"` kronos.py 无结果）。只有 `from_pretrained`（继承 `PyTorchModelHubMixin`，kronos.py:13）。训练是「加载预训练 → 标准训练循环微调 → save_pretrained」。
+2. **预训练 tokenizer 只有两个**：`pretrained/Kronos-Tokenizer-2k`（mini 用，group_size=5，2048 context）和 `pretrained/Kronos-Tokenizer-base`（small/base 用，group_size=4，512 context）。
+3. **微调损失**：`recon_loss = mse(z_pre,x)+mse(z,x)` + `bsq_loss`（deprecated train_tokenizer.py:194-195）。权重微调，非重新学码本。
+4. **group_size/context 是架构超参**（kronos.py:40 `__init__` 参数），预训练定死，微调不改。
+5. **norm_mode 影响微调数据分布**（QlibDataset 按 norm_mode 归一化后喂 tokenizer），故不同 norm_mode 需各自微调——与用户补充一致。
+
+### 21.2 早期 §1.5 的三处错误（已纠正）
+
+| 错误 | 实际 | 严重性 |
+|------|------|--------|
+| 写 `KronosTokenizer.train(data=, vocab_size=)` 从零训练 | 该 API 不存在；实际 `from_pretrained` + 微调循环 | 🔴 致命（按此实现会直接报错） |
+| `vocab_map={mini:2048, small:4096, base:8192}` | 杜撰映射；实际 mini→2k，small/base 共用 base tokenizer，无 small=4096 | 🔴 致命（误导架构选择） |
+| 「每个 norm_mode 单独训练 tokenizer」表述 | 把「按 norm_mode 微调」误解为「按 norm_mode 从零建架构」；实际是同架构、不同权重微调 | 🟡 表述误导 |
+
+### 21.3 纠正后的设计要点（已写入方案 §1.5.1-1.5.5）
+
+- tokenizer 是**微调**（from_pretrained + 权重训练），非从零训练；
+- **架构由 model_type 决定**（mini→2k，small/base→base），架构耦合 predictor token 维度；
+- **vocab_size 不是微调参数**，预训练时定；
+- **norm_mode 决定微调数据分布**，不同 norm_mode 必须各自微调、不可复用（响应用户补充）；
+- 路径 `outputs/tokenizers/{norm_mode}/{model_type}/` 含义：model_type 决定架构，norm_mode 标记微调分布；同 model_type 不同 norm_mode 架构相同、权重不同。
+
+### 21.4 代码层遗留错误（供开发人员修）
+
+方案已纠正，但代码中仍有杜撰的 vocab 映射残留：
+
+1. **`train.py:87-91` `TOKENIZER_PATHS`**：
+   ```python
+   TOKENIZER_PATHS = {
+       'mini': {'vocab': 2048},
+       'small': {'vocab': 4096},   # ← 杜撰
+       'base': {'vocab': 8192},    # ← 杜撰
+   }
+   ```
+   该常量实际未被使用（行 740 用 `get_tokenizer_path`），是死代码，但误导。**建议删除或改为架构映射**：`{'mini':'Kronos-Tokenizer-2k', 'small':'Kronos-Tokenizer-base', 'base':'Kronos-Tokenizer-base'}`。
+
+2. **`config.py:143` docstring**：「vocab_size 映射：mini→2048, small→4096, base→8192」——同样错误。**建议改为**：「架构映射：mini→Kronos-Tokenizer-2k，small/base→Kronos-Tokenizer-base」。
+
+3. **`train.py:743` fallback** `'outputs/tokenizers/final/2k-MA60' if mini else '...base-MA60'`——2k/base 区分正确（与架构一致），但 `final/` 是旧路径。**建议**：R3（tokenizer 微调入口）落地后，fallback 改为新路径或直接报错而非静默 fallback（见 §20 I8）。
+
+### 21.5 待办
+
+- **R3 落地**：`finetune/tokenizer/train.py` 仍为空目录。按纠正后的 §1.5.2 实现微调入口（from_pretrained + 微调循环，非从零训练）。
+- 修代码层 vocab 映射残留（§21.4）。
+- Phase 2 执行时按 §1.5.2 实现，vocab_size 不作为参数。
+

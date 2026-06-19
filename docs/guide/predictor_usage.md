@@ -77,38 +77,53 @@ finetune/data/processed/{norm_mode}/lb{lookback}_pd{predict}/{split_mode}/
 
 ---
 
-## 2. Tokenizer 训练
+## 2. Tokenizer 微调
 
-每个 norm_mode 需单独训练 tokenizer（归一化后分布不同）。
+KronosTokenizer 是预训练的 VQ-VAE quantizer，**按 norm_mode 微调**（非从零训练）。
+
+### 2.1 设计要点
+
+- 架构由 model_type 决定：mini→Kronos-Tokenizer-2k，small/base→Kronos-Tokenizer-base
+- vocab_size 由预训练架构固定，不是微调参数
+- 不同 norm_mode 数据分布不同，必须各自微调
+- 微调损失：`recon_loss + bsq_loss`
+
+### 2.2 微调命令
 
 ```bash
-# mini vocab_size=2048
+# 按 norm_mode 微调 tokenizer
 python finetune/tokenizer/train.py \
     --norm-mode sliding_ma60 \
     --model mini \
-    --sample-ratio 0.1
+    --epochs 30 \
+    --batch-size 16 \
+    --lr 0.001
 
-# small vocab_size=4096
+# sliding_ma120 微调
 python finetune/tokenizer/train.py \
-    --norm-mode sliding_ma60 \
-    --model small \
-    --sample-ratio 0.1
-
-# base vocab_size=8192
-python finetune/tokenizer/train.py \
-    --norm-mode sliding_ma60 \
-    --model base \
-    --sample-ratio 0.1
+    --norm-mode sliding_ma120 \
+    --model mini \
+    --epochs 30
 ```
 
-**输出路径**：
+### 2.3 输出路径
+
 ```
 outputs/tokenizers/{norm_mode}/{model_type}/
-├── vocab.json
-├── tokenizer_config.json
-├── merges.txt
-└── meta.json       # 记录 fingerprint、vocab_size 等
+├── model.safetensors       # 微调后的权重
+├── config.json             # 架构配置（来自预训练）
+└── meta.json               # norm_mode、pretrained_base、fingerprint
 ```
+
+### 2.4 模型-tokenizer 配对
+
+| 模型 | 预训练 Tokenizer | 架构参数 |
+|------|-----------------|---------|
+| mini | Kronos-Tokenizer-2k | group_size=5, context=2048 |
+| small | Kronos-Tokenizer-base | group_size=4, context=512 |
+| base | Kronos-Tokenizer-base | group_size=4, context=512 |
+
+**注意**：tokenizer 与 predictor 必须同 norm_mode，否则编码失真。
 
 ---
 
@@ -286,11 +301,11 @@ python finetune/predictor/preprocess.py \
     --split-mode block \
     --validate
 
-echo "=== Step 2: Train Tokenizer ==="
+echo "=== Step 2: Fine-tune Tokenizer ==="
 python finetune/tokenizer/train.py \
     --norm-mode $NORM_MODE \
     --model $MODEL \
-    --sample-ratio 0.1
+    --epochs 30
 
 echo "=== Step 3: Train Predictor ==="
 python finetune/predictor/train.py \
@@ -302,7 +317,7 @@ python finetune/predictor/train.py \
     --epochs $EPOCHS \
     --lr 0.01
 
-echo "=== Step 4: Evaluate ==="
+echo "=== Step 3: Evaluate ==="
 python finetune/predictor/eval.py \
     --norm-mode $NORM_MODE \
     --lookback $LOOKBACK \
@@ -348,14 +363,15 @@ finetune/
 │       ├── splitting.py          # 数据分割
 │       └ schema.py               # 数据结构
 │       └ utils.py                # 工具函数
-└── tokenizer/
-    └ train.py                    # Tokenizer 训练
 
 outputs/
 ├── tokenizers/
-│   └── {norm_mode}/{model_type}/
+│   └── {norm_mode}/{model_type}/    # 按 norm_mode 微调后的 tokenizer
+│       ├── model.safetensors
+│       ├── config.json
+│       └── meta.json
 └── models/
-    └ └── {norm_mode}/lb{lookback}_pd{predict}/{split_mode}/{model_type}/
+    └── {norm_mode}/lb{lookback}_pd{predict}/{split_mode}/{model_type}/
         ├── checkpoints/
         │   ├── latest_model/
         │   ├── best_ic_model/

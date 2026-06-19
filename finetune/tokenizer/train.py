@@ -1,15 +1,18 @@
 """
-Kronos Tokenizer Training Entry
+Kronos Tokenizer Fine-tuning Entry
 
-每个 norm_mode 需单独训练 tokenizer（归一化后分布不同）。
+微调 tokenizer（非从零训练）
+
+关键：
+- 加载预训练 tokenizer（架构由 model_type 决定）
+- 按 norm_mode 归一化的数据微调权重
+- 保存到 outputs/tokenizers/{norm_mode}/{model_type}/
 
 使用：
     python finetune/tokenizer/train.py \
         --norm-mode sliding_ma60 \
         --model mini \
-        --sample-ratio 0.1
-
-默认使用 finetune/data/raw/kline_daily_raw.pkl
+        --epochs 30
 """
 
 import os
@@ -19,172 +22,260 @@ import pickle
 import json
 import numpy as np
 from datetime import datetime
+import torch
+import torch.nn.functional as F
+from torch.utils.data import DataLoader, RandomSampler
 
 script_dir = os.path.dirname(os.path.abspath(__file__))
 project_root = os.path.dirname(os.path.dirname(script_dir))
 sys.path.insert(0, project_root)
 
 from model.kronos import KronosTokenizer
+from finetune.predictor.core.config import DataConfig
 from finetune.predictor.core.paths import (
     get_raw_path,
+    get_split_data_path,
     get_tokenizer_path,
     ensure_dir,
+    PROJECT_ROOT,
 )
-from finetune.predictor.core.normalization import get_normalizer, NormalizerFactory
+from finetune.predictor.core.dataset import KronosDataset
 from finetune.predictor.core.schema import compute_fingerprint
-from finetune.predictor.core.utils import safe_save_json
+from finetune.predictor.core.utils import safe_save_json, get_device, set_seed
 
 
-# vocab_size 映射
-VOCAB_SIZE_MAP = {
-    'mini': 2048,
-    'small': 4096,
-    'base': 8192,
+# 预训练 tokenizer 映射（架构由 model_type 决定）
+PRETRAINED_MAP = {
+    'mini': 'pretrained/Kronos-Tokenizer-2k',
+    'small': 'pretrained/Kronos-Tokenizer-base',
+    'base': 'pretrained/Kronos-Tokenizer-base',
 }
 
 
-def train_tokenizer(
+def finetune_tokenizer(
     norm_mode: str,
     model_type: str,
-    raw_data_path: str = None,
+    data_path: str = None,
+    epochs: int = 30,
+    batch_size: int = 16,
+    learning_rate: float = 0.001,
+    weight_decay: float = 0.1,
+    seed: int = 42,
     lookback: int = 400,
     predict: int = 10,
-    sample_ratio: float = 0.1,
-    seed: int = 42
+    split_mode: str = 'block',
 ):
     """
-    训练 tokenizer
+    微调 tokenizer（非从零训练）
 
     步骤：
-    1. 加载原始数据
-    2. 按 norm_mode 归一化
-    3. 抽样训练数据
-    4. 训练 tokenizer
-    5. 保存到 outputs/tokenizers/{norm_mode}/{model_type}/
+    1. 按 model_type 选预训练 tokenizer
+    2. 加载数据（已按 norm_mode 预处理）
+    3. 微调循环：recon_loss + bsq_loss
+    4. 保存到 outputs/tokenizers/{norm_mode}/{model_type}/
 
     Args:
-        norm_mode: 归一化模式（full_window/sliding_ma{N}）
-        model_type: 模型类型（mini/small/base）→ vocab_size 不同
-        raw_data_path: 原始数据路径（默认 kline_daily_raw.pkl）
-        lookback: 回看窗口长度
-        predict: 预测步数
-        sample_ratio: 抽样比例（默认 10%）
+        norm_mode: 归一化模式（决定数据分布）
+        model_type: 模型类型（决定架构）
+        data_path: 训练数据路径（默认使用预处理后的 train.pkl）
+        epochs: 微调轮数
+        batch_size: 批大小
+        learning_rate: 学习率
+        weight_decay: 权重衰减
         seed: 随机种子
+        lookback: 回看窗口
+        predict: 预测步数
+        split_mode: 分割模式
     """
-    if raw_data_path is None:
-        raw_data_path = get_raw_path()
+    set_seed(seed)
+    device = get_device()
 
-    vocab_size = VOCAB_SIZE_MAP[model_type]
+    # 数据路径
+    if data_path is None:
+        data_path = get_split_data_path(
+            norm_mode, lookback, predict, split_mode, 'train'
+        )
+
+    pretrained_path = os.path.join(PROJECT_ROOT, PRETRAINED_MAP[model_type])
+    output_path = get_tokenizer_path(norm_mode, model_type)
 
     print("=" * 60)
-    print("Kronos Tokenizer Training")
+    print("Kronos Tokenizer Fine-tuning")
     print("=" * 60)
     print(f"norm_mode: {norm_mode}")
     print(f"model_type: {model_type}")
-    print(f"vocab_size: {vocab_size}")
-    print(f"raw_data: {raw_data_path}")
-    print(f"sample_ratio: {sample_ratio}")
+    print(f"pretrained: {PRETRAINED_MAP[model_type]}")
+    print(f"data_path: {data_path}")
+    print(f"output_path: {output_path}")
+    print(f"epochs: {epochs}")
+    print(f"batch_size: {batch_size}")
+    print(f"learning_rate: {learning_rate}")
     print("=" * 60)
 
-    # 1. 加载原始数据
-    print("\n[1] Loading raw data...")
-    with open(raw_data_path, 'rb') as f:
-        raw_data = pickle.load(f)
-    print(f"Loaded {len(raw_data)} symbols")
+    # 1. 加载预训练 tokenizer（架构由 model_type 决定）
+    print("\n[1] Loading pretrained tokenizer...")
+    tokenizer = KronosTokenizer.from_pretrained(pretrained_path)
+    tokenizer.to(device)
+    tokenizer.train()  # 设置为训练模式
+    print(f"Tokenizer loaded from: {pretrained_path}")
 
-    # 2. 获取归一化器
-    normalizer = get_normalizer(norm_mode)
+    # 2. 加载数据（已按 norm_mode 预处理）
+    print("\n[2] Loading data...")
+    with open(data_path, 'rb') as f:
+        train_data = pickle.load(f)
+    print(f"Loaded {len(train_data)} stocks")
 
-    # 3. 收集并归一化数据
-    print("\n[2] Normalizing data...")
-    all_normalized = []
+    # 构建索引
+    indices = []
+    for symbol, d in train_data.items():
+        if 'windows' in d:
+            for w in d['windows']:
+                indices.append((symbol, int(w)))
 
-    for symbol, data in raw_data.items():
-        # 检测数据格式
-        if hasattr(data, 'columns'):
-            # DataFrame 格式
-            values = data.values.astype(np.float32)
-        else:
-            # dict 格式
-            values = np.asarray(data.get('values', data.get('original')), dtype=np.float32)
+    print(f"Total windows: {len(indices)}")
 
-        if len(values) < lookback + predict:
-            continue
-
-        # 归一化
-        normalized, _, _ = normalizer.normalize(values)
-        all_normalized.append(normalized)
-
-    print(f"Collected {len(all_normalized)} normalized sequences")
-
-    # 4. 抽样
-    print("\n[3] Sampling training data...")
-    rng = np.random.RandomState(seed)
-    n_samples = int(len(all_normalized) * sample_ratio)
-    if n_samples < 100:
-        n_samples = min(100, len(all_normalized))
-    sampled_indices = rng.choice(len(all_normalized), size=n_samples, replace=False)
-    sampled_data = [all_normalized[i] for i in sampled_indices]
-    print(f"Sampled {n_samples} sequences for tokenizer training")
-
-    # 5. 训练 tokenizer
-    print("\n[4] Training tokenizer...")
-    tokenizer = KronosTokenizer.train(
-        data=sampled_data,
-        vocab_size=vocab_size,
-        max_length=lookback + predict,
+    # 创建数据集
+    config = DataConfig(
+        norm_mode=norm_mode,
+        lookback=lookback,
+        predict=predict,
+        split_mode=split_mode,
     )
-    print(f"Tokenizer trained with vocab_size={tokenizer.vocab_size}")
 
-    # 6. 保存
-    print("\n[5] Saving tokenizer...")
-    output_path = get_tokenizer_path(norm_mode, model_type)
+    # 3. 微调循环
+    print("\n[3] Fine-tuning...")
+    optimizer = torch.optim.AdamW(
+        tokenizer.parameters(),
+        lr=learning_rate,
+        weight_decay=weight_decay
+    )
+
+    # 使用简单的数据加载方式
+    sampler = RandomSampler(indices)
+    loader = DataLoader(
+        [(indices[i], train_data) for i in range(len(indices))],
+        batch_size=batch_size,
+        sampler=sampler,
+        collate_fn=lambda batch: prepare_batch(batch, config, device),
+        num_workers=0,
+    )
+
+    for epoch_idx in range(epochs):
+        epoch_losses = []
+        recon_losses = []
+        bsq_losses = []
+
+        for batch_x in loader:
+            # Forward
+            zs, bsq_loss, _, _ = tokenizer(batch_x)
+            z_pre, z = zs
+
+            # 计算重建损失
+            recon_loss = F.mse_loss(z_pre, batch_x) + F.mse_loss(z, batch_x)
+
+            # 总损失
+            loss = (recon_loss + bsq_loss) / 2
+
+            # Backward
+            optimizer.zero_grad()
+            loss.backward()
+            optimizer.step()
+
+            epoch_losses.append(loss.item())
+            recon_losses.append(recon_loss.item())
+            bsq_losses.append(bsq_loss.item())
+
+        avg_loss = np.mean(epoch_losses)
+        avg_recon = np.mean(recon_losses)
+        avg_bsq = np.mean(bsq_losses)
+
+        print(f"Epoch {epoch_idx+1}/{epochs}: loss={avg_loss:.4f}, recon={avg_recon:.4f}, bsq={avg_bsq:.4f}")
+
+    # 4. 保存微调后的 tokenizer
+    print("\n[4] Saving tokenizer...")
     ensure_dir(output_path)
     tokenizer.save_pretrained(output_path)
+    print(f"Tokenizer saved to: {output_path}")
 
-    # 7. 保存元数据
+    # 5. 记录元数据
     meta = {
         'norm_mode': norm_mode,
         'model_type': model_type,
-        'vocab_size': vocab_size,
-        'lookback': lookback,
-        'predict': predict,
-        'sample_ratio': sample_ratio,
-        'n_samples': n_samples,
-        'data_fingerprint': compute_fingerprint(raw_data_path),
+        'pretrained_base': PRETRAINED_MAP[model_type],
+        'data_fingerprint': compute_fingerprint(data_path),
+        'epochs': epochs,
+        'learning_rate': learning_rate,
+        'batch_size': batch_size,
         'created_at': datetime.now().isoformat(),
     }
     safe_save_json(meta, os.path.join(output_path, 'meta.json'))
 
-    print(f"\nTokenizer saved to: {output_path}")
+    print("=" * 60)
+    print("Fine-tuning complete!")
     print("=" * 60)
 
     return tokenizer
 
 
+def prepare_batch(batch, config, device):
+    """
+    准备批次数据
+
+    Args:
+        batch: [(index, data_dict)]
+        config: DataConfig
+        device: torch.device
+
+    Returns:
+        batch_x: (B, lookback, 6) tensor
+    """
+    batch_x = []
+    for (symbol, window_start), data_dict in batch:
+        d = data_dict[symbol]
+        if 'normalized' in d:
+            x_norm = d['normalized'][window_start:window_start + config.lookback]
+        else:
+            x_raw = d['original'][window_start:window_start + config.lookback]
+            x_mean = np.mean(x_raw, axis=0)
+            x_std = np.std(x_raw, axis=0) + 1e-5
+            x_norm = np.clip((x_raw - x_mean) / x_std, -config.clip, config.clip)
+
+        batch_x.append(x_norm.astype(np.float32))
+
+    return torch.from_numpy(np.stack(batch_x)).to(device)
+
+
 def main():
-    parser = argparse.ArgumentParser(description='Kronos Tokenizer Training')
+    parser = argparse.ArgumentParser(description='Kronos Tokenizer Fine-tuning')
     parser.add_argument('--norm-mode', type=str, default='sliding_ma60',
                         choices=['full_window', 'sliding_ma20', 'sliding_ma60', 'sliding_ma120'])
     parser.add_argument('--model', type=str, default='mini',
-                        choices=['mini', 'small', 'base'])
-    parser.add_argument('--raw-data', type=str, default=None,
-                        help='Raw data path (default: kline_daily_raw.pkl)')
+                        choices=['mini', 'small', 'base'],
+                        help='mini→Kronos-Tokenizer-2k, small/base→Kronos-Tokenizer-base')
+    parser.add_argument('--data-path', type=str, default=None,
+                        help='训练数据路径（默认使用预处理后的 train.pkl）')
     parser.add_argument('--lookback', type=int, default=400)
     parser.add_argument('--predict', type=int, default=10)
-    parser.add_argument('--sample-ratio', type=float, default=0.1,
-                        help='Sampling ratio for tokenizer training')
+    parser.add_argument('--split-mode', type=str, default='block')
+    parser.add_argument('--epochs', type=int, default=30)
+    parser.add_argument('--batch-size', type=int, default=16)
+    parser.add_argument('--lr', type=float, default=0.001)
+    parser.add_argument('--weight-decay', type=float, default=0.1)
     parser.add_argument('--seed', type=int, default=42)
     args = parser.parse_args()
 
-    train_tokenizer(
+    finetune_tokenizer(
         norm_mode=args.norm_mode,
         model_type=args.model,
-        raw_data_path=args.raw_data,
+        data_path=args.data_path,
+        epochs=args.epochs,
+        batch_size=args.batch_size,
+        learning_rate=args.lr,
+        weight_decay=args.weight_decay,
+        seed=args.seed,
         lookback=args.lookback,
         predict=args.predict,
-        sample_ratio=args.sample_ratio,
-        seed=args.seed,
+        split_mode=args.split_mode,
     )
 
 
