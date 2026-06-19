@@ -99,6 +99,13 @@ from .utils import (
     verbose_print,
 )
 
+from .dataset import (
+    KronosDataset,
+    KronosWindowedDataset,
+    load_split_data,
+    collate_fn,
+)
+
 
 __all__ = [
     # Config
@@ -181,4 +188,10 @@ __all__ = [
     'cleanup_ddp',
     'debug_print',
     'verbose_print',
+
+    # Dataset
+    'KronosDataset',
+    'KronosWindowedDataset',
+    'load_split_data',
+    'collate_fn',
 ]
