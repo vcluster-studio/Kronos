@@ -112,3 +112,4 @@ deploy_*.tar.gz
 
 # Local scripts (hardcoded paths)
 train.bat
+deprecated/
