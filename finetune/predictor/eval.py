@@ -107,16 +107,25 @@ def load_model_and_tokenizer(
     lookback: int = 400,      # EV1 修复：从 CLI 传入
     predict: int = 10,        # EV1 修复
     split_mode: str = 'block', # EV1 修复
+    custom_tokenizer_path: str = None,
+    custom_checkpoint_path: str = None,
 ):
     """
     加载模型和 tokenizer
 
     EV1 修复：lookback/predict/split_mode 从 CLI 传入，避免硬编码导致数据模型错配
+
+    支持自定义路径：
+    - custom_tokenizer_path: 自定义 tokenizer 路径
+    - custom_checkpoint_path: 自定义 checkpoint 目录路径
     """
-    # Tokenizer
-    tokenizer_path = get_tokenizer_path(norm_mode, model_type)
-    if not os.path.exists(tokenizer_path):
-        tokenizer_path = 'outputs/tokenizers/final/2k-MA60' if model_type == 'mini' else 'outputs/tokenizers/final/base-MA60'
+    # Tokenizer：支持自定义路径
+    if custom_tokenizer_path:
+        tokenizer_path = custom_tokenizer_path
+    else:
+        tokenizer_path = get_tokenizer_path(norm_mode, model_type)
+        if not os.path.exists(tokenizer_path):
+            tokenizer_path = 'outputs/tokenizers/final/2k-MA60' if model_type == 'mini' else 'outputs/tokenizers/final/base-MA60'
 
     tokenizer = KronosTokenizer.from_pretrained(tokenizer_path)
     tokenizer.eval().to(device)
@@ -131,9 +140,12 @@ def load_model_and_tokenizer(
     model = Kronos.from_pretrained(pretrained_paths[model_type])
     model.eval().to(device)
 
-    # Checkpoint（EV1 修复：使用传入参数，不再硬编码）
-    model_dir = get_model_path(norm_mode, lookback, predict, split_mode, model_type)
-    checkpoint_path = get_checkpoint_path(model_dir, checkpoint)
+    # Checkpoint：支持自定义路径
+    if custom_checkpoint_path:
+        checkpoint_path = custom_checkpoint_path
+    else:
+        model_dir = get_model_path(norm_mode, lookback, predict, split_mode, model_type)
+        checkpoint_path = get_checkpoint_path(model_dir, checkpoint)
 
     checkpoint_file = os.path.join(checkpoint_path, 'model.safetensors')
     if os.path.exists(checkpoint_file):
@@ -439,6 +451,10 @@ def main():
                         help='Comma-separated models for batch comparison')
     parser.add_argument('--checkpoint', type=str, default='best_combined_model',
                         choices=['best_model', 'best_ic_model', 'best_combined_model', 'latest_model'])
+    parser.add_argument('--tokenizer-path', type=str, default=None,
+                        help='自定义 tokenizer 路径')
+    parser.add_argument('--checkpoint-path', type=str, default=None,
+                        help='自定义 checkpoint 目录路径（包含 model.safetensors）')
     parser.add_argument('--n-samples', type=int, default=-1,
                         help='Number of samples (-1 for full)')
     parser.add_argument('--seed', type=int, default=42)
@@ -472,6 +488,10 @@ def main():
         print(f"norm_mode: {config.norm_mode}")
         print(f"model: {args.model}")
         print(f"checkpoint: {args.checkpoint}")
+        if args.tokenizer_path:
+            print(f"tokenizer_path: {args.tokenizer_path} (custom)")
+        if args.checkpoint_path:
+            print(f"checkpoint_path: {args.checkpoint_path} (custom)")
         print(f"n_samples: {args.n_samples if args.n_samples > 0 else 'FULL'}")
         if use_ddp:
             print(f"DDP: {world_size} GPUs")
@@ -495,9 +515,11 @@ def main():
 
         model, tokenizer = load_model_and_tokenizer(
             config.norm_mode, model_type, device, args.checkpoint,
-            lookback=config.lookback,       # EV1 修复：从 config 传入
-            predict=config.predict,          # EV1 修复
-            split_mode=config.split_mode,    # EV1 修复
+            lookback=config.lookback,
+            predict=config.predict,
+            split_mode=config.split_mode,
+            custom_tokenizer_path=args.tokenizer_path,
+            custom_checkpoint_path=args.checkpoint_path,
         )
 
         ic_result, da_result, amplitude_result, limit_result, naive_da_by_step = evaluate(

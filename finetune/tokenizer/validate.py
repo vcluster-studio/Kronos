@@ -47,6 +47,7 @@ def validate_tokenizer(
     batch_size: int = 16,
     seed: int = 42,
     val_holdout_ratio: float = 0.1,
+    custom_tokenizer_path: str = None,
 ):
     """
     验证 tokenizer 微调效果
@@ -63,6 +64,7 @@ def validate_tokenizer(
         batch_size: 批大小
         seed: 划分种子（须与 train 一致，否则 val 集不同步）
         val_holdout_ratio: val 股票比例（须与 train 一致）
+        custom_tokenizer_path: 自定义 tokenizer 路径（优先于默认路径）
 
     Returns:
         dict: 包含预训练和微调后 tokenizer 的重建损失统计
@@ -71,7 +73,11 @@ def validate_tokenizer(
 
     # 数据路径（tokenizer 专用，只按 norm_mode 键控）
     data_path = get_tokenizer_data_path(norm_mode)
-    finetuned_path = get_tokenizer_path(norm_mode, model_type)
+    # 微调 tokenizer 路径：支持自定义
+    if custom_tokenizer_path:
+        finetuned_path = custom_tokenizer_path
+    else:
+        finetuned_path = get_tokenizer_path(norm_mode, model_type)
     pretrained_path = os.path.join(PROJECT_ROOT, PRETRAINED_MAP[model_type])
 
     print("=" * 60)
@@ -82,6 +88,8 @@ def validate_tokenizer(
     print(f"seq_len: {seq_len}")
     print(f"pretrained_path: {pretrained_path}")
     print(f"finetuned_path: {finetuned_path}")
+    if custom_tokenizer_path:
+        print(f"  (custom path specified)")
     print(f"data_path: {data_path}")
     print(f"seed: {seed}, val_holdout_ratio: {val_holdout_ratio}")
     print("=" * 60)
@@ -236,6 +244,8 @@ def main():
                         choices=['full_window', 'sliding_ma20', 'sliding_ma60', 'sliding_ma120'])
     parser.add_argument('--model', type=str, default='mini',
                         choices=['mini', 'small', 'base'])
+    parser.add_argument('--tokenizer-path', type=str, default=None,
+                        help='自定义 tokenizer 路径（优先于默认 outputs/tokenizers/{norm_mode}/{model}）')
     parser.add_argument('--seq-len', type=int, default=400,
                         help='tokenizer 重建窗口长度（须与 train 一致）')
     parser.add_argument('--n-val-iter', type=int, default=400,
@@ -255,6 +265,7 @@ def main():
         batch_size=args.batch_size,
         seed=args.seed,
         val_holdout_ratio=args.val_holdout_ratio,
+        custom_tokenizer_path=args.tokenizer_path,
     )
 
 
