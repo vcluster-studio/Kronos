@@ -33,7 +33,10 @@ from finetune.predictor.core.config import BacktestConfig
 from finetune.predictor.core.paths import (
     get_backtest_data_path,
     get_tokenizer_path,
+    get_model_path,
+    get_checkpoint_path,  # §6.11 修复：拼接 checkpoints/{name} 正确路径
 )
+from finetune.predictor.core.normalization import get_normalizer
 from finetune.predictor.core.metrics import (
     safe_corrcoef,
     safe_spearmanr,
@@ -63,7 +66,8 @@ def backtest(
     device: torch.device,
     n_samples: int = 100,
     seed: int = 42,
-    norm_mode: str = 'sliding_ma60'
+    norm_mode: str = 'sliding_ma60',
+    model_type: str = 'mini'
 ):
     """
     回测（正确口径）
@@ -88,6 +92,43 @@ def backtest(
 
     # 结果收集（per-symbol）
     results_by_symbol = {}
+
+    # PR4 修复：一次性校验 context 段归一化未用 target 段数据（无泄露）
+    # 对第一个样本重算 context 段归一化，与 preprocess 存的 normalized 对比。
+    # 若 preprocess 用了 target 数据归一化 context，重算结果会不同 → 报错。
+    if symbols:
+        first_sym = symbols[0]
+        first_d = test_data[first_sym]
+        try:
+            lb = first_d['lookback']
+            pd_ = first_d['predict']
+            full_orig = first_d['original']
+            full_norm = first_d['normalized']
+            seq_len = len(full_orig)
+            ctx_start = seq_len - lb - pd_
+            target_start = ctx_start + lb
+
+            # 重算 context 段归一化（仅用 context 及其前 N 步历史，不含 target）
+            from finetune.predictor.core.normalization import NormalizerFactory
+            required = NormalizerFactory.get_required_history(norm_mode)
+            hist_start = max(0, ctx_start - required)
+            ctx_with_hist = full_orig[hist_start:target_start]  # 不含 target
+            normalizer = get_normalizer(norm_mode)
+            recon_norm, _, _ = normalizer.normalize(ctx_with_hist.astype(np.float32))
+            # recon_norm 长度 = len(ctx_with_hist)，context 段在其末尾 lb 个
+            recon_ctx_norm = recon_norm[-lb:]
+
+            stored_ctx_norm = full_norm[ctx_start:target_start]
+            if not np.allclose(recon_ctx_norm, stored_ctx_norm, atol=1e-5, equal_nan=True):
+                raise RuntimeError(
+                    f"PR4 校验失败：{first_sym} context 段归一化与重算不一致，"
+                    f"preprocess 可能用了 target 段数据归一化 context（泄露）"
+                )
+            print(f"[INFO] PR4 校验通过：context 段归一化未用 target 数据（{first_sym}）")
+        except RuntimeError:
+            raise
+        except Exception as e:
+            print(f"[WARNING] PR4 校验跳过：{e}")
 
     for sym in tqdm(symbols, desc="Backtesting"):
         d = test_data[sym]
@@ -136,7 +177,7 @@ def backtest(
                 preds = auto_regressive_inference(
                     tokenizer, model,
                     x_tensor, x_stamp_tensor, y_stamp_tensor,
-                    max_context=2048,
+                    max_context={'mini': 2048, 'small': 512, 'base': 512}.get(model_type, 2048),  # B11 修复：按 model_type
                     pred_len=predict,
                     clip=5.0,
                     T=1.0,
@@ -181,6 +222,7 @@ def backtest(
                     'actual_gains': [],
                     'scores': [],
                     'directions': [],
+                    'actual_dirs': [],  # 新增：用于计算 naive DA
                     'amp_rates': [],
                     'pred_limit': [],
                     'actual_limit': [],
@@ -190,6 +232,7 @@ def backtest(
             results_by_symbol[sym]['actual_gains'].append(actual_gain)
             results_by_symbol[sym]['scores'].append(score)
             results_by_symbol[sym]['directions'].append(direction_correct)
+            results_by_symbol[sym]['actual_dirs'].append(actual_dir)  # 新增
             results_by_symbol[sym]['amp_rates'].append(amp_rate)
             results_by_symbol[sym]['pred_limit'].append(pred_limit.any())
             results_by_symbol[sym]['actual_limit'].append(actual_limit.any())
@@ -214,6 +257,7 @@ def backtest(
     all_pred_gains = []
     all_actual_gains = []
     all_directions = []
+    all_actual_dirs = []  # 新增：用于计算 naive DA
     all_amp_rates = []
     all_pred_limit = []
     all_actual_limit = []
@@ -222,6 +266,7 @@ def backtest(
         all_pred_gains.extend(res['pred_gains'])
         all_actual_gains.extend(res['actual_gains'])
         all_directions.extend(res['directions'])
+        all_actual_dirs.extend(res['actual_dirs'])  # 新增
         all_amp_rates.extend(res['amp_rates'])
         all_pred_limit.extend(res['pred_limit'])
         all_actual_limit.extend(res['actual_limit'])
@@ -232,23 +277,37 @@ def backtest(
         'n_stocks': len(results_by_symbol),
     }
 
-    # IC（per-stock 聚合）
+    # IC（per-stock 聚合，补 p25/p75）
     if per_stock_ics:
-        result['backtest_ic_mean'] = float(np.mean(per_stock_ics))
-        result['backtest_ic_std'] = float(np.std(per_stock_ics))
-        result['backtest_ic_p50'] = float(np.percentile(per_stock_ics, 50))
+        ics_arr = np.array(per_stock_ics)
+        n = len(per_stock_ics)
+        result['backtest_ic_mean'] = float(np.mean(ics_arr))
+        result['backtest_ic_std'] = float(np.std(ics_arr)) if n >= 2 else 0.0
+        result['backtest_ic_p25'] = float(np.percentile(ics_arr, 25)) if n >= 4 else None
+        result['backtest_ic_p50'] = float(np.percentile(ics_arr, 50))
+        result['backtest_ic_p75'] = float(np.percentile(ics_arr, 75)) if n >= 4 else None
     else:
         result['backtest_ic_mean'] = 0.0
         result['backtest_ic_std'] = 0.0
+        result['backtest_ic_p25'] = None
+        result['backtest_ic_p50'] = None
+        result['backtest_ic_p75'] = None
 
     if per_stock_rank_ics:
         result['backtest_rank_ic_mean'] = float(np.mean(per_stock_rank_ics))
 
-    # 方向胜率（DA）
+    # 方向胜率（DA）- 真实 naive DA 计算
     if all_directions:
         model_da = float(np.mean(all_directions))
         result['direction_accuracy'] = model_da
-        result['excess_da'] = excess_da(model_da, 0.5)
+        # 真实 naive DA = 多数方向比例（持平预测的 DA）
+        if all_actual_dirs:
+            up_ratio = float(np.mean(all_actual_dirs))
+            naive_da = max(up_ratio, 1 - up_ratio)
+        else:
+            naive_da = 0.5
+        result['naive_da'] = naive_da
+        result['excess_da'] = excess_da(model_da, naive_da)
 
     # 振幅
     if all_amp_rates:
@@ -279,12 +338,19 @@ def backtest(
 
 def main():
     parser = argparse.ArgumentParser(description='Kronos Predictor Backtest')
-    parser.add_argument('--model', type=str, default='final_models/Kronos-mini-MA60')
+    parser.add_argument('--model', type=str, default='mini',
+                        help='模型类型(mini/small/base)或 checkpoint 目录完整路径')
+    parser.add_argument('--checkpoint', type=str, default='best_combined_model',
+                        choices=['best_model', 'best_ic_model', 'best_combined_model', 'latest_model'],
+                        help='Checkpoint 名称(§6.11 修复：定位 checkpoints/{name}/，与 eval 一致)')
     parser.add_argument('--tokenizer', type=str, default=None)
     parser.add_argument('--norm-mode', type=str, default='sliding_ma60',
                         choices=['full_window', 'sliding_ma20', 'sliding_ma60', 'sliding_ma120'])
     parser.add_argument('--lookback', type=int, default=400)
     parser.add_argument('--predict', type=int, default=10)
+    parser.add_argument('--split-mode', type=str, default='block',
+                        choices=['time', 'block'],
+                        help='Split mode for locating model checkpoint (B3 修复：不再硬编码 block)')
     parser.add_argument('--n-samples', type=int, default=100,
                         help='Number of samples (-1 for full)')
     parser.add_argument('--batch-size', type=int, default=64)
@@ -302,26 +368,54 @@ def main():
         limit_pct=args.limit_pct,
     )
 
-    # Tokenizer
+    # Tokenizer（B1/B4 修复：使用 get_tokenizer_path，不再硬编码 legacy 路径）
     if args.tokenizer:
         tokenizer_path = args.tokenizer
-    elif args.norm_mode == 'full_window':
-        tokenizer_path = 'final_models/Kronos-Tokenizer-2k'
     else:
-        tokenizer_path = 'outputs/tokenizers/final/2k-MA60'
+        tokenizer_path = get_tokenizer_path(args.norm_mode, args.model)
+
+    if not os.path.exists(tokenizer_path):
+        # B3 修复：显式警告找不到 tokenizer
+        print(f"[WARNING] Tokenizer not found at {tokenizer_path}")
+        # fallback 到预训练
+        tokenizer_path = 'pretrained/Kronos-Tokenizer-2k' if args.model == 'mini' else 'pretrained/Kronos-Tokenizer-base'
+        print(f"[WARNING] Using pretrained tokenizer: {tokenizer_path}")
 
     tokenizer = KronosTokenizer.from_pretrained(tokenizer_path)
     tokenizer.eval().to(device)
 
-    # 模型
-    model = Kronos.from_pretrained('pretrained/Kronos-mini')
+    # 模型（B2 修复：根据 model 参数选择架构，不再硬编码 mini）
+    pretrained_paths = {
+        'mini': 'pretrained/Kronos-mini',
+        'small': 'pretrained/Kronos-small',
+        'base': 'pretrained/Kronos-base',
+    }
+    model_type = args.model if args.model in pretrained_paths else 'mini'
+    model = Kronos.from_pretrained(pretrained_paths[model_type])
     model.eval().to(device)
 
-    model_dir = os.path.join(project_root, args.model)
-    safetensors_path = os.path.join(model_dir, 'model.safetensors')
+    # Checkpoint（§6.11 修复：用 get_checkpoint_path 拼接 checkpoints/{name}，与 eval 一致）
+    if args.model in pretrained_paths:
+        # model_type 模式：按 norm_mode/lookback/predict/split_mode 定位 + checkpoints/{name}
+        model_dir = get_model_path(args.norm_mode, args.lookback, args.predict, args.split_mode, args.model)
+        checkpoint_dir = get_checkpoint_path(model_dir, args.checkpoint)
+    else:
+        # 路径模式：args.model 直接作为 checkpoint 目录
+        checkpoint_dir = os.path.join(project_root, args.model)
+    safetensors_path = os.path.join(checkpoint_dir, 'model.safetensors')
+
     if os.path.exists(safetensors_path):
         state_dict = load_file(safetensors_path)
-        model.load_state_dict(state_dict, strict=False)
+        # B1 修复：checkpoint 与模型对不上直接报错（不静默用错权重）
+        missing, unexpected = model.load_state_dict(state_dict, strict=False)
+        if missing or unexpected:
+            raise RuntimeError(
+                f"Checkpoint 与模型不匹配，拒绝加载: missing={missing}, unexpected={unexpected}"
+            )
+        print(f"[INFO] Loaded checkpoint: {checkpoint_dir}")
+    else:
+        print(f"[WARNING] Checkpoint not found at {checkpoint_dir}")
+        print(f"[WARNING] Using pretrained model - backtest may not reflect fine-tuned performance")
 
     # 数据：回测样本（由 preprocess.py 生成）+ 样本外 raw（full_window 借用历史）
     test_path = get_backtest_data_path(args.norm_mode, args.lookback, args.predict)
@@ -345,7 +439,8 @@ def main():
         model, tokenizer, test_data, config, device,
         n_samples=args.n_samples,
         seed=args.seed,
-        norm_mode=args.norm_mode
+        norm_mode=args.norm_mode,
+        model_type=model_type
     )
 
     # 输出
