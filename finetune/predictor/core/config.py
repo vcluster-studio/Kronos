@@ -140,7 +140,11 @@ class ArtifactConfig:
         根据 norm_mode 和 model_type 自动选择 tokenizer
 
         路径格式：outputs/tokenizers/{norm_mode}/{model_type}
-        vocab_size 映射：mini→2048, small→4096, base→8192
+
+        T3 修复：架构映射（非 vocab 映射）
+        - mini → Kronos-Tokenizer-2k（group_size=5, context=2048）
+        - small/base → Kronos-Tokenizer-base（group_size=4, context=512）
+        vocab_size 由预训练架构决定，不是配置参数
         """
         if self.tokenizer_path:
             return self.tokenizer_path

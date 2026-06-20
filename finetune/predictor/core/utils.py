@@ -131,17 +131,26 @@ def ensure_dir(path: str) -> str:
 
 def safe_save_json(data: dict, path: str):
     """
-    安全保存 JSON 文件
+    安全保存 JSON 文件（M6 修复：原子写入）
+
+    写入临时文件，然后 rename，避免 crash 时损坏文件。
 
     Args:
         data: 数据字典
         path: 文件路径
     """
     import json
+    import tempfile
 
     ensure_dir(path)
-    with open(path, 'w', encoding='utf-8') as f:
+
+    # 写入临时文件
+    temp_path = path + '.tmp'
+    with open(temp_path, 'w', encoding='utf-8') as f:
         json.dump(data, f, indent=2, default=str)
+
+    # Rename（原子操作）
+    os.replace(temp_path, path)
 
 
 def safe_load_json(path: str) -> dict:
@@ -164,7 +173,9 @@ def safe_load_json(path: str) -> dict:
 
 def safe_save_pickle(data: Any, path: str):
     """
-    安全保存 pickle 文件
+    安全保存 pickle 文件（UT3 修复：原子写入）
+
+    写入临时文件，然后 rename，避免 crash 时损坏文件。
 
     Args:
         data: 数据对象
@@ -173,8 +184,14 @@ def safe_save_pickle(data: Any, path: str):
     import pickle
 
     ensure_dir(path)
-    with open(path, 'wb') as f:
+
+    # 写入临时文件
+    temp_path = path + '.tmp'
+    with open(temp_path, 'wb') as f:
         pickle.dump(data, f)
+
+    # Rename（原子操作）
+    os.replace(temp_path, path)
 
 
 def safe_load_pickle(path: str) -> Any:
