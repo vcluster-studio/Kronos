@@ -66,6 +66,10 @@ from finetune.predictor.core.metrics import (
     get_log_step_weights,
     get_feature_weights,
     format_metrics_report,
+    # §10 新增：可懂指标
+    amplitude_error_rate,
+    detect_limit,
+    limit_hit_rate,
 )
 from finetune.predictor.core.utils import (
     set_seed,
@@ -84,10 +88,13 @@ from finetune.predictor.core.utils import (
 # 配置
 # ============================================================================
 
-TOKENIZER_PATHS = {
-    'mini': {'vocab': 2048},
-    'small': {'vocab': 4096},
-    'base': {'vocab': 8192},
+# T2 修复：删除杜撰的 vocab 映射，改为正确的架构映射
+# 实际 mini→Kronos-Tokenizer-2k，small/base→Kronos-Tokenizer-base
+# vocab_size 由预训练架构决定，不是配置参数
+TOKENIZER_ARCH = {
+    'mini': 'Kronos-Tokenizer-2k',
+    'small': 'Kronos-Tokenizer-base',
+    'base': 'Kronos-Tokenizer-base',
 }
 
 MODEL_PATHS = {
@@ -110,6 +117,8 @@ MAX_CONTEXT = {
 def init_training_info(output_dir: str, config: DataConfig, train_config: TrainConfig) -> str:
     """
     初始化 training_info.json
+
+    §10 更新：best 跟踪扩展到 5 项 + 可懂指标
     """
     info = {
         'status': 'running',
@@ -135,10 +144,15 @@ def init_training_info(output_dir: str, config: DataConfig, train_config: TrainC
             'data_fingerprint': '待更新',
         },
         'epochs': [],
+        # §10 更新：best 跟踪扩展到 5 项 + 可懂指标
         'best': {
-            'ic': 0.0,
-            'combined': 0.0,
-            'epoch': 0,
+            'val_loss': {'value': float('inf'), 'epoch': 0},
+            'ic': {'value': -999, 'epoch': 0},
+            'da_score': {'value': 0.0, 'epoch': 0},
+            'excess_da': {'value': 0.0, 'epoch': 0},
+            'combined': {'value': 0.0, 'epoch': 0},
+            'amplitude_error_rate': {'value': None, 'epoch': 0},
+            'limit_hit_rate': {'value': None, 'epoch': 0},
         },
     }
 
@@ -149,17 +163,23 @@ def init_training_info(output_dir: str, config: DataConfig, train_config: TrainC
     return info_path
 
 
-def update_training_info(info_path: str, epoch: int, metrics: dict, is_best: bool = False, best_type: str = None):
+def update_training_info(info_path: str, epoch: int, metrics: dict, best_updates: dict = None):
     """
     更新 training_info.json
+
+    §10 更新：
+    - metrics 含 da_score/excess_da/可懂指标（可懂指标在非 best 时为 None）
+    - best_updates 为本 epoch 刷新的 best 列表，如 {'val_loss': (2.28, 7), 'ic': (0.21, 7)}
     """
-    info = safe_save_json.__wrapped__(info_path) if hasattr(safe_save_json, '__wrapped__') else {}
+    # 读取现有 info
+    info = {}
     try:
         with open(info_path, 'r', encoding='utf-8') as f:
             info = json.load(f)
-    except:
+    except (FileNotFoundError, json.JSONDecodeError):
         info = {}
 
+    # epoch 记录：所有关键指标并列
     epoch_record = {
         'epoch': epoch,
         'train_loss': metrics.get('train_loss', 0),
@@ -169,17 +189,18 @@ def update_training_info(info_path: str, epoch: int, metrics: dict, is_best: boo
         'excess_da': metrics.get('excess_da', 0),
         'combined': metrics.get('combined', 0),
         'lr': metrics.get('lr', 0),
+        # 可懂指标：仅本 epoch 产生 best 时才有值，否则 None
+        'amplitude_error_rate': metrics.get('amplitude_error_rate'),
+        'limit_hit_rate': metrics.get('limit_hit_rate'),
         'time': datetime.now().isoformat(),
     }
     info.setdefault('epochs', []).append(epoch_record)
 
-    if is_best:
-        if best_type == 'ic':
-            info['best']['ic'] = metrics.get('ic', 0)
-            info['best']['ic_epoch'] = epoch
-        elif best_type == 'combined':
-            info['best']['combined'] = metrics.get('combined', 0)
-            info['best']['combined_epoch'] = epoch
+    # 更新 best：每个关键指标独立记 best 值 + best epoch
+    if best_updates:
+        info.setdefault('best', {})
+        for metric_name, (value, best_epoch) in best_updates.items():
+            info['best'][metric_name] = {'value': value, 'epoch': best_epoch}
 
     safe_save_json(info, info_path)
 
@@ -198,10 +219,13 @@ def evaluate_trajectory_ic(
     world_size: int = 1,
     rank: int = 0,
     n_samples: int = 500,
-    seed: int = 42
+    seed: int = 42,
+    model_type: str = 'mini'
 ) -> dict:
     """
     Trajectory IC 评估（正确口径：去趋势序列）
+
+    §10 更新：添加可懂指标收集（amplitude_error_rate / limit_hit_rate）
 
     关键：
     - pred/actual 必须先 detrend_to_baseline
@@ -235,6 +259,12 @@ def evaluate_trajectory_ic(
 
     # 收集 actual_dir 统计（用于计算 naive DA）
     local_actual_dir = [[] for _ in range(config.predict)]  # 仅 close
+
+    # §10 新增：可懂指标收集
+    local_amplitude_rates = []  # 振幅误差率
+    local_pred_limit = []       # 预测涨跌停
+    local_actual_limit = []     # 实际涨跌停
+    limit_pct = 0.10  # 主板涨跌停阈值（默认 10%）
 
     for (symbol, window_start) in local_indices:
         d = val_data[symbol]
@@ -286,7 +316,7 @@ def evaluate_trajectory_ic(
                 preds = auto_regressive_inference(
                     tokenizer, model,
                     x_tensor, x_stamp_tensor, y_stamp_tensor,
-                    max_context=2048,
+                    max_context={'mini': 2048, 'small': 512, 'base': 512}.get(model_type, 2048),  # 按 model_type
                     pred_len=config.predict,
                     clip=config.clip,
                     T=1.0,
@@ -331,6 +361,21 @@ def evaluate_trajectory_ic(
                     if fn == 'close':
                         local_actual_dir[step_idx].append(actual_dir)
 
+            # §10 新增：可懂指标收集
+            baseline_close = baseline[3]  # close 特征
+
+            # 振幅误差率（第一根 predict 的 high - low）
+            pred_amp = pred_raw[0, 1] - pred_raw[0, 2]  # high - low
+            actual_amp = actual[0, 1] - actual[0, 2]
+            amp_rate = amplitude_error_rate(pred_amp, actual_amp)
+            local_amplitude_rates.append(amp_rate)
+
+            # 涨跌停检测
+            pred_limit = detect_limit(pred_raw, baseline_close, limit_pct)
+            actual_limit = detect_limit(actual, baseline_close, limit_pct)
+            local_pred_limit.append(pred_limit.any())
+            local_actual_limit.append(actual_limit.any())
+
         except Exception as e:
             continue
 
@@ -339,24 +384,25 @@ def evaluate_trajectory_ic(
         ic_result = aggregate_ic(local_ics, world_size, device, rank == 0)
         da_result = aggregate_da(local_da, world_size, device, config.predict, rank == 0)
 
-        # 聚合 actual_dir 统计计算 naive DA
+        # 聚合 actual_dir 统计计算 naive DA（所有 rank 执行 all_gather）
+        # 注意：dist.all_gather 必须所有 rank 同时调用，否则死锁
         naive_da_by_step = {}
-        if rank == 0:
-            # 收集各 rank 的 up_ratio
-            for step_idx in range(config.predict):
-                local_up_count = sum(local_actual_dir[step_idx])
-                local_n = len(local_actual_dir[step_idx])
+        for step_idx in range(config.predict):
+            local_up_count = sum(local_actual_dir[step_idx])
+            local_n = len(local_actual_dir[step_idx])
 
-                # all_gather 统计
-                up_count_tensor = torch.tensor([local_up_count], device=device)
-                n_tensor = torch.tensor([local_n], device=device)
+            up_count_tensor = torch.tensor([local_up_count], device=device)
+            n_tensor = torch.tensor([local_n], device=device)
 
-                gathered_up = [torch.zeros_like(up_count_tensor) for _ in range(world_size)]
-                gathered_n = [torch.zeros_like(n_tensor) for _ in range(world_size)]
+            gathered_up = [torch.zeros_like(up_count_tensor) for _ in range(world_size)]
+            gathered_n = [torch.zeros_like(n_tensor) for _ in range(world_size)]
 
-                dist.all_gather(gathered_up, up_count_tensor)
-                dist.all_gather(gathered_n, n_tensor)
+            # 所有 rank 执行 all_gather
+            dist.all_gather(gathered_up, up_count_tensor)
+            dist.all_gather(gathered_n, n_tensor)
 
+            # 只有 rank 0 组装结果
+            if rank == 0:
                 total_up = sum(t.item() for t in gathered_up)
                 total_n = sum(t.item() for t in gathered_n)
 
@@ -405,7 +451,97 @@ def evaluate_trajectory_ic(
             else:
                 naive_da_by_step[step_idx] = 0.5
 
-    return ic_result, da_result, naive_da_by_step
+    # §10 新增：可懂指标聚合
+    amplitude_result = None
+    limit_result = None
+
+    if rank == 0:
+        # 振幅误差率统计
+        if local_amplitude_rates:
+            amp_arr = np.array(local_amplitude_rates)
+            amplitude_result = {
+                'mean_rate': float(np.mean(amp_arr)),
+                'std_rate': float(np.std(amp_arr)),
+                'usable_pct': float(np.mean(np.abs(amp_arr - 1.0) < 0.3)),
+            }
+
+        # 涨跌停命中率
+        if local_pred_limit and local_actual_limit:
+            limit_result = limit_hit_rate(
+                np.array(local_pred_limit),
+                np.array(local_actual_limit)
+            )
+
+    return ic_result, da_result, naive_da_by_step, amplitude_result, limit_result
+
+
+def compute_val_loss(
+    model,
+    tokenizer,
+    val_data,
+    val_indices,
+    config: DataConfig,
+    device: torch.device,
+    batch_size: int = 16,
+    max_batches: int = 100,
+) -> float:
+    """
+    计算 validation 集上的损失
+
+    F2 口径修复：使用 head.compute_loss 算 token CE，与 train 同口径。
+    之前用 MSE 重建，量级差 2-3 个数量级，不可用于 early stopping。
+
+    Args:
+        model: Kronos 模型
+        tokenizer: KronosTokenizer
+        val_data: 验证数据 dict
+        val_indices: 验证索引列表
+        config: 数据配置
+        device: 设备
+        batch_size: 批大小
+        max_batches: 最大批数（限制计算时间）
+
+    Returns:
+        avg_val_loss: 平均 token CE 损失（与 train 同口径）
+    """
+    model.eval()
+
+    # 创建临时 val dataset 和 loader
+    val_dataset = KronosDataset(val_data, val_indices, config, mode='val')
+    val_loader = DataLoader(
+        val_dataset,
+        batch_size=batch_size,
+        sampler=RandomSampler(val_dataset, replacement=False, num_samples=min(len(val_dataset), max_batches * batch_size)),
+        collate_fn=collate_fn,
+        num_workers=0,
+        pin_memory=False,
+        drop_last=False,
+    )
+
+    val_losses = []
+
+    with torch.no_grad():
+        for x_norm, x_stamp, y_stamp, meta in val_loader:
+            x_norm = x_norm.to(device)
+            x_stamp = x_stamp.to(device)
+
+            # Tokenize
+            token_seq_0, token_seq_1 = tokenizer.encode(x_norm, half=True)
+
+            # Forward（与 train 同口径）
+            s1_logits, s2_logits = model(token_seq_0, token_seq_1, x_stamp)
+
+            # CE loss（与 train 同口径，用 head.compute_loss）
+            # DDP 解包：DDP 模式下 model 是 DDP 包装，需 model.module.head
+            head = model.module.head if isinstance(model, DDP) else model.head
+            token_out = [token_seq_0[:, 1:], token_seq_1[:, 1:]]
+            ce_loss, _, _ = head.compute_loss(
+                s1_logits[:, :-1, :], s2_logits[:, :-1, :], token_out[0], token_out[1]
+            )
+            val_losses.append(ce_loss.item())
+
+    model.train()
+    return sum(val_losses) / len(val_losses) if val_losses else 0.0
 
 
 # ============================================================================
@@ -425,6 +561,9 @@ def train(
     rank: int = 0,
     world_size: int = 1,
     use_ddp: bool = False,
+    resume_checkpoint: str = None,
+    max_val_batches: int = 100,
+    max_ic_samples: int = -1,
 ):
     """
     主训练循环
@@ -433,9 +572,12 @@ def train(
     - IC 用去趋势口径（E1 解决）
     - checkpoint 选择用正确口径
     - early stopping patience 需审视（§1.6.7）
+
+    I9 修复：支持 --resume 断点续训
     """
     is_main = (rank == 0)
     start_time = time.time()
+    start_epoch = 0
 
     # 初始化 training_info
     info_path = init_training_info(save_dir, config, train_config) if is_main else None
@@ -453,11 +595,68 @@ def train(
         optimizer, T_max=total_steps, eta_min=train_config.lr_min
     )
 
-    # 最佳跟踪
+    # I9 修复：Resume 加载
+    start_epoch = 0
     best_val_loss = float('inf')
+    best_val_loss_epoch = 0
     best_ic = -999
-    best_combined = -999
+    best_ic_epoch = 0
+    best_da_score = 0.0
+    best_da_score_epoch = 0
+    best_excess_da = 0.0
+    best_excess_da_epoch = 0
+    best_combined = 0.0
+    best_combined_epoch = 0
+    # §10 新增：可懂指标 best
+    best_amplitude_error_rate = 1.0  # 越接近 1.0 越好，初始设为最差
+    best_amplitude_error_rate_epoch = 0
+    best_limit_hit_rate = 0.0  # 越高越好
+    best_limit_hit_rate_epoch = 0
     patience_counter = 0
+
+    if resume_checkpoint and os.path.exists(resume_checkpoint):
+        if is_main:
+            print(f"\n[RESUME] Loading from {resume_checkpoint}")
+        # 加载模型权重
+        unwrapped = model.module if use_ddp else model
+        state_dict = load_file(os.path.join(resume_checkpoint, 'model.safetensors'))
+        unwrapped.load_state_dict(state_dict, strict=False)
+
+        # 加载 optimizer/scheduler 状态
+        opt_path = os.path.join(resume_checkpoint, 'optimizer.pt')
+        sch_path = os.path.join(resume_checkpoint, 'scheduler.pt')
+        meta_path = os.path.join(resume_checkpoint, 'resume_meta.json')
+
+        if os.path.exists(opt_path):
+            optimizer.load_state_dict(torch.load(opt_path, map_location=device))
+        if os.path.exists(sch_path):
+            scheduler.load_state_dict(torch.load(sch_path, map_location=device))
+        if os.path.exists(meta_path):
+            with open(meta_path, 'r') as f:
+                resume_meta = json.load(f)
+            start_epoch = resume_meta.get('epoch', 0)
+            best_val_loss = resume_meta.get('best_val_loss', float('inf'))
+            best_val_loss_epoch = resume_meta.get('best_val_loss_epoch', 0)
+            best_ic = resume_meta.get('best_ic', -999)
+            best_ic_epoch = resume_meta.get('best_ic_epoch', 0)
+            best_da_score = resume_meta.get('best_da_score', 0.0)
+            best_da_score_epoch = resume_meta.get('best_da_score_epoch', 0)
+            best_excess_da = resume_meta.get('best_excess_da', 0.0)
+            best_excess_da_epoch = resume_meta.get('best_excess_da_epoch', 0)
+            best_combined = resume_meta.get('best_combined', 0.0)
+            best_combined_epoch = resume_meta.get('best_combined_epoch', 0)
+            # §10 新增：可懂指标 resume
+            best_amplitude_error_rate = resume_meta.get('best_amplitude_error_rate', 1.0)
+            best_amplitude_error_rate_epoch = resume_meta.get('best_amplitude_error_rate_epoch', 0)
+            best_limit_hit_rate = resume_meta.get('best_limit_hit_rate', 0.0)
+            best_limit_hit_rate_epoch = resume_meta.get('best_limit_hit_rate_epoch', 0)
+            patience_counter = resume_meta.get('patience_counter', 0)
+            # epoch 从 resume_meta 推算（或从 training_info.json 读取）
+            if is_main:
+                print(f"[RESUME] Starting from epoch {start_epoch + 1}")
+                print(f"[RESUME] Best: val_loss={best_val_loss:.4f}@{best_val_loss_epoch}, IC={best_ic:.4f}@{best_ic_epoch}, DA={best_da_score:.4f}@{best_da_score_epoch}, Combined={best_combined:.4f}@{best_combined_epoch}")
+
+    # §10 更新：best 跟踪已在上面的初始化/resume 中完成
 
     history = {
         'train_loss': [],
@@ -469,7 +668,8 @@ def train(
         'lr': [],
     }
 
-    for epoch_idx in range(train_config.epochs):
+    # I9 修复：从 resume 的 epoch 开始
+    for epoch_idx in range(start_epoch, train_config.epochs):
         epoch_start = time.time()
         model.train()
 
@@ -510,31 +710,37 @@ def train(
 
             if is_main and (batch_idx % 50 == 0 or batch_idx == 0):
                 avg_loss = sum(epoch_losses[-50:]) / min(len(epoch_losses[-50:]), 50)
-                print(f"  Batch {batch_idx + 1} - Loss: {recon_loss.item():.4f}, Avg: {avg_loss:.4f}")
+                print(f"  Batch {batch_idx + 1} - Loss: {recon_loss.item():.4f}, Avg: {avg_loss:.4f}", flush=True)
 
         avg_train_loss = sum(epoch_losses) / len(epoch_losses)
         current_lr = optimizer.param_groups[0]['lr']
 
-        # Validation loss（简化：用最后一个 batch）
-        avg_val_loss = avg_train_loss  # TODO: 实现 validation loss 计算
+        # Validation loss（在 val 集上前向计算，不反传）
+        avg_val_loss = compute_val_loss(
+            model, tokenizer, val_data, val_indices, config, device,
+            batch_size=train_config.batch_size,
+            max_batches=max_val_batches,
+        )
 
         history['train_loss'].append(avg_train_loss)
         history['val_loss'].append(avg_val_loss)
         history['lr'].append(current_lr)
 
-        # Trajectory IC 评估
-        ic_result, da_result, naive_da_by_step = evaluate_trajectory_ic(
+        # Trajectory IC 评估（§10 更新：返回可懂指标）
+        ic_result, da_result, naive_da_by_step, amplitude_result, limit_result = evaluate_trajectory_ic(
             model, tokenizer, val_data, val_indices, config,
             device, world_size, rank,
-            n_samples=-1,  # 全量评估
-            seed=config.seed + epoch_idx * 9999
+            n_samples=max_ic_samples,  # 支持限制样本数
+            seed=config.seed + epoch_idx * 9999,
+            model_type=train_config.model_type
         )
 
         if is_main:
             current_ic = ic_result.get('close', {}).get('mean', 0)
 
             # 计算 DA_score 和 excess_da
-            da_by_step = [{f: [da_result[f'step{s+1}'].get(f, {}).get('mean', 0)] for f in FEATURE_NAMES} for s in range(config.predict)]
+            # M4 修复：直接传标量（已聚合的均值），calculate_da_score 兼容标量/列表
+            da_by_step = [{f: da_result[f'step{s+1}'].get(f, {}).get('mean', 0) for f in FEATURE_NAMES} for s in range(config.predict)]
             da_score = calculate_da_score(da_by_step, config.predict)
 
             # 计算 excess DA（平均 excess）
@@ -553,55 +759,145 @@ def train(
             history['excess_da'].append(excess_da_avg)
             history['combined'].append(current_combined)
 
-            print(f"\n  Trajectory IC (close, detrended): {current_ic:.4f}")
-            print(f"  DA_score: {da_score:.4f}, Excess DA: {excess_da_avg:+.1%}, Combined: {current_combined:.4f}")
+            # §10 更新：epoch 打印并列显示 current | best @ep
+            epoch_time = time.time() - epoch_start
+            print(f"\n  Epoch {epoch_idx + 1}/{train_config.epochs}  LR: {current_lr:.6f}")
+            print(f"    IC:        current {current_ic:.4f}  | best {best_ic:.4f} @ep{best_ic_epoch}")
+            print(f"    DA_score:  current {da_score:.4f}  | best {best_da_score:.4f} @ep{best_da_score_epoch}")
+            print(f"    Excess DA: current {excess_da_avg:+.1%}  | best {best_excess_da:+.1%} @ep{best_excess_da_epoch}")
+            print(f"    Combined:  current {current_combined:.4f}  | best {best_combined:.4f} @ep{best_combined_epoch}")
+            print(f"    Val_loss:  current {avg_val_loss:.4f}  | best {best_val_loss:.4f} @ep{best_val_loss_epoch}")
+            print(f"    Train: {avg_train_loss:.4f}, Time: {format_time(epoch_time)}")
 
-            # IC 滑动均值
+            # IC 滑动均值（用于 early stopping）
             ic_window = 3
             if len(history['ic']) >= ic_window:
                 ic_smoothed = np.mean(history['ic'][-ic_window:])
             else:
                 ic_smoothed = current_ic
 
-            epoch_time = time.time() - epoch_start
-            print(f"  Train: {avg_train_loss:.4f}, Time: {format_time(epoch_time)}")
-
-            # 保存 latest
+            # 保存 latest（I9 修复：同时保存 optimizer/scheduler 状态）
             latest_path = get_checkpoint_path(save_dir, 'latest_model')
             unwrapped = model.module if use_ddp else model
             unwrapped.save_pretrained(latest_path)
 
-            # Checkpoint 选择
-            improved = False
+            # 保存 optimizer/scheduler 状态（用于 resume）
+            torch.save(optimizer.state_dict(), os.path.join(latest_path, 'optimizer.pt'))
+            torch.save(scheduler.state_dict(), os.path.join(latest_path, 'scheduler.pt'))
+            resume_meta = {
+                'epoch': epoch_idx,
+                'best_val_loss': best_val_loss,
+                'best_val_loss_epoch': best_val_loss_epoch,
+                'best_ic': best_ic,
+                'best_ic_epoch': best_ic_epoch,
+                'best_da_score': best_da_score,
+                'best_da_score_epoch': best_da_score_epoch,
+                'best_excess_da': best_excess_da,
+                'best_excess_da_epoch': best_excess_da_epoch,
+                'best_combined': best_combined,
+                'best_combined_epoch': best_combined_epoch,
+                # §10 新增：可懂指标
+                'best_amplitude_error_rate': best_amplitude_error_rate,
+                'best_amplitude_error_rate_epoch': best_amplitude_error_rate_epoch,
+                'best_limit_hit_rate': best_limit_hit_rate,
+                'best_limit_hit_rate_epoch': best_limit_hit_rate_epoch,
+                'patience_counter': patience_counter,
+            }
+            safe_save_json(resume_meta, os.path.join(latest_path, 'resume_meta.json'))
 
+            # §10 更新：best 跟踪扩展 + 可懂指标只在 best 时算
+            best_updates = {}
+            improved = False
+            compute_understandable = False  # 标记是否需要算可懂指标
+
+            # val_loss best
             if avg_val_loss < best_val_loss:
                 best_val_loss = avg_val_loss
-                patience_counter = 0
+                best_val_loss_epoch = epoch_idx + 1
                 improved = True
+                compute_understandable = True
+                best_updates['val_loss'] = (best_val_loss, best_val_loss_epoch)
 
                 best_path = get_checkpoint_path(save_dir, 'best_model')
                 unwrapped.save_pretrained(best_path)
-                print(f"  [VAL LOSS] {best_val_loss:.4f}")
 
-            # §1.6.7: IC 归零条件需审视
+            # IC best
             if train_config.ic_patience_reset and ic_smoothed > best_ic:
                 best_ic = ic_smoothed
+                best_ic_epoch = epoch_idx + 1
                 patience_counter = 0
                 improved = True
+                compute_understandable = True
+                best_updates['ic'] = (best_ic, best_ic_epoch)
 
                 ic_path = get_checkpoint_path(save_dir, 'best_ic_model')
                 unwrapped.save_pretrained(ic_path)
-                print(f"  [IC] {best_ic:.4f}")
 
+            # DA_score best（只记录，不存 checkpoint）
+            if da_score > best_da_score:
+                best_da_score = da_score
+                best_da_score_epoch = epoch_idx + 1
+                best_updates['da_score'] = (best_da_score, best_da_score_epoch)
+
+            # Excess DA best（只记录，不存 checkpoint）
+            if excess_da_avg > best_excess_da:
+                best_excess_da = excess_da_avg
+                best_excess_da_epoch = epoch_idx + 1
+                best_updates['excess_da'] = (best_excess_da, best_excess_da_epoch)
+
+            # Combined best
             if current_combined > best_combined:
                 best_combined = current_combined
+                best_combined_epoch = epoch_idx + 1
+                improved = True
+                compute_understandable = True
+                best_updates['combined'] = (best_combined, best_combined_epoch)
 
                 combined_path = get_checkpoint_path(save_dir, 'best_combined_model')
                 unwrapped.save_pretrained(combined_path)
-                print(f"  [COMBINED] {best_combined:.4f}")
 
             if not improved:
                 patience_counter += 1
+
+            # §10 D：可懂指标只在产生 best 时记录（已在 evaluate_trajectory_ic 中收集）
+            # 注意：evaluate_trajectory_ic 总是返回这些值，但只在产生 best 时才写入 training_info
+            epoch_amplitude_result = None
+            epoch_limit_result = None
+            if compute_understandable:
+                # 使用 evaluate_trajectory_ic 的返回值
+                epoch_amplitude_result = amplitude_result
+                epoch_limit_result = limit_result
+
+                # 如果可懂指标刷新 best，也记录到 best_updates
+                if amplitude_result and amplitude_result.get('mean_rate'):
+                    # 检查是否刷新 amplitude_error_rate best
+                    current_amp = amplitude_result['mean_rate']
+                    if current_amp < best_amplitude_error_rate:  # 越接近 1.0 越好，但我们记录 mean_rate
+                        best_amplitude_error_rate = current_amp
+                        best_amplitude_error_rate_epoch = epoch_idx + 1
+                        best_updates['amplitude_error_rate'] = (best_amplitude_error_rate, best_amplitude_error_rate_epoch)
+
+                if limit_result and limit_result.get('hit_rate'):
+                    current_limit_hit = limit_result['hit_rate']
+                    if current_limit_hit > best_limit_hit_rate:  # 越高越好
+                        best_limit_hit_rate = current_limit_hit
+                        best_limit_hit_rate_epoch = epoch_idx + 1
+                        best_updates['limit_hit_rate'] = (best_limit_hit_rate, best_limit_hit_rate_epoch)
+
+            # 更新 training_info（§10 更新）
+            if info_path:
+                metrics_dict = {
+                    'train_loss': avg_train_loss,
+                    'val_loss': avg_val_loss,
+                    'ic': current_ic,
+                    'da_score': da_score,
+                    'excess_da': excess_da_avg,
+                    'combined': current_combined,
+                    'lr': current_lr,
+                    'amplitude_error_rate': epoch_amplitude_result,
+                    'limit_hit_rate': epoch_limit_result,
+                }
+                update_training_info(info_path, epoch_idx + 1, metrics_dict, best_updates)
 
             # Early stopping（§1.6.7: patience=12 需审视）
             # DDP 同步：rank 0 算 stop 决定，broadcast 给所有 rank，一起 break。
@@ -617,19 +913,7 @@ def train(
             if stop_flag[0] > 0:
                 break
 
-            # 更新 training_info
-            if info_path:
-                update_training_info(info_path, epoch_idx + 1, {
-                    'train_loss': avg_train_loss,
-                    'val_loss': avg_val_loss,
-                    'ic': current_ic,
-                    'da_score': da_score,
-                    'excess_da': excess_da_avg,
-                    'combined': current_combined,
-                    'lr': current_lr,
-                })
-
-    # Final save
+            # Final save
     if is_main:
         final_path = get_checkpoint_path(save_dir, 'final_model')
         unwrapped = model.module if use_ddp else model
@@ -693,6 +977,14 @@ def main():
     parser.add_argument('--use-block', action='store_true',
                         help='Use block_lb400_pd10 data (legacy compat)')
     parser.add_argument('--output-folder', type=str, default=None)
+    parser.add_argument('--resume', type=str, default=None,
+                        help='Resume from checkpoint path (e.g. outputs/models/.../checkpoints/latest_model)')
+    parser.add_argument('--max-train-batches', type=int, default=None,
+                        help='Max batches per epoch for minimal testing (default: full dataset)')
+    parser.add_argument('--max-val-batches', type=int, default=100,
+                        help='Max batches for val loss computation (default: 100)')
+    parser.add_argument('--max-ic-samples', type=int, default=-1,
+                        help='Max samples for IC evaluation (-1 for full)')
     args = parser.parse_args()
 
     # DDP setup
@@ -700,13 +992,14 @@ def main():
     device = get_device(local_rank)
     is_main = (rank == 0)
 
-    # Config
+    # Config（DDP 各 rank 用不同 seed，保证数据不同）
+    # 注意：seed 偏移量用 rank，不是 local_rank（多机场景 rank 全局唯一）
     config = DataConfig(
         norm_mode=args.norm_mode,
         lookback=args.lookback,
         predict=args.predict,
         split_mode=args.split_mode,
-        seed=args.seed,
+        seed=args.seed + rank,  # 各 rank seed 不同
     )
 
     train_config = TrainConfig(
@@ -738,9 +1031,22 @@ def main():
 
     # 加载 tokenizer
     tokenizer_path = get_tokenizer_path(config.norm_mode, train_config.model_type)
-    if not os.path.exists(tokenizer_path):
-        # fallback to legacy
-        tokenizer_path = 'outputs/tokenizers/final/2k-MA60' if args.model == 'mini' else 'outputs/tokenizers/final/base-MA60'
+    if not os.path.exists(os.path.join(tokenizer_path, 'model.safetensors')):
+        # I8 修复：显式警告而非静默 fallback
+        # fallback 到 legacy tokenizer（注意 norm_mode 可能不匹配）
+        legacy_path = 'outputs/tokenizers/final/2k-MA60' if args.model == 'mini' else 'outputs/tokenizers/final/base-MA60'
+        if os.path.exists(legacy_path):
+            if is_main:
+                print(f"[WARNING] Tokenizer not found at {tokenizer_path}")
+                print(f"[WARNING] Using legacy fallback: {legacy_path}")
+                print(f"[WARNING] norm_mode mismatch: tokenizer may not match data distribution")
+            tokenizer_path = legacy_path
+        else:
+            raise FileNotFoundError(
+                f"Tokenizer not found at {tokenizer_path}. "
+                f"Please run tokenizer training first: "
+                f"python finetune/tokenizer/train.py --norm-mode {config.norm_mode} --model {train_config.model_type}"
+            )
 
     tokenizer = KronosTokenizer.from_pretrained(tokenizer_path)
     tokenizer.eval().to(device)
@@ -779,14 +1085,17 @@ def main():
     val_indices = []
     for symbol, d in val_data.items():
         if 'windows' in d:
+            # 已预处理的窗口列表
             for w in d['windows']:
                 val_indices.append((symbol, int(w)))
         elif hasattr(d, 'columns'):
-            if len(d) >= config.lookback + config.predict:
-                val_indices.append((symbol, len(d) - config.lookback - config.predict))
+            # DataFrame 格式：取所有合法窗口（非仅末尾 1 个）
+            for i in range(len(d) - config.lookback - config.predict + 1):
+                val_indices.append((symbol, i))
         else:
-            if len(d['normalized']) >= config.lookback + config.predict:
-                val_indices.append((symbol, len(d['normalized']) - config.lookback - config.predict))
+            # dict 格式：取所有合法窗口
+            for i in range(len(d['normalized']) - config.lookback - config.predict + 1):
+                val_indices.append((symbol, i))
 
     if is_main:
         print(f"Train: {len(train_indices)}, Val: {len(val_indices)}")
@@ -795,10 +1104,15 @@ def main():
     train_dataset = KronosDataset(train_data, train_indices, config, mode='train')
     val_dataset = KronosDataset(val_data, val_indices, config, mode='val')
 
+    # 采样数（支持 minimal testing）
+    train_samples = len(train_dataset)
+    if args.max_train_batches:
+        train_samples = min(train_samples, args.max_train_batches * train_config.batch_size)
+
     train_loader = DataLoader(
         train_dataset,
         batch_size=train_config.batch_size,
-        sampler=RandomSampler(train_dataset, replacement=True, num_samples=len(train_dataset)),
+        sampler=RandomSampler(train_dataset, replacement=True, num_samples=train_samples),
         collate_fn=collate_fn,
         num_workers=0,
         pin_memory=True,
@@ -815,11 +1129,14 @@ def main():
         ensure_dir(save_dir)
         ensure_dir(get_checkpoint_path(save_dir, 'checkpoints'))
 
-    # 训练
+    # 训练（I9 修复：传入 resume_checkpoint）
     result = train(
         model, tokenizer, train_loader, val_data, val_indices,
         config, train_config, save_dir, device,
-        rank, world_size, use_ddp
+        rank, world_size, use_ddp,
+        resume_checkpoint=args.resume,
+        max_val_batches=args.max_val_batches,
+        max_ic_samples=args.max_ic_samples,
     )
 
     cleanup_ddp()
