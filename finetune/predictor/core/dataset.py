@@ -88,12 +88,9 @@ class KronosDataset(Dataset):
             - y_stamp: (predict, 5) 目标时间戳特征
             - meta: {symbol, start, baseline, means, stds}
         """
-        # 训练时随机采样，验证/测试时顺序取
-        if self.mode == 'train':
-            rand_idx = self.py_rng.randint(0, len(self.indices))
-            symbol, start = self.indices[rand_idx]
-        else:
-            symbol, start = self.indices[idx]
+        # 直接使用传入 idx，让 DataLoader 的 sampler 控制采样顺序
+        # DDP 时 DistributedSampler 或 RandomSampler 保证各 rank 数据不同
+        symbol, start = self.indices[idx]
 
         end = start + self.window_size
 

@@ -64,18 +64,10 @@ def time_split(
             s.split = 'test'
             test_samples.append(s)
         else:
-            # 边界附近的样本：target 跨 split 边界
-            # 这种情况在 stride < predict 时会出现
-            # 按主要位置分配（target_start 优先）
-            if s.target_start < train_end:
-                s.split = 'train'
-                train_samples.append(s)
-            elif s.target_start < val_end:
-                s.split = 'val'
-                val_samples.append(s)
-            else:
-                s.split = 'test'
-                test_samples.append(s)
+            # I7 修复：丢弃跨 split 边界的样本（而非强分）
+            # 跨边界样本的 target 与两个 split 相交，无法保证无泄露
+            # 强分会触发 validate_no_leakage 崩溃
+            continue  # 丢弃
 
     return train_samples, val_samples, test_samples
 
@@ -125,11 +117,13 @@ def create_target_blocks(
         # S1 修复：末端块防超界
         current_block_end = min(current_block_start + block_size, t_max)
 
-        # 收集 target 落在 [current_block_start, current_block_end) 的窗口
+        # I6 修复：按 target_start 归入起始块，不丢弃跨块窗口
+        # 原条件 `s.target_end <= current_block_end` 会丢弃跨块窗口
+        # 改为：target_start 在当前块内，即使 target_end 超出也归入该块
         block_windows = []
         for s in sorted_samples:
-            # target 区间落在当前时间块内
-            if s.target_start >= current_block_start and s.target_end <= current_block_end:
+            # target 起点落在当前时间块内
+            if s.target_start >= current_block_start and s.target_start < current_block_end:
                 block_windows.append(s)
 
         if block_windows:
@@ -137,14 +131,22 @@ def create_target_blocks(
 
         current_block_start = current_block_end
 
-    # 断言：块之间 target 区间不相交
-    for i, block_a in enumerate(blocks):
-        for j, block_b in enumerate(blocks):
-            if i != j:
-                intervals_a = [(s.target_start, s.target_end) for s in block_a]
-                intervals_b = [(s.target_start, s.target_end) for s in block_b]
-                assert not intervals_overlap(intervals_a, intervals_b), \
-                    f"block {i}/{j} target intervals overlap!"
+    # M5 修复：改用扫描线检查块间不相交（O(N log N) vs O(块数²)）
+    all_intervals = []
+    for block_idx, block in enumerate(blocks):
+        for s in block:
+            all_intervals.append((s.target_start, s.target_end, block_idx))
+
+    # 按 target_start 排序
+    all_intervals.sort(key=lambda x: x[0])
+
+    # 扫描线检查：相邻区间如果相交且属于不同块 → 报错
+    for i in range(len(all_intervals) - 1):
+        s1, e1, b1 = all_intervals[i]
+        s2, e2, b2 = all_intervals[i + 1]
+        # 区间相交：e1 > s2
+        if e1 > s2 and b1 != b2:
+            raise AssertionError(f"Block {b1} and {b2} target intervals overlap: [{s1},{e1}) vs [{s2},{e2})")
 
     return blocks
 
