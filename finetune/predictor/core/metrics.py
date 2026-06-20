@@ -568,7 +568,7 @@ def get_feature_weights() -> Dict[str, float]:
 
 
 def calculate_da_score(
-    da_by_step: List[Dict[str, List[float]]],
+    da_by_step: List[Dict[str, Any]],
     predict: int = 10
 ) -> float:
     """
@@ -579,7 +579,9 @@ def calculate_da_score(
     2. 特征间：价格类0.7 + 交易量类0.3
 
     Args:
-        da_by_step: [{feature: [DA_values]}] for each step
+        da_by_step: [{feature: DA_value}] for each step
+            DA_value 可以是标量（已聚合的均值）或列表（原始 0/1 值）；
+            列表时取 np.mean，标量时直接用。数值结果一致。
         predict: 预测步数
 
     Returns:
@@ -592,10 +594,15 @@ def calculate_da_score(
     for feature, f_weight in feature_weights.items():
         feature_da = 0.0
         for step in range(predict):
-            da_list = da_by_step[step].get(feature, [])
-            if da_list:
-                step_da = np.mean(da_list)
-                feature_da += step_da * step_weights[step]
+            da_val = da_by_step[step].get(feature, [])
+            if isinstance(da_val, (list, tuple, np.ndarray)):
+                if len(da_val) == 0:
+                    continue
+                step_da = float(np.mean(da_val))
+            else:
+                # 标量（已聚合的均值）
+                step_da = float(da_val)
+            feature_da += step_da * step_weights[step]
         da_score += feature_da * f_weight
 
     return float(da_score)
@@ -677,12 +684,18 @@ def format_metrics_report(
         step_key = f'step{step_idx + 1}'
         # 获取该步的 naive DA（如果提供）
         naive_da = naive_da_by_step.get(step_idx, 0.5) if naive_da_by_step else 0.5
+        # 确保 naive_da 不为 None（防止 dict 中显式存储了 None）
+        if naive_da is None:
+            naive_da = 0.5
 
         if step_key in da_result and 'close' in da_result[step_key]:
             da_info = da_result[step_key]['close']
             da_mean = da_info.get('mean', 0)
             da_std = da_info.get('std', 0)
-            da_p50 = da_info.get('p50', da_mean)
+            da_p50 = da_info.get('p50')
+            # 确保 da_p50 有值（可能为 None）
+            if da_p50 is None:
+                da_p50 = da_mean
             excess = excess_da(da_mean, naive_da)
             lines.append(f"+{step_idx+1:<5} {da_mean:>8.1%} {da_std:>8.1%} {da_p50:>8.1%} {naive_da:>8.1%} {excess:>8.1%}")
 
@@ -710,11 +723,13 @@ def format_metrics_report(
     for fn in FEATURE_NAMES:
         if fn in ic_result:
             info = ic_result[fn]
-            p25 = info.get('p25', 'N/A')
-            p75 = info.get('p75', 'N/A')
+            p25 = info.get('p25')
+            p50 = info.get('p50')
+            p75 = info.get('p75')
             p25_str = f"{p25:.4f}" if p25 is not None else "N/A"
+            p50_str = f"{p50:.4f}" if p50 is not None else "N/A"
             p75_str = f"{p75:.4f}" if p75 is not None else "N/A"
-            lines.append(f"{fn:<8} {info['mean']:>8.4f} {info['std']:>8.4f} {p25_str:>8} {info['p50']:>8.4f} {p75_str:>8} {info['n']:>6}")
+            lines.append(f"{fn:<8} {info['mean']:>8.4f} {info['std']:>8.4f} {p25_str:>8} {p50_str:>8} {p75_str:>8} {info['n']:>6}")
 
     lines.append("=" * 70)
 
