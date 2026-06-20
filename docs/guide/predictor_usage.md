@@ -261,11 +261,19 @@ python finetune/tokenizer/validate.py \
 |------|--------|------|
 | `--norm-mode` | sliding_ma60 | 归一化模式（须与 train 一致） |
 | `--model` | mini | 模型类型 |
+| `--tokenizer-path` | None | **自定义 tokenizer 路径（优先级最高，覆盖默认路径）** |
 | `--seq-len` | 400 | tokenizer 重建窗口长度（须与 train 一致） |
 | `--n-val-iter` | 400 | val 采样步数倍数 |
 | `--batch-size` | 16 | 批大小 |
 | `--seed` | 42 | val 划分种子（须与 train 一致） |
 | `--val-holdout-ratio` | 0.1 | val 股票比例（须与 train 一致） |
+
+**使用自定义 tokenizer**：
+```bash
+python finetune/tokenizer/validate.py \
+    --tokenizer-path outputs/tokenizers/sliding_ma60/mini \
+    --seq-len 400
+```
 
 **输出示例**：
 ```
@@ -427,10 +435,24 @@ torchrun --nproc_per_node=$(nvidia-smi -L | wc -l) finetune/predictor/eval.py \
 | `--model` | mini | 模型类型 |
 | `--models` | None | 多模型对比（逗号分隔，如 `mini,small,base`） |
 | `--checkpoint` | best_combined_model | Checkpoint 名称（best_model/best_ic_model/best_combined_model/latest_model） |
+| `--tokenizer-path` | None | **自定义 tokenizer 路径（优先级最高）** |
+| `--checkpoint-path` | None | **自定义 checkpoint 目录路径（优先级最高，包含 model.safetensors）** |
 | `--n-samples` | -1 | 评估样本数（-1 全量） |
 | `--seed` | 42 | 随机种子（抽样用） |
 | `--limit-pct` | 0.10 | 涨跌停阈值（主板 10%，创业板 20%） |
 | `--use-block` | False | 兼容旧 block_lb400_pd10 数据（legacy） |
+
+**使用自定义路径**：
+```bash
+# 自定义 tokenizer
+python finetune/predictor/eval.py \
+    --tokenizer-path outputs/tokenizers/sliding_ma60/mini \
+    --n-samples -1
+
+# 自定义 checkpoint
+python finetune/predictor/eval.py \
+    --checkpoint-path outputs/models/sliding_ma60/lb400_pd10/block/mini/checkpoints/best_combined_model
+```
 
 ### 4.2 评估输出示例
 
@@ -710,8 +732,13 @@ python finetune/predictor/preprocess.py \
 
 ---
 
-*文档更新：2026-06-20*
+*文档更新：2026-06-21*
 *对应提交：P1-P5 fixes (5f4cb7a) + M4 fix + 指南对齐*
+
+**2026-06-21 对齐（自定义路径支持）**：
+- §2.4.1 验证参数：新增 `--tokenizer-path`（自定义 tokenizer，优先级最高）
+- §4.1.1 评估参数：新增 `--tokenizer-path`/`--checkpoint-path`（自定义路径，优先级最高）
+- tokenizer/validate.py、predictor/eval.py：CLI 新增自定义路径参数，打印时显示 `(custom)` 标记
 
 **2026-06-20 修正**：
 - §9 参数速查表：删除杜撰的 vocab_size 2048/4096/8192 映射（small 共用 base tokenizer，非 4096），改为预训练 tokenizer 架构映射
