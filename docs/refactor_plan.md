@@ -5,6 +5,16 @@
 
 ---
 
+## 变更日志
+
+| 日期 | 章节 | 变更 | 原因 | 详见 review |
+|------|------|------|------|-------------|
+| 2026-06-19 | §1.5.2 / §1.5.6 | tokenizer 微调改为步数驱动放回采样（`n_train_iter_multiplier`，默认 32000 步/epoch），删除臆造的 `sample_ratio=0.1`；补微调效果检验（val 重建损失 + 与预训练对比 + 验收标准表） | 原方案杜撰了不存在的采样率与 `KronosTokenizer.train()` API；核实现有 `deprecated/finetune/train_tokenizer.py` 真实做法为步数驱动采样 + 重建损失 early stopping | §21 |
+| 2026-06-19 | §1.2 / §6.2 / §8.3 | 三项口径决策确认：① I2 SlidingMANormalizer **保持含当前点**（不加 shift(1)，归一化需含当前点信息）；② I3 eval.py 用 **DDP 框架统一控卡数**（单/多卡同一套代码，`torchrun --nproc_per_node=N`）；③ P4 excess DA 已写入 training_info（确认已修）。I2 口径与旧代码不同 → Phase 4 等价性改为"新口径自洽 + 可换算对照"，不强求与旧数值对齐 | 用户拍板口径；核实 train.py:627/169 excess_da 已记录、normalization.py:112 含当前点、eval.py 待按 DDP 改造 | §22.6 |
+| 2026-06-19 | §10 | epoch 输出与 best 跟踪完善（ABCD+X）：① epoch 打印各关键指标并列 `current \| best @ep`，不再 IC 主导；② best 跟踪扩展到 val_loss/ic/da_score/excess_da/combined 五项，各记 `{value, epoch}`；③ 可懂指标三件套（振幅误差率/涨跌停命中率）只在产生 best 时算并记录，平凡 epoch 不算（无额外 forward）；④ checkpoint 仍只 3 个（val_loss/ic/combined），DA/可懂指标 best 仅记录值+epoch 不存独立 ckpt（X）；⑤ `update_training_info` 签名改为 `best_updates` dict，epoch_record 补 da_score/excess_da/可懂指标 | 原 epoch 输出 IC 主导，DA/excess_da 无 best 跟踪，可懂指标完全缺失；用户要求各关键指标补 current+best、best 时算可懂指标 | §10 |
+
+---
+
 ## 一、核心设计决策
 
 ### 1.1 归一化策略：Runtime 归一化
@@ -84,10 +94,18 @@ SampleSchema = {
 
 #### Time Split（时间分割）
 
+**语义（重要）**：按**每只股票序列内的样本位置序号**切分，不是按日期。`train_end`/`val_end` 是整数位置，表示"该股票序列内第 N 个样本"。因各股票数据按交易日升序排列，位置序号≈交易日序号（A 股每年约 244 个交易日）。
+
+- 每只股票独立切：长股票切 train/val/test 三份，短股票（序列长度 < train_end）可能全归 train。
+- 同一位置序号在不同股票对应不同日期（因各股票上市时间/停牌不同），但这不影响 target 区间不相交（每只股票内部位置单调）。
+- **用户估算**：train_end ≈ 训练期交易日数。如 train 用 2018-01~2023-06（约 5.5 年 ≈ 1340 交易日），可设 train_end≈1340；val 至 2024-12（再 1.5 年 ≈ 370 交易日），val_end≈1710。实际按数据调整。
+
 按 target_end 切分：
 ```python
 def time_split(samples, train_end, val_end):
     """
+    train_end/val_end: 整数位置（每只股票序列内样本序号）
+
     train: target_end <= train_end
     val:   target_start >= train_end and target_end <= val_end  
     test:  target_start >= val_end
@@ -98,9 +116,9 @@ def time_split(samples, train_end, val_end):
     return train_samples, val_samples, test_samples
 ```
 
-时间边界示例：
-- train_end: 2023-06-30
-- val_end: 2024-12-31
+位置边界示例（A 股约 244 交易日/年）：
+- train_end: 1340（≈ 2018-01 ~ 2023-06，5.5 年）
+- val_end: 1710（≈ 至 2024-12，再 1.5 年）
 
 #### Block Split（分层抽样）
 
@@ -283,17 +301,29 @@ assert normalizer.fit_range <= context_end, "normalizer 使用了未来数据"
 
 #### 1.5.2 Tokenizer 微调入口
 
+**采样机制（关键，对齐现有实现）**：tokenizer 微调**不用「按比例抽样」**（早期方案臆造的 `sample_ratio=0.1` 是错的，已删除），而是**步数驱动放回采样**——每 epoch 用 `RandomSampler(replacement=True, num_samples=n_train_iter)` 采样固定步数，跨 epoch 覆盖数据。这是现有 `deprecated/finetune/train_tokenizer.py:94-95,132` 的真实做法：
+
+```python
+n_train_iter = n_train_iter_multiplier * batch_size   # 默认 2000 * 16 = 32000 步/epoch
+n_val_iter   = n_val_iter_multiplier   * batch_size   # 默认 400  * 16 = 6400 步/epoch
+sampler = RandomSampler(dataset, replacement=True, num_samples=n_train_iter)  # 放回采样
+```
+
+步数驱动而非比例驱动的原因：数据量大时按比例抽样每 epoch 太长；放回采样 + 固定步数可控制每 epoch 时长，多 epoch 仍能覆盖全量。
+
 ```python
 # finetune/tokenizer/train.py
 
 def finetune_tokenizer(
     norm_mode: str,
-    model_type: str,            # mini → Kronos-Tokenizer-2k; small/base → Kronos-Tokenizer-base
-    data_path: str,             # 预处理后的训练数据（已含 norm_mode 归一化信息）
+    model_type: str,                     # mini → Kronos-Tokenizer-2k; small/base → Kronos-Tokenizer-base
+    data_path: str,                      # 预处理后的训练数据（已含 norm_mode 归一化信息）
     output_dir: str,
     epochs: int = 30,
     batch_size: int = 16,
     learning_rate: float = 0.001,
+    n_train_iter_multiplier: int = 2000, # 每 epoch 采样步数 = multiplier × batch_size
+    n_val_iter_multiplier: int = 400,    # val 步数 = multiplier × batch_size
     seed: int = 42
 ):
     """
@@ -303,10 +333,14 @@ def finetune_tokenizer(
     1. 按 model_type 选预训练 tokenizer：
        - mini → pretrained/Kronos-Tokenizer-2k
        - small/base → pretrained/Kronos-Tokenizer-base
-    2. 加载数据，QlibDataset 按 norm_mode 归一化
-    3. 微调循环：recon_loss + bsq_loss，标准 backward
-    4. 保存到 outputs/tokenizers/{norm_mode}/{model_type}/
+    2. 加载数据，KronosDataset 按 norm_mode 归一化
+    3. 步数驱动放回采样（非比例抽样），每 epoch n_train_iter 步
+    4. 微调循环：recon_loss + bsq_loss，标准 backward
+    5. 每 epoch 用 val split 算重建损失，early stopping
+    6. 保存到 outputs/tokenizers/{norm_mode}/{model_type}/
     """
+    set_seed(seed)
+
     # 1. 选预训练 tokenizer（架构由 model_type 决定）
     pretrained_map = {
         'mini': 'pretrained/Kronos-Tokenizer-2k',
@@ -316,33 +350,81 @@ def finetune_tokenizer(
     tokenizer = KronosTokenizer.from_pretrained(pretrained_map[model_type])
     tokenizer.to(device)
 
-    # 2. 数据按 norm_mode 归一化（QlibDataset/KronosDataset 内部处理）
-    dataset = KronosDataset(data, indices, config, mode='train')
+    # 2. 数据按 norm_mode 归一化（KronosDataset 内部处理）
+    train_dataset = KronosDataset(train_data, train_indices, config, mode='train')
+    val_dataset   = KronosDataset(val_data,   val_indices,   config, mode='val')
 
-    # 3. 微调循环
-    optimizer = torch.optim.AdamW(tokenizer.parameters(), lr=learning_rate, weight_decay=0.1)
+    # 3. 步数驱动放回采样（关键：非比例抽样）
+    n_train_iter = n_train_iter_multiplier * batch_size
+    n_val_iter   = n_val_iter_multiplier   * batch_size
+    train_loader = DataLoader(
+        train_dataset, batch_size=batch_size,
+        sampler=RandomSampler(train_dataset, replacement=True, num_samples=n_train_iter),
+        num_workers=0, drop_last=True,
+    )
+    val_loader = DataLoader(
+        val_dataset, batch_size=batch_size,
+        sampler=RandomSampler(val_dataset, replacement=True, num_samples=n_val_iter),
+        num_workers=0, drop_last=False,
+    )
+
+    # 4. 微调循环
+    optimizer = torch.optim.AdamW(
+        tokenizer.parameters(), lr=learning_rate, weight_decay=0.1,
+        betas=(0.9, 0.95),
+    )
+    scheduler = torch.optim.lr_scheduler.OneCycleLR(
+        optimizer, max_lr=learning_rate,
+        steps_per_epoch=len(train_loader), epochs=epochs, pct_start=0.03, div_factor=10,
+    )
+
+    best_val_loss = float('inf')
     for epoch in range(epochs):
-        for batch_x, _, _ in loader:
+        tokenizer.train()
+        for batch_x, _, _ in train_loader:
+            batch_x = batch_x.to(device)
             zs, bsq_loss, _, _ = tokenizer(batch_x)
             z_pre, z = zs
             recon_loss = F.mse_loss(z_pre, batch_x) + F.mse_loss(z, batch_x)
             loss = (recon_loss + bsq_loss) / 2
             optimizer.zero_grad()
             loss.backward()
+            torch.nn.utils.clip_grad_norm_(tokenizer.parameters(), max_norm=2.0)
             optimizer.step()
+            scheduler.step()
 
-    # 4. 保存（架构=预训练，权重=微调后）
+        # 5. val 重建损失 + early stopping
+        tokenizer.eval()
+        val_loss_sum, val_count = 0.0, 0
+        with torch.no_grad():
+            for batch_x, _, _ in val_loader:
+                batch_x = batch_x.to(device)
+                zs, _, _, _ = tokenizer(batch_x)
+                _, z = zs
+                vl = F.mse_loss(z, batch_x)
+                val_loss_sum += vl.item() * batch_x.size(0)
+                val_count += batch_x.size(0)
+        avg_val_loss = val_loss_sum / val_count
+
+        if avg_val_loss < best_val_loss - early_stopping_min_delta:
+            best_val_loss = avg_val_loss
+            tokenizer.save_pretrained(f"{output_path}/checkpoints/best_model")
+        # ... early stopping 逻辑（patience + grace period，参考 deprecated 实现）
+
+    # 6. 保存最终 + 元数据
     output_path = f"outputs/tokenizers/{norm_mode}/{model_type}"
-    tokenizer.save_pretrained(output_path)
+    tokenizer.save_pretrained(f"{output_path}/checkpoints/final_model")
 
-    # 5. 记录元数据（vocab_size 来自预训练架构，非微调参数）
     meta = {
         'norm_mode': norm_mode,
         'model_type': model_type,
-        'pretrained_base': pretrained_map[model_type],  # 基础架构来源
+        'pretrained_base': pretrained_map[model_type],
         'data_fingerprint': compute_fingerprint(data_path),
         'learning_rate': learning_rate,
         'epochs': epochs,
+        'n_train_iter': n_train_iter,        # 实际采样步数
+        'n_val_iter': n_val_iter,
+        'best_val_loss': best_val_loss,      # 重建损失（验收用）
     }
     with open(f"{output_path}/meta.json", 'w') as f:
         json.dump(meta, f, indent=2)
@@ -353,8 +435,10 @@ def finetune_tokenizer(
 python finetune/tokenizer/train.py \
     --norm-mode sliding_ma60 \
     --model mini \
-    --epochs 30
+    --epochs 30 \
+    --n-train-iter-multiplier 2000
 ```
+
 
 （数据来自 `finetune/data/processed/{norm_mode}/...`，已按 norm_mode 预处理）
 
@@ -401,31 +485,37 @@ checkpoint 必须记录 tokenizer 信息：
 
 Phase 2 新增 `finetune/tokenizer/train.py` 微调入口，确保 Phase 4 训练 predictor 时有「架构匹配 + 分布匹配」的 tokenizer。微调而非从零训练，故无需大规模数据/长训练，epochs≈30 即可（参考 `deprecated/finetune/train_tokenizer.py`）。
 
----
+#### 1.5.6 微调效果检验
 
-训练 predictor 前必须验证：
+**采样机制**（§1.5.2 已述）：步数驱动放回采样，非比例抽样。`n_train_iter = n_train_iter_multiplier × batch_size`（默认 32000 步/epoch），跨多 epoch 覆盖全量。
 
+**检验方式**（两层，对齐现有 `deprecated/finetune/train_tokenizer.py` + `validate_tokenizer.py`）：
+
+**层 1 — 训练中（自动）**：每 epoch 用 val split 算重建损失 `mse(z, batch_x)`（z = 分词后解码的重建），驱动 early stopping：
 ```python
-def validate_tokenizer_consistency(tokenizer_config, predictor_config):
-    """验证 tokenizer 和 predictor 数据一致性"""
-    assert tokenizer_config['norm_mode'] == predictor_config['norm_mode']
-    assert tokenizer_config['data_fingerprint'] == predictor_config['data_fingerprint']
-    print("Tokenizer consistency check passed")
+zs, _, _, _ = tokenizer(batch_x)
+_, z = zs
+val_loss = F.mse_loss(z, batch_x)   # 重建损失
+```
+记录 `best_val_loss` 到 meta.json。
+
+**层 2 — 训练后（脚本 `finetune/tokenizer/validate.py`）**：对比「预训练 tokenizer vs 微调后」在同一 val 数据上的重建误差 mean/std：
+```
+预trained Kronos-Tokenizer-2k:  0.001234 +/- 0.000456
+微调后 (sliding_ma60):          0.000987 +/- 0.000321   # 应更低
 ```
 
-checkpoint 必须记录 tokenizer 信息：
-```json
-{
-  "data": {
-    "norm_mode": "sliding_ma60",
-    "data_fingerprint": "sha256:..."
-  },
-  "tokenizer": {
-    "path": "outputs/tokenizers/sliding_ma60/mini",
-    "data_fingerprint": "sha256:..."
-  }
-}
-```
+**验收标准**：
+
+| 标准 | 级别 | 说明 |
+|------|------|------|
+| 微调后 val 重建损失 < 预训练在同数据重建损失 | 必要 | 证明 tokenizer 适应了目标 norm_mode 分布 |
+| 重建损失收敛（early stopping 触发，非暴力训满） | 必要 | 证明非过拟合式下降 |
+| 短 predictor 预训练 loss 下降、IC 非零 | 可选 | 下游验证分词对预测有效；本质属 Phase 4，非 tokenizer 阶段阻断项 |
+
+**重建损失的合理性**：重建损失是 tokenizer 微调的**直接目标**（编解码忠实重建该分布数据），微调后低于预训练即证明适应了分布。它是必要的微调质量指标。
+
+**重建损失的局限**：重建损失低 ≠ 分出来的 token 对预测有用（间接性）。一个完美重建但 token 冗余的 tokenizer 仍可能让 predictor 学不到东西。故「可选」层用短 predictor 训练做下游验证——但这是 Phase 4 的事，tokenizer 微调阶段用重建损失 + 与预训练对比即可，下游效果在 Phase 4 自然体现。
 
 ---
 
@@ -1163,33 +1253,62 @@ def init_training_info(output_dir, config):
     return info_path
 
 
-def update_training_info(info_path, epoch, metrics, is_best=False):
-    """每个 epoch 完成时更新"""
-    with open(info_path, 'r') as f:
+def update_training_info(info_path, epoch, metrics, best_updates=None):
+    """
+    每个 epoch 完成时更新 training_info
+
+    Args:
+        metrics: 本 epoch 的全部指标（含 da_score、excess_da、可懂指标，可懂指标在非 best 时为 None）
+        best_updates: 本 epoch 刷新的 best 列表，如
+            {'val_loss': (2.28, 7), 'ic': (0.2105, 7), 'combined': (0.478, 7)}
+            可懂指标（amplitude_error_rate, limit_hit_rate）仅在某 best 刷新时才填入
+    """
+    with open(info_path, 'r', encoding='utf-8') as f:
         info = json.load(f)
-    
-    # 添加 epoch 记录
+
+    # epoch 记录：所有关键指标并列（不再 IC 主导）
     epoch_record = {
         "epoch": epoch,
         "train_loss": metrics['train_loss'],
         "val_loss": metrics['val_loss'],
         "ic": metrics['ic'],
+        "da_score": metrics['da_score'],
+        "excess_da": metrics['excess_da'],
         "combined": metrics['combined'],
         "lr": metrics['lr'],
+        # 可懂指标：仅本 epoch 产生 best 时才有值，否则 None（平凡 epoch 不算，省时）
+        "amplitude_error_rate": metrics.get('amplitude_error_rate'),  # None 或 {mean, std, usable_pct}
+        "limit_hit_rate": metrics.get('limit_hit_rate'),              # None 或 {hit_rate, n_pred, n_actual}
         "time": datetime.now().isoformat(),
     }
     info['epochs'].append(epoch_record)
-    
-    # 更新 best
-    if is_best:
-        info['best']['ic'] = metrics['ic']
-        info['best']['combined'] = metrics['combined']
-        info['best']['epoch'] = epoch
-    
-    # 写回
-    with open(info_path, 'w') as f:
+
+    # 更新 best：每个关键指标独立记 best 值 + best epoch（checkpoint X：只记录，不存独立 ckpt）
+    if best_updates:
+        for metric_name, (value, best_epoch) in best_updates.items():
+            info['best'][metric_name] = {"value": value, "epoch": best_epoch}
+
+    with open(info_path, 'w', encoding='utf-8') as f:
         json.dump(info, f, indent=2)
 ```
+
+**epoch 打印（并列显示 current + best，不再 IC 主导）**：
+```
+Epoch 12/50  LR: 0.003000
+  IC:        current 0.1823  | best 0.2105 @ep8
+  DA_score:  current 0.5410  | best 0.5520 @ep10
+  Excess DA: current +4.1%   | best +6.2% @ep10
+  Combined:  current 0.4521  | best 0.4780 @ep8
+  Val_loss:  current 2.31    | best 2.28 @ep7
+  Train: 2.35, Time: 03:12
+```
+
+**best 跟踪与可懂指标三件套的设计（ABCD + checkpoint X）**：
+
+- **A. epoch 打印并列**：各关键指标并列显示 `current | best @ep`，不以 IC 为主标题。
+- **B. best 跟踪扩展**：每个关键指标（val_loss / ic / da_score / excess_da / combined）独立记 `best.{metric} = {value, epoch}`，写入 training_info 的 `best` 块。
+- **C. checkpoint 不泛滥（X）**：仍只存 3 个 checkpoint——`best_model`(val_loss) / `best_ic_model`(ic) / `best_combined_model`(combined)。da_score / excess_da / 可懂指标的 best **只记录值+epoch，不存独立 checkpoint**；需取某指标 best 时的模型，查 training_info 该指标 best epoch，对应取该 epoch 的 checkpoint。
+- **D. 可懂指标三件套只在产生 best 时算**：振幅误差率 + 涨跌停命中率 在本 epoch 刷新任一 best（val_loss / ic / combined）时才收集计算，记入该 best 的 epoch_record 与 `best` 块；平凡 epoch 不算（省时，无额外 forward，pred_raw 已有，仅多两个 numpy 运算）。方向胜率 = DA（已有，不算额外）。
 
 **training_info.json 结构**：
 ```json
@@ -1222,21 +1341,43 @@ def update_training_info(info_path, epoch, metrics, is_best=False):
       "train_loss": 2.5,
       "val_loss": 2.3,
       "ic": 0.05,
+      "da_score": 0.51,
+      "excess_da": 0.01,
       "combined": 0.03,
       "lr": 0.01,
+      "amplitude_error_rate": null,
+      "limit_hit_rate": null,
       "time": "2026-06-19T10:05:00"
     },
-    ...
+    {
+      "epoch": 8,
+      "train_loss": 2.1,
+      "val_loss": 2.28,
+      "ic": 0.2105,
+      "da_score": 0.55,
+      "excess_da": 0.05,
+      "combined": 0.478,
+      "lr": 0.006,
+      "amplitude_error_rate": {"mean_rate": 1.05, "std_rate": 0.18, "usable_pct": 0.72},
+      "limit_hit_rate": {"hit_rate": 0.12, "n_pred_limit": 340, "n_actual_limit": 280},
+      "time": "2026-06-19T10:40:00"
+    }
   ],
   "best": {
-    "ic": 0.15,
-    "combined": 0.12,
-    "epoch": 25
+    "val_loss": {"value": 2.28, "epoch": 7},
+    "ic": {"value": 0.2105, "epoch": 8},
+    "da_score": {"value": 0.5520, "epoch": 10},
+    "excess_da": {"value": 0.062, "epoch": 10},
+    "combined": {"value": 0.4780, "epoch": 8},
+    "amplitude_error_rate": {"value": 1.05, "epoch": 8},
+    "limit_hit_rate": {"value": 0.12, "epoch": 8}
   }
 }
 ```
 
 训练结束时更新 status 为 "completed" 或 "early_stopped"。
+
+> **对代码现状的说明**：现有 train.py 的 `update_training_info`（行 152-184）已是 9 字段（含 da_score、excess_da），但 `best` 块仍只跟 ic/combined（旧版），未扩展到 da_score/excess_da/可懂指标；epoch 打印仍 IC 主导（行 629-630）；可懂指标三件套未在 train 路径收集。本节为待实现目标，开发人员按上述 ABCD + X 改造 train.py 的 best 跟踪与 epoch 输出。
 
 ---
 

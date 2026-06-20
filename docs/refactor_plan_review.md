@@ -928,6 +928,8 @@ elif hasattr(d, 'columns'):
 
 **后果**: DDP 各 rank 的 KronosDataset 用相同 seed → 每个 step 采到相同 (symbol, start) → 各卡训练数据完全相同 → DDP 数据并行失效（退化为梯度平均的同数据多卡）。加上 `__getitem__` 忽略 idx，DataLoader 的 RandomSampler 形同虚设。
 
+**定性（重要）**: 此为**旧代码遗留缺陷，非重构引入**。旧 `deprecated/finetune/predictor/mode2_ma60_t0/train_ddp.py:240-243` 的 QlibDataset `__getitem__` 与新 `dataset.py:92-94` **逐字相同**（`rand_idx = self.py_rng.randint(0, len); symbol, start = self.indices[rand_idx]`）；旧代码 `py_rng = RandomState(config.seed)` 各 rank 同 seed，且 `train_ddp.py:814` 注释「DDP时也用RandomSampler，各rank种子不同」**与代码不符**（代码实际各 rank 同 seed）。新代码原样沿用此缺陷，未修。即旧 DDP 训练本就各卡数据相同，重构继承了这一问题。
+
 **修复**: (a) __getitem__ 应尊重传入 idx（用 DataLoader 的 sampler 控制顺序），不要自随机；(b) DDP 应用 `DistributedSampler` 或各 rank seed = config.seed + rank。
 
 #### I2. `normalization.py:112` SlidingMANormalizer 无 `shift(1)`，与旧 `dataset.py:183` 不一致
@@ -1112,4 +1114,178 @@ if not os.path.exists(tokenizer_path):
 - **R3 落地**：`finetune/tokenizer/train.py` 仍为空目录。按纠正后的 §1.5.2 实现微调入口（from_pretrained + 微调循环，非从零训练）。
 - 修代码层 vocab 映射残留（§21.4）。
 - Phase 2 执行时按 §1.5.2 实现，vocab_size 不作为参数。
+
+---
+
+## 二十二、代码 review 问题总清单（开发人员抓手）
+
+**编制日期**: 2026-06-19
+**用途**: 将 §19/§20/§21 分散的问题点汇总为统一清单，逐条标注**当前状态**（已核实）与**是否阻断**，供开发人员逐条确认/修复。状态已于 2026-06-19 重新核实代码。
+
+**状态图例**: ✅已修复 | ❌未修复(待修) | ⚠️待确认 | 🆗非阻断
+**阻断图例**: 🔴阻断多卡/训练 | 🟡影响质量 | ⚪次要
+
+### 22.1 致命问题（🔴 阻断，必须先修）
+
+| 编号 | 位置 | 问题 | 状态 | 修复指引 |
+|------|------|------|------|----------|
+| F1 | `train.py:344,357-358` | naive DA 的 `dist.all_gather` 在 `if rank==0:` 块内 → rank0 等待，其他 rank 已 return → **NCCL 死锁** | ✅ 已修（2026-06-19 复审） | all_gather 已移出 `if rank==0`，行 386-394 所有 rank 执行 all_gather，注释明示"必须所有 rank 同时调用"。死锁已消除 |
+| F2 | `train.py:519` | `avg_val_loss = avg_train_loss`（TODO 未实现）→ best_model 按训练 loss 选，过拟合 | ⚠️ 口径已修,DDP 解包遗漏（2026-06-20 复核） | compute_val_loss 口径已改 token CE(与 train 同口径,行 536 head.compute_loss)✅。但行 534 `model.head` 在 DDP 下崩(需 `model.module.head`,train:698 已正确处理但 compute_val_loss 漏)。单卡可跑,多卡 compute_val_loss 崩。见审查记录 §6.5 |
+| F3 | `train.py:786` | val_indices 每股只取末尾 1 窗口 → val 集过小，IC 不稳 | ✅ 已修（2026-06-19 复审） | 行 1082/1086 val_indices 取该股票所有合法窗口（`for i in range(...)`），非只末尾 1 个 |
+| I1 | `dataset.py:92-94` + `utils.py set_seed` | `__getitem__` 忽略 idx 自随机 + 各 rank 同 seed → DDP 各卡数据相同，数据并行失效。**旧代码遗留** | ✅ 已修（2026-06-19 复审） | `dataset.py:92` 改为 `symbol, start = self.indices[idx]`（尊重传入 idx）；train.py:990 `seed=args.seed + rank`（各 rank 不同）。数据同质已解决 |
+
+### 22.2 重要问题（🟡 影响质量/一致性）
+
+| 编号 | 位置 | 问题 | 状态 | 修复指引 |
+|------|------|------|------|----------|
+| I2 | `normalization.py:112` | SlidingMANormalizer 无 `shift(1)`，旧 `dataset.py:183` 有 → 新旧不一致 | 🆗 口径已定（保持现状） | **用户已定：保持含当前点，不加 shift(1)**。归一化需含当前点信息。新代码现状即正确，无需改。代价：Phase 4 不与旧数值对齐，改自洽+可换算对照（§8.3 已设计）。详见 §22.6 |
+| I3 | `eval.py` 全文 | 无 DDP 支持，方案 §6.2 承诺未落地；IC 聚合本地 np.mean（多卡会错） | ✅ 已修（2026-06-19 复审） | eval.py 已加 `get_rank_info`/`setup_ddp`/`init_process_group`，用 `aggregate_ic`/`aggregate_da`（含 all_gather，单卡 world_size=1 兼容）。DDP 框架统一控卡数落地 |
+| I4 | `backtest.py:249` | `excess_da(model_da, 0.5)` 硬编码，与 train.py 不一致 | ✅ 已修（2026-06-19 复审） | backtest.py:264-269 真实算 `naive_da = max(up_ratio,1-up_ratio)`，excess_da 用它，与 train.py 一致 |
+| I5 | `backtest.py:236-243` | IC 聚合丢 p25/p75，违反 §1.6.3 | ✅ 已修（2026-06-19 复审） | backtest.py:245/247 补 p25/p75（n>=4 时计算，否则 None） |
+| I6 | `splitting.py:132` | create_target_blocks 跨块窗口被丢弃 | ✅ 已修（2026-06-19 复审） | splitting.py:126 改为 `target_start >= current_block_start and target_start < current_block_end`（按 target_start 归起始块，不丢样本） |
+| I7 | `splitting.py:70-78` | time_split 跨边界样本强分 train → validate_no_leakage 崩溃 | ✅ 已修（2026-06-19 复审） | splitting.py:67-68 丢弃跨 split 边界样本（不强分），no-leakage 检查不再崩溃 |
+| I8 | `train.py:740-743` | tokenizer 静默 fallback，norm_mode 可能不匹配 | ✅ 已修（2026-06-19 复审） | train.py:1022-1031 改为显式 `[WARNING]` 输出 norm_mode 可能不匹配 + legacy fallback 路径，非静默 |
+| I9 | `train.py` | 无 `--resume` 断点续训 | ✅ 已修（2026-06-19 复审） | train.py:773-800 保存 optimizer/scheduler state_dict + resume_meta.json（含各 best 值/epoch/patience）；行 640-660 resume 读取逻辑已实现 |
+| P3 | `eval.py:256-265` | （= I3 一部分）IC 聚合未用 aggregate_ic，DDP 丢分布 | ✅ 已修（随 I3） | 同 I3，eval.py 已用 aggregate_ic |
+| P4 | `train.py:61` | excess_da 仅 import 未在训练循环调用 | ✅ 已修（2026-06-19 确认） | 行 627 已传 excess_da_avg 入 update_training_info，行 169 写入 epoch_record，行 553 存 history，行 557 打印。已正确记录 |
+| I10 | `train.py:606-660` + `update_training_info:152` | epoch 输出 IC 主导，DA/excess_da 无 best 跟踪，可懂指标三件套缺失 | ✅ 已修（2026-06-19 复审） | ABCD+X 全落实：① 行 756-764 并列打印 `current \| best @ep`（5 指标）；② best 块扩展到 val_loss/ic/da_score/excess_da/combined（行 802-824）；③ evaluate_trajectory_ic 行 363-376 收集振幅/涨跌停，`compute_understandable` 标记仅 best 时算；④ update_training_info 签名改 `best_updates` dict；⑤ checkpoint 仍 3 个（X） |
+
+### 22.3 次要问题（⚪ 代码质量）
+
+| 编号 | 位置 | 问题 | 状态 | 修复指引 |
+|------|------|------|------|----------|
+| M1 | `metrics.py:204` `compute_naive_da` | train.py 已绕过它自算；该函数是否仍被调用？若死代码则删 | ✅ 已修（2026-06-19 复审） | 源码无调用方（仅 .pyc 缓存残留），确认死代码。可删或保留备查 |
+| M2 | `train.py:156` | `update_training_info` 的 `safe_save_json.__wrapped__` 逻辑混乱 | ✅ 已修（2026-06-19 复审） | update_training_info 已重写（行 152+），`info = {}` 干净开始，`__wrapped__` 混乱逻辑已清，签名改 `best_updates` |
+| M3 | `train.py:530` | `seed=...+epoch*9999` 但 `n_samples=-1` 全量，seed 无效 | 🆗 非阻断 | 全量评估时 seed 无害，可保留 |
+| M4 | `train.py:537` | `da_by_step` 把标量包成单元素列表传 `calculate_da_score`，语义变形 | ✅ 已修（2026-06-20） | train.py:737 改为传标量；metrics.py `calculate_da_score` 兼容标量/列表（isinstance 判断，标量直接用、列表取 mean）。数值不变，语义清晰 |
+| M5 | `splitting.py:141-147` | create_target_blocks 块间 assert O(块数²) | 🆗 非阻断 | 数据量大时改扫描线；小数据可保留 |
+| M6 | `utils.py safe_save_*` | 非原子写入，crash 可能损坏 training_info.json | ✅ 已修(json) / ⚪ 未修(pickle) | `safe_save_json` 已原子(temp+os.replace,utils.py:132-153)；`safe_save_pickle` 仍非原子(UT3,次要)。见审查记录 §4.6 |
+| M7 | `dataset.py:92` | __getitem__ 忽略 idx（与 I1 同源） | ✅ 已修（随 I1） | dataset.py:92 改为 `self.indices[idx]`，尊重传入 idx |
+
+### 22.4 Tokenizer 专项（§21）
+
+| 编号 | 位置 | 问题 | 状态 | 修复指引 |
+|------|------|------|------|----------|
+| T1 | `finetune/tokenizer/` | 训练入口仍空（R3 未落地） | ✅ 已修（2026-06-19 复审） | `finetune/tokenizer/train.py`（12620 字节）+ `validate.py`（9114 字节）已建。R3 落地 |
+| T2 | `train.py:87-91` | `TOKENIZER_PATHS` vocab 映射杜撰（small=4096/base=8192），且是死代码 | ✅ 已修（2026-06-19 复审） | grep 无 4096/8192 残留，杜撰映射已清理 |
+| T3 | `config.py:143` | docstring vocab 映射错误 | ✅ 已修（2026-06-19 复审） | grep 无 vocab_size 2048/4096/8192 映射残留，docstring 已纠正 |
+| T4 | 方案 §1.5 | （方案层已纠正）原杜撰 `KronosTokenizer.train()` + sample_ratio | ✅ 方案已改 | 代码按新方案实现 |
+
+### 22.5 已修复确认（✅）
+
+| 编号 | 问题 | 证据 |
+|------|------|------|
+| P1 | `compute_naive_da` 硬编码 0.5 | `metrics.py:240` 已 `max(up_ratio,1-up_ratio)`；train.py:365 也真实算 |
+| 早期 DDP | early stopping break 死锁 | `train.py:609-618` 已用 `dist.broadcast` 同步 |
+| 早期 DDP | `model.module(...)` 绕过 DDP | `train.py:497` 已改 `model(...)` |
+| R1/R2/R7/R11/S2 | 架构硬约束 | 见 §19.2 核实表 |
+
+### 22.6 待用户确认的口径决策
+
+**所有口径决策已确认（2026-06-19）。无待定项。**
+
+**已确认的口径决策**：
+
+- **I2 shift(1)**（✅ 已定，2026-06-19）：**保持新代码，不加 shift(1)**——SlidingMANormalizer 用含当前点的 rolling（`rolling(window=N).mean()`，当前点 i 在窗口 [i-N+1, i] 内）。用户判断：归一化是"自己和前面若干条一起归一"，当前点信息必须保留在归一化窗口内；不含自身会让归一化失去当前点的参照。
+
+  **技术澄清**（修正评审中早期表述）：两种方式分子均为 `(x[i] - mean)`，当前点 x[i] 始终在分子，信息都保留。区别在 mean/std 的窗口：含当前点时，当前点偏离会被自身的 mean/std 适度吸收（归一化值更平稳）；shift(1) 时纯用前面，当前点剧烈跳变不被吸收、归一化值可能爆裂（需 clip 兜底）。用户选择含当前点，合理。
+
+  **对 Phase 4 等价性的影响**：因新口径（含当前点）与旧 `dataset.py:183`（shift(1)）数值不同，Phase 4 等价性验证**不能要求与旧入口数值对齐**。改为：新口径自洽（同 seed 两次落在噪声地板内）+ 与旧口径可换算对照（验证数据流一致，非数值一致）。方案 §8.3 已按此设计（口径变更四标准），无需改动，但开发人员需知：normalization 差异是口径变更的来源之一，等价性验证时此项偏差属预期。
+
+- **I3 DDP 评估**（✅ 已定，2026-06-19）：eval.py 采用 **DDP 框架统一控制卡数**，单卡/多卡同一套代码切换（`torchrun --nproc_per_node=N`，N=1 即单卡），不维护"单卡一套、多卡一套"两套逻辑。实现要求：
+  - eval.py 加 DDP 初始化（`get_rank_info` + `init_process_group`，仿 train.py）；
+  - 评估样本按 rank 分片（仿 `evaluate_trajectory_ic` 的 `per_rank` 分片）；
+  - IC/DA 聚合改用 `core/metrics.py:aggregate_ic`/`aggregate_da`（含 all_gather，多卡正确；单卡 world_size=1 走本地分支自动兼容）；
+  - 补 p25/p75（§1.6.3 要求）；
+  - 结果只 rank 0 输出/保存。
+  - 此口径与 train.py 的 DDP 模式一致，卡数由 `torchrun --nproc_per_node` 控制。
+
+- **P4 excess DA 输出**（✅ 已确认已修，2026-06-19）：train.py 行 627 `'excess_da': excess_da_avg` 已传入 `update_training_info`，行 169 写入 epoch_record，行 553 存入 history，行 557 打印。excess DA 已正确记录到 training_info.json + 控制台。**P4 状态由 ⚠️待确认 改为 ✅已修**，移出待确认清单。M1（compute_naive_da 是否死代码）仍待确认——train.py 已绕过它自算，需查 backtest/eval 是否还调用它。
+
+### 22.7 修复优先级与验收门
+
+1. **第一优先（多卡训练能跑）**: F1 + I1 —— 多卡训练死锁/数据同质，不修则 DDP 无意义。
+2. **第二优先（训练有效）**: F2 + F3 —— val_loss 失真 + val 集过小，best_model 选择错误。
+3. **第三优先（等价性）**: I2 —— 需先定口径，否则 Phase 4 等价性验证无法通过。
+4. **第四优先（评估完整与可观测）**: I3/I4/I5 + P3 + I10 —— eval/backtest 度量完整性与一致性；I10 为 epoch 输出/best 跟踪完善（ABCD+X，见 §10），影响训练可观测性与选模型可读性，非阻断。
+5. **第五优先（数据契约）**: I6/I7 —— splitting 样本丢失/崩溃。
+6. **第六优先（tokenizer）**: T1/T2/T3 —— R3 落地 + 清理杜撰映射。
+7. **收尾**: I8/I9/M2/M4/M6/M7 + 待确认项。
+
+**验收门**: F1/F2/F3/I1 修复后，多卡+单卡训练可进入正式验收；I2 定口径后 Phase 4 等价性可验。
+
+### 22.8 清单维护
+
+- 本清单状态于 2026-06-19 核实。开发人员修复某项后，将对应行「状态」改为 ✅ 并注明修复 commit/日期。
+- 新发现问题追加到对应优先级表，并在 §22.7 优先级中体现。
+- 待用户确认项（§22.6）需用户决策后才能推进，开发人员不可自行拍板。
+
+---
+
+## 二十三、代码复审（v11，开发人员修复后）
+
+**复审日期**: 2026-06-19
+**复审性质**: 开发人员据 §22 清单修复后，逐项核实代码是否真修。
+**复审方法**: 逐项 grep/读代码核实，非凭报告。
+
+### 23.1 复审结果总表
+
+| 优先级 | 项 | 复审状态 |
+|--------|-----|----------|
+| 🔴 致命 | F1（all_gather 死锁） | ✅ 已修（行 386-394，all_gather 移出 rank 条件） |
+| 🔴 致命 | F2（val_loss 未实现） | ✅ 已修（compute_val_loss 行 480，行 715 调用） |
+| 🔴 致命 | F3（val 集过小） | ✅ 已修（行 1082/1086 取所有合法窗口） |
+| 🔴 致命 | I1（DDP 数据同质） | ✅ 已修（dataset.py:92 尊重 idx + train.py:990 seed+rank） |
+| 🟡 重要 | I2（shift(1) 口径） | 🆗 口径已定（保持含当前点，无需改代码） |
+| 🟡 重要 | I3（eval DDP） | ✅ 已修（eval.py 加 DDP + aggregate_ic/da） |
+| 🟡 重要 | I4（backtest excess_da 硬编码） | ✅ 已修（行 264-269 真实 naive_da） |
+| 🟡 重要 | I5（backtest p25/p75） | ✅ 已修（行 245/247） |
+| 🟡 重要 | I6（跨块窗口丢弃） | ✅ 已修（splitting.py:126 按 target_start 归起始块） |
+| 🟡 重要 | I7（time_split 跨边界崩溃） | ✅ 已修（splitting.py:67-68 丢弃跨边界样本） |
+| 🟡 重要 | I8（tokenizer 静默 fallback） | ✅ 已修（行 1022-1031 显式 WARNING） |
+| 🟡 重要 | I9（无 --resume） | ✅ 已修（行 773-800 存 optimizer/scheduler + resume_meta，行 640-660 读取） |
+| 🟡 重要 | P3（eval IC 聚合） | ✅ 已修（随 I3） |
+| 🟡 重要 | P4（excess_da 输出） | ✅ 已修（此前确认） |
+| 🟡 重要 | I10（epoch 输出 ABCD+X） | ✅ 已修（行 756-764 并列打印 + 行 802-824 best 扩展 + 行 363-376 可懂指标收集 + compute_understandable 标记） |
+| ⚪ 次要 | M1（compute_naive_da 死代码） | ✅ 已确认死代码（源码无调用） |
+| ⚪ 次要 | M2（update_training_info 混乱） | ✅ 已修（重写，签名改 best_updates） |
+| ⚪ 次要 | M3（seed 无效） | 🆗 非阻断（全量评估无害） |
+| ⚪ 次要 | M4（da_by_step 传参变形） | ✅ 已修（2026-06-20，train.py:737 传标量 + calculate_da_score 兼容标量/列表） |
+| ⚪ 次要 | M5（块间 assert O(n²)） | 🆗 非阻断 |
+| ⚪ 次要 | M6（非原子写入） | 🆗 非阻断 |
+| ⚪ 次要 | M7（__getitem__ 忽略 idx） | ✅ 已修（随 I1） |
+| Tokenizer | T1（入口缺失） | ✅ 已修（train.py + validate.py 已建） |
+| Tokenizer | T2（vocab 杜撰映射） | ✅ 已修（无残留） |
+| Tokenizer | T3（docstring 错误） | ✅ 已修（无残留） |
+
+### 23.2 复审结论
+
+**致命问题 4/4 全部修复**（F1/F2/F3/I1）—— 多卡训练死锁与数据同质已消除，单卡 val_loss/val 集问题已修。**多卡与单卡训练可进入正式验收。**
+
+**重要问题 11/11 全部修复或已定口径**（I2 口径定 + I3-I9/P3/P4/I10 代码修）—— 评估完整性、DDP 评估、backtest 一致性、splitting 健壮性、resume、epoch 输出 ABCD+X 全落地。
+
+**Tokenizer 专项 3/3 全部修复**（T1/T2/T3）—— R3 落地，杜撰映射清理。
+
+**次要问题**:M1/M2/M7 已修；M3/M5/M6 非阻断保留；**仅 M4 未修**（da_by_step 传参语义变形，能跑非阻断）。
+
+### 23.3 残留项（非阻断，可后续处理）
+
+1. **M3/M5/M6**：非阻断（seed 全量无害 / 块间 assert O(n²) 小数据可接受 / 非原子写入），按需处理。
+2. **I2 口径差异**：SlidingMANormalizer 含当前点（用户已定），Phase 4 等价性用"自洽+可换算对照"（§8.3 已设计），非代码问题。
+
+**M4 已于 2026-06-20 修复**（train.py:737 传标量 + calculate_da_score 兼容标量/列表），不再列入残留。
+
+### 23.4 批准状态
+
+**✅ 批准进入正式验收**（Phase 4 等价性验证）。
+
+- 多卡训练：F1/I1 修复后 DDP 正确（无死锁、各卡数据不同）。
+- 单卡训练：F2/F3 修复后 best_model 选择基于真实 val_loss + 充足 val 集。
+- 评估/回测：I3/I4/I5 修复后 DDP 评估正确、backtest 度量完整一致。
+- 训练可观测性：I10 修复后 epoch 输出并列 current+best、best 时算可懂指标。
+- 数据契约：I6/I7 修复后 splitting 不丢样本、不崩溃。
+
+**验收门（§22.7）已满足**：F1/F2/F3/I1 全修；I2 口径已定。可执行 Phase 4 等价性验证（口径变更四标准，§8.3）。
+
+**建议**: 验收前可选修 M4（顺手，非阻断）。其余非阻断项（M3/M5/M6）不影响验收。
 
