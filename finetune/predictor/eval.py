@@ -29,6 +29,7 @@ import argparse
 import pickle
 import numpy as np
 import torch
+import torch.distributed as dist
 from tqdm import tqdm
 
 script_dir = os.path.dirname(os.path.abspath(__file__))
@@ -60,8 +61,38 @@ from finetune.predictor.core.metrics import (
     detect_limit,
     format_metrics_report,
     excess_da,
+    aggregate_ic,
+    aggregate_da,
 )
 from finetune.predictor.core.utils import get_device, format_time
+
+
+# ============================================================================
+# DDP 工具（从 train.py 复用）
+# ============================================================================
+
+def get_rank_info():
+    """获取 DDP rank 信息"""
+    if 'RANK' in os.environ:
+        rank = int(os.environ['RANK'])
+        local_rank = int(os.environ['LOCAL_RANK'])
+        world_size = int(os.environ['WORLD_SIZE'])
+        return rank, local_rank, world_size, True
+    return 0, 0, 1, False
+
+def setup_ddp(rank, local_rank, world_size):
+    """初始化 DDP"""
+    dist.init_process_group(
+        backend='nccl',
+        rank=rank,
+        world_size=world_size,
+    )
+    torch.cuda.set_device(local_rank)
+
+def cleanup_ddp():
+    """清理 DDP"""
+    if dist.is_initialized():
+        dist.destroy_process_group()
 
 
 # ============================================================================
@@ -72,10 +103,15 @@ def load_model_and_tokenizer(
     norm_mode: str,
     model_type: str,
     device: torch.device,
-    checkpoint: str = 'best_combined_model'
+    checkpoint: str = 'best_combined_model',
+    lookback: int = 400,      # EV1 修复：从 CLI 传入
+    predict: int = 10,        # EV1 修复
+    split_mode: str = 'block', # EV1 修复
 ):
     """
     加载模型和 tokenizer
+
+    EV1 修复：lookback/predict/split_mode 从 CLI 传入，避免硬编码导致数据模型错配
     """
     # Tokenizer
     tokenizer_path = get_tokenizer_path(norm_mode, model_type)
@@ -95,13 +131,24 @@ def load_model_and_tokenizer(
     model = Kronos.from_pretrained(pretrained_paths[model_type])
     model.eval().to(device)
 
-    # Checkpoint
-    model_dir = get_model_path(norm_mode, 400, 10, 'block', model_type)
+    # Checkpoint（EV1 修复：使用传入参数，不再硬编码）
+    model_dir = get_model_path(norm_mode, lookback, predict, split_mode, model_type)
     checkpoint_path = get_checkpoint_path(model_dir, checkpoint)
 
-    if os.path.exists(os.path.join(checkpoint_path, 'model.safetensors')):
-        state_dict = load_file(os.path.join(checkpoint_path, 'model.safetensors'))
-        model.load_state_dict(state_dict, strict=False)
+    checkpoint_file = os.path.join(checkpoint_path, 'model.safetensors')
+    if os.path.exists(checkpoint_file):
+        state_dict = load_file(checkpoint_file)
+        # EV2 修复：checkpoint 与模型对不上直接报错（不静默用错权重）
+        missing, unexpected = model.load_state_dict(state_dict, strict=False)
+        if missing or unexpected:
+            raise RuntimeError(
+                f"Checkpoint 与模型不匹配，拒绝加载: missing={missing}, unexpected={unexpected}"
+            )
+        print(f"[INFO] Loaded checkpoint: {checkpoint_path}")
+    else:
+        # EV3 修复：显式警告找不到 checkpoint，使用预训练
+        print(f"[WARNING] Checkpoint not found at {checkpoint_path}")
+        print(f"[WARNING] Using pretrained model instead - evaluation may not reflect fine-tuned performance")
 
     return model, tokenizer
 
@@ -118,15 +165,20 @@ def evaluate(
     device: torch.device,
     n_samples: int = -1,
     seed: int = 42,
-    limit_pct: float = 0.10
+    limit_pct: float = 0.10,
+    rank: int = 0,
+    world_size: int = 1,
+    model_type: str = 'mini',
 ):
     """
     评估模型（正确口径）
+
+    DDP 模式：各 rank 按轮询分配样本，最后用 all_gather 聚合
     """
     model.eval()
     tokenizer.eval()
 
-    rng = np.random.RandomState(seed)
+    rng = np.random.RandomState(seed)  # EV6 修复：所有 rank 同 seed 抽同样本，再按 idx%world_size 分片
 
     # 构建窗口索引
     indices = []
@@ -137,11 +189,13 @@ def evaluate(
         elif hasattr(d, 'columns'):
             seq_len = len(d)
             if seq_len >= config.lookback + config.predict:
-                indices.append((symbol, seq_len - config.lookback - config.predict))
+                for i in range(seq_len - config.lookback - config.predict + 1):
+                    indices.append((symbol, i))
         else:
             seq_len = len(d['normalized'])
             if seq_len >= config.lookback + config.predict:
-                indices.append((symbol, seq_len - config.lookback - config.predict))
+                for i in range(seq_len - config.lookback - config.predict + 1):
+                    indices.append((symbol, i))
 
     # 抽样
     if n_samples > 0 and n_samples < len(indices):
@@ -158,7 +212,11 @@ def evaluate(
     amplitude_rates = []
     limit_results = {'pred_limit': [], 'actual_limit': []}
 
-    for (symbol, start) in tqdm(indices, desc="Evaluating"):
+    # DDP 分片：每个 rank 只处理属于它的样本（按轮询分配）
+    for idx, (symbol, start) in enumerate(tqdm(indices, desc=f"Rank {rank} Evaluating", disable=rank != 0)):
+        if idx % world_size != rank:
+            continue  # 跳过不属于该 rank 的样本
+
         d = test_data[symbol]
         end = start + config.lookback + config.predict
 
@@ -206,7 +264,7 @@ def evaluate(
                 preds = auto_regressive_inference(
                     tokenizer, model,
                     x_tensor, x_stamp_tensor, y_stamp_tensor,
-                    max_context=2048,
+                    max_context={'mini': 2048, 'small': 512, 'base': 512}.get(model_type, 2048),  # EV9 修复：按 model_type
                     pred_len=config.predict,
                     clip=config.clip,
                     T=1.0,
@@ -259,50 +317,88 @@ def evaluate(
         except Exception:
             continue
 
-    # 聚合结果
-    ic_result = {}
-    for fn in FEATURE_NAMES:
-        ics = ic_lists[fn]
-        if ics:
-            ics_arr = np.array(ics)
-            n = len(ics)
-            ic_result[fn] = {
-                'mean': float(np.mean(ics_arr)),
-                'std': float(np.std(ics_arr)) if n >= 2 else 0.0,
-                'p25': float(np.percentile(ics_arr, 25)) if n >= 4 else None,
-                'p50': float(np.percentile(ics_arr, 50)),
-                'p75': float(np.percentile(ics_arr, 75)) if n >= 4 else None,
-                'n': n,
-            }
-        else:
-            ic_result[fn] = {'mean': 0.0, 'std': 0.0, 'p25': None, 'p50': None, 'p75': None, 'n': 0}
+    # 聚合结果（DDP 模式用 all_gather）
+    use_ddp = world_size > 1
 
-    da_result = {}
-    naive_da_by_step = {}  # {step_idx: naive_da}
-    for step_idx in range(config.predict):
-        step_result = {}
+    if use_ddp:
+        # DDP 聚合
+        ic_result = aggregate_ic(ic_lists, world_size, device, rank == 0)
+        da_result = aggregate_da(da_by_step, world_size, device, config.predict, rank == 0)
+
+        # 聚合 actual_dir 用于 naive DA（EV7 修复：计数法，避免列表 padding）
+        # 与 train.py:386-412 同源：all_gather up_count/n 标量，rank0 算 up_ratio
+        naive_da_by_step = {}
+        for step_idx in range(config.predict):
+            local_actual = actual_dir_by_step[step_idx]
+            local_up_count = int(sum(local_actual))
+            local_n = len(local_actual)
+
+            up_count_tensor = torch.tensor([local_up_count], device=device)
+            n_tensor = torch.tensor([local_n], device=device)
+
+            gathered_up = [torch.zeros_like(up_count_tensor) for _ in range(world_size)]
+            gathered_n = [torch.zeros_like(n_tensor) for _ in range(world_size)]
+
+            # 所有 rank 执行 all_gather
+            dist.all_gather(gathered_up, up_count_tensor)
+            dist.all_gather(gathered_n, n_tensor)
+
+            # 只 rank 0 组装
+            if rank == 0:
+                total_up = sum(t.item() for t in gathered_up)
+                total_n = sum(t.item() for t in gathered_n)
+                if total_n > 0:
+                    up_ratio = total_up / total_n
+                    naive_da_by_step[step_idx] = float(max(up_ratio, 1 - up_ratio))
+                else:
+                    naive_da_by_step[step_idx] = 0.5
+    else:
+        # 单进程聚合
+        ic_result = {}
         for fn in FEATURE_NAMES:
-            da_list = da_by_step[step_idx][fn]
-            if da_list:
-                da_arr = np.array(da_list)
-                n = len(da_list)
-                step_result[fn] = {
-                    'mean': float(np.mean(da_arr)),
-                    'std': float(np.std(da_arr)) if n >= 2 else 0.0,
-                    'p50': float(np.percentile(da_arr, 50)),
+            ics = ic_lists[fn]
+            if ics:
+                ics_arr = np.array(ics)
+                n = len(ics)
+                ic_result[fn] = {
+                    'mean': float(np.mean(ics_arr)),
+                    'std': float(np.std(ics_arr)) if n >= 2 else 0.0,
+                    'p25': float(np.percentile(ics_arr, 25)) if n >= 4 else None,
+                    'p50': float(np.percentile(ics_arr, 50)),
+                    'p75': float(np.percentile(ics_arr, 75)) if n >= 4 else None,
                     'n': n,
                 }
             else:
-                step_result[fn] = {'mean': 0.0, 'std': 0.0, 'p50': None, 'n': 0}
-        da_result[f'step{step_idx + 1}'] = step_result
+                ic_result[fn] = {'mean': 0.0, 'std': 0.0, 'p25': None, 'p50': None, 'p75': None, 'n': 0}
 
-        # 计算 naive DA（多数方向比例）
-        actual_dirs = actual_dir_by_step[step_idx]
-        if actual_dirs:
-            up_ratio = np.mean(actual_dirs)
-            naive_da_by_step[step_idx] = float(max(up_ratio, 1 - up_ratio))
-        else:
-            naive_da_by_step[step_idx] = 0.5
+        da_result = {}
+        naive_da_by_step = {}
+        for step_idx in range(config.predict):
+            step_result = {}
+            for fn in FEATURE_NAMES:
+                da_list = da_by_step[step_idx][fn]
+                if da_list:
+                    da_arr = np.array(da_list)
+                    n = len(da_list)
+                    step_result[fn] = {
+                        'mean': float(np.mean(da_arr)),
+                        'std': float(np.std(da_arr)) if n >= 2 else 0.0,
+                        'p25': float(np.percentile(da_arr, 25)) if n >= 4 else None,
+                        'p50': float(np.percentile(da_arr, 50)),
+                        'p75': float(np.percentile(da_arr, 75)) if n >= 4 else None,
+                        'n': n,
+                    }
+                else:
+                    step_result[fn] = {'mean': 0.0, 'std': 0.0, 'p25': None, 'p50': None, 'p75': None, 'n': 0}
+            da_result[f'step{step_idx + 1}'] = step_result
+
+            # 计算 naive DA
+            actual_dirs = actual_dir_by_step[step_idx]
+            if actual_dirs:
+                up_ratio = np.mean(actual_dirs)
+                naive_da_by_step[step_idx] = float(max(up_ratio, 1 - up_ratio))
+            else:
+                naive_da_by_step[step_idx] = 0.5
 
     # 振幅统计
     amplitude_result = {
@@ -345,7 +441,12 @@ def main():
                         help='Use block_lb400_pd10 data')
     args = parser.parse_args()
 
-    device = get_device()
+    # DDP setup
+    rank, local_rank, world_size, use_ddp = get_rank_info()
+    if use_ddp:
+        setup_ddp(rank, local_rank, world_size)
+    device = get_device(local_rank)
+    is_main = (rank == 0)
 
     config = DataConfig(
         norm_mode=args.norm_mode,
@@ -357,19 +458,23 @@ def main():
     # 数据路径（由 preprocess.py 预先生成）
     test_path = get_split_data_path(config.norm_mode, config.lookback, config.predict, config.split_mode, 'test')
 
-    print(f"\n{'=' * 60}")
-    print(f"Kronos Predictor Evaluation (Detrended IC)")
-    print(f"{'=' * 60}")
-    print(f"norm_mode: {config.norm_mode}")
-    print(f"model: {args.model}")
-    print(f"checkpoint: {args.checkpoint}")
-    print(f"n_samples: {args.n_samples if args.n_samples > 0 else 'FULL'}")
-    print(f"{'=' * 60}")
+    if is_main:
+        print(f"\n{'=' * 60}")
+        print(f"Kronos Predictor Evaluation (Detrended IC)")
+        print(f"{'=' * 60}")
+        print(f"norm_mode: {config.norm_mode}")
+        print(f"model: {args.model}")
+        print(f"checkpoint: {args.checkpoint}")
+        print(f"n_samples: {args.n_samples if args.n_samples > 0 else 'FULL'}")
+        if use_ddp:
+            print(f"DDP: {world_size} GPUs")
+        print(f"{'=' * 60}")
 
     # 加载测试数据
     with open(test_path, 'rb') as f:
         test_data = pickle.load(f)
-    print(f"Test data: {len(test_data)} stocks")
+    if is_main:
+        print(f"Test data: {len(test_data)} stocks")
 
     # 模型列表
     if args.models:
@@ -378,26 +483,36 @@ def main():
         model_types = [args.model]
 
     for model_type in model_types:
-        print(f"\n--- Evaluating {model_type} ---")
+        if is_main:
+            print(f"\n--- Evaluating {model_type} ---")
 
         model, tokenizer = load_model_and_tokenizer(
-            config.norm_mode, model_type, device, args.checkpoint
+            config.norm_mode, model_type, device, args.checkpoint,
+            lookback=config.lookback,       # EV1 修复：从 config 传入
+            predict=config.predict,          # EV1 修复
+            split_mode=config.split_mode,    # EV1 修复
         )
 
         ic_result, da_result, amplitude_result, limit_result, naive_da_by_step = evaluate(
             model, tokenizer, test_data, config, device,
             n_samples=args.n_samples,
             seed=args.seed,
-            limit_pct=args.limit_pct
+            limit_pct=args.limit_pct,
+            rank=rank,
+            world_size=world_size,
+            model_type=model_type,
         )
 
-        # 输出报告
-        report = format_metrics_report(
-            ic_result, da_result, amplitude_result, limit_result,
-            naive_da_by_step=naive_da_by_step,
-            predict=config.predict
-        )
-        print(report)
+        # 输出报告（只 rank 0）
+        if is_main:
+            report = format_metrics_report(
+                ic_result, da_result, amplitude_result, limit_result,
+                naive_da_by_step=naive_da_by_step,
+                predict=config.predict
+            )
+            print(report)
+
+    cleanup_ddp()
 
 
 if __name__ == '__main__':
