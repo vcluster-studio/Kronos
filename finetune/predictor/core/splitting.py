@@ -78,97 +78,77 @@ def time_split(
 
 def create_target_blocks(
     sym_samples: List[SampleSchema],
-    block_size: int = 50
+    block_size: int = 600
 ) -> List[List[SampleSchema]]:
     """
     创建 target 时间块
 
-    算法（关键：块之间 target 时间区间不相交）：
-    1. 取该股票 target 时间轴 [t_min, t_max]
-    2. 按 block_size 切成不重叠的时间区间块
-    3. 每个窗口按其 target 落在哪个时间块，归入该块
-    4. 返回 block 列表，每个 block 是窗口列表
+    设计（2026-06-20 重设计）：样本由 preprocess.create_samples 按**块**生成——
+    先按 block_size 切不重叠时间段，块内 stride=1 生成窗口（target 不超块边界）。
+    故样本天然属于某个块，块间 target 不相交自动成立。
+
+    块边界与 create_samples 一致：从 0 起，block_size 步进。
+    block_id = window_start // block_size。
 
     Args:
-        sym_samples: 单只股票的样本列表
-        block_size: 时间块大小
+        sym_samples: 单只股票的样本列表（已按块生成）
+        block_size: 时间块大小（须与 create_samples 一致）
 
     Returns:
         blocks: [[SampleSchema]] 时间块列表
-
-    注意:
-        不是按样本列表顺序分块（那会退化为 window-index splitting → 泄露）
     """
     if not sym_samples:
         return []
 
-    # 按 target_start 排序
-    sorted_samples = sorted(sym_samples, key=lambda s: s.target_start)
+    # 按 block_id（window_start // block_size）分组
+    blocks_by_id = defaultdict(list)
+    for s in sym_samples:
+        block_id = s.window_start // block_size
+        blocks_by_id[block_id].append(s)
 
-    # 取 target 时间范围
-    t_min = sorted_samples[0].target_start
-    t_max = sorted_samples[-1].target_end
+    # 按 block_id 排序
+    blocks = [blocks_by_id[k] for k in sorted(blocks_by_id.keys())]
 
-    # 切成时间块
-    blocks = []
-    current_block_start = t_min
-
-    while current_block_start < t_max:
-        # S1 修复：末端块防超界
-        current_block_end = min(current_block_start + block_size, t_max)
-
-        # I6 修复：按 target_start 归入起始块，不丢弃跨块窗口
-        # 原条件 `s.target_end <= current_block_end` 会丢弃跨块窗口
-        # 改为：target_start 在当前块内，即使 target_end 超出也归入该块
-        block_windows = []
-        for s in sorted_samples:
-            # target 起点落在当前时间块内
-            if s.target_start >= current_block_start and s.target_start < current_block_end:
-                block_windows.append(s)
-
-        if block_windows:
-            blocks.append(block_windows)
-
-        current_block_start = current_block_end
-
-    # M5 修复：改用扫描线检查块间不相交（O(N log N) vs O(块数²)）
+    # Sanity 检查：块间 target 不相交（应永不触发，因样本按块生成 target 不跨块）
     all_intervals = []
     for block_idx, block in enumerate(blocks):
         for s in block:
             all_intervals.append((s.target_start, s.target_end, block_idx))
-
-    # 按 target_start 排序
     all_intervals.sort(key=lambda x: x[0])
-
-    # 扫描线检查：相邻区间如果相交且属于不同块 → 报错
     for i in range(len(all_intervals) - 1):
         s1, e1, b1 = all_intervals[i]
         s2, e2, b2 = all_intervals[i + 1]
-        # 区间相交：e1 > s2
         if e1 > s2 and b1 != b2:
-            raise AssertionError(f"Block {b1} and {b2} target intervals overlap: [{s1},{e1}) vs [{s2},{e2})")
+            raise AssertionError(
+                f"Block {b1} and {b2} target intervals overlap: [{s1},{e1}) vs [{s2},{e2})。"
+                f"样本应按块生成（target 不跨块），检查 create_samples。"
+            )
 
     return blocks
 
 
 def block_split(
     samples: List[SampleSchema],
-    train_ratio: float = 0.6,
-    val_ratio: float = 0.2,
-    test_ratio: float = 0.2,
-    block_size: int = 50,
+    train_ratio: float = 0.75,
+    val_ratio: float = 0.15,
+    test_ratio: float = 0.15,
+    block_size: int = 600,
     seed: int = 42
 ) -> Tuple[List[SampleSchema], List[SampleSchema], List[SampleSchema]]:
     """
     以 target 时间块为单位分配 train/val/test
 
-    关键：同一股票相邻窗口可能跨 split（因为以 block 为单位）
+    分配规则：
+    1. 6个指标：个股train/val/test缺度 + 全局train/val/test缺度
+    2. 选择最大缺度对应的split（谁最缺给谁）
+    3. 同等缺度时按优先级：train>val>test
+    4. 使用优先权后，该split优先级降为最低，依次循环
 
     Args:
         samples: 所有样本列表
-        train_ratio: 训练集比例
-        val_ratio: 验证集比例
-        test_ratio: 测试集比例
+        train_ratio: 训练集比例（默认 0.75）
+        val_ratio: 验证集比例（默认 0.15）
+        test_ratio: 测试集比例（默认 0.15）
         block_size: 时间块大小
         seed: 随机种子
 
@@ -182,31 +162,117 @@ def block_split(
     for s in samples:
         by_symbol[s.symbol].append(s)
 
-    train, val, test = [], [], []
+    # 目标比例
+    target_ratios = {'train': train_ratio, 'val': val_ratio, 'test': test_ratio}
+    split_names = ['train', 'val', 'test']
 
+    # 全局统计（用 block 数量）
+    global_assigned = {name: 0 for name in split_names}
+    global_total = 0
+
+    # 每只股票的分配结果
+    stock_assignments = {symbol: {name: [] for name in split_names} for symbol in by_symbol}
+
+    # 优先级轮换状态：记录每个split的当前优先级顺序
+    # 初始优先级：train(0) > val(1) > test(2)
+    priority_order = {'train': 0, 'val': 1, 'test': 2}
+
+    # 收集所有股票的块
+    all_stock_blocks = {}
     for symbol, sym_samples in by_symbol.items():
-        # 创建 target 时间块（块之间不相交）
         blocks = create_target_blocks(sym_samples, block_size=block_size)
+        if blocks:
+            rng.shuffle(blocks)
+            all_stock_blocks[symbol] = blocks
+            global_total += len(blocks)
 
-        if not blocks:
-            continue
+    # 分配算法
+    for symbol, blocks in all_stock_blocks.items():
+        n_blocks = len(blocks)
 
-        # 随机分配 blocks
-        rng.shuffle(blocks)
-        n_train = int(len(blocks) * train_ratio)
-        n_val = int(len(blocks) * val_ratio)
+        for block in blocks:
+            # 计算个股当前比例和缺度
+            stock_assigned = {name: len(stock_assignments[symbol][name]) for name in split_names}
+            stock_total = sum(stock_assigned.values())
+            if stock_total > 0:
+                stock_ratios = {name: stock_assigned[name] / stock_total for name in split_names}
+            else:
+                stock_ratios = {name: 0.0 for name in split_names}
 
-        for block in blocks[:n_train]:
+            # 缺度 = 目标比例 - 当前比例（正数表示缺，负数表示超）
+            stock_gaps = {name: target_ratios[name] - stock_ratios[name] for name in split_names}
+            stock_gap_rates = {name: stock_gaps[name] / target_ratios[name] if target_ratios[name] > 0 else 0 for name in split_names}
+
+            # 计算全局当前比例和缺度
+            global_total_assigned = sum(global_assigned.values())
+            if global_total_assigned > 0:
+                global_ratios = {name: global_assigned[name] / global_total_assigned for name in split_names}
+            else:
+                global_ratios = {name: 0.0 for name in split_names}
+
+            global_gaps = {name: target_ratios[name] - global_ratios[name] for name in split_names}
+            global_gap_rates = {name: global_gaps[name] / target_ratios[name] if target_ratios[name] > 0 else 0 for name in split_names}
+
+            # 6个指标：缺度（正数表示缺，负数表示超）
+            indicators = {
+                'stock_train': stock_gap_rates['train'],
+                'stock_val': stock_gap_rates['val'],
+                'stock_test': stock_gap_rates['test'],
+                'global_train': global_gap_rates['train'],
+                'global_val': global_gap_rates['val'],
+                'global_test': global_gap_rates['test'],
+            }
+
+            # 找最大缺度（按固定顺序遍历，避免字典顺序不确定）
+            max_gap = -float('inf')
+            for name in split_names:
+                split_gap = max(indicators[f'stock_{name}'], indicators[f'global_{name}'])
+                if split_gap > max_gap:
+                    max_gap = split_gap
+                    best_split = name
+
+            # 找出所有缺度等于最大缺度的 split
+            splits_with_max_gap = []
+            for name in split_names:
+                split_gap = max(indicators[f'stock_{name}'], indicators[f'global_{name}'])
+                if split_gap == max_gap:
+                    splits_with_max_gap.append(name)
+
+            # 如果多个split缺度相等，按优先级选择并轮换
+            if len(splits_with_max_gap) > 1:
+                # 按当前优先级顺序排序（数字越小优先级越高）
+                splits_with_max_gap.sort(key=lambda s: priority_order[s])
+                best_split = splits_with_max_gap[0]
+
+                # 使用优先权后，轮换优先级（循环队列）
+                # 例如：[0,1,2] → 选中0 → [2,0,1]；选中1 → [1,2,0]；选中2 → [0,1,2]
+                # 实现：选中的 split 优先级设为2，其他按相对顺序递减
+                current_order = sorted(split_names, key=lambda s: priority_order[s])
+                new_order = []
+                for name in current_order:
+                    if name != best_split:
+                        new_order.append(name)
+                new_order.append(best_split)  # 选中的放最后
+                # 重新分配优先级：0=最高，1=次之，2=最低
+                for i, name in enumerate(new_order):
+                    priority_order[name] = i
+
+            # 分配块
+            stock_assignments[symbol][best_split].append(block)
+            global_assigned[best_split] += 1
+
+    # 收集结果
+    train, val, test = [], [], []
+    for symbol, assignments in stock_assignments.items():
+        for block in assignments['train']:
             for s in block:
                 s.split = 'train'
                 train.append(s)
-
-        for block in blocks[n_train:n_train + n_val]:
+        for block in assignments['val']:
             for s in block:
                 s.split = 'val'
                 val.append(s)
-
-        for block in blocks[n_train + n_val:]:
+        for block in assignments['test']:
             for s in block:
                 s.split = 'test'
                 test.append(s)

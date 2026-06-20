@@ -99,62 +99,66 @@ def create_samples_from_raw(
     predict = config.predict
     window_size = lookback + predict
 
-    # 获取 norm_mode 需要的历史长度
-    required_history = NormalizerFactory.get_required_history(config.norm_mode)
+    # block 模式：块内做 sliding_ma（块首用 expanding），块内窗口只需 window_size，无需额外历史
+    # time 模式：整条 sliding_ma，窗口也只需 window_size
+    use_block_generation = (config.split_mode == 'block')
+    block_size = config.block_size if use_block_generation else None
+
+    def _gen_range(seq_len):
+        """生成 (窗口起点 i, 所属 block 起点) 的迭代器。block 模式按块，time 模式全序列(block_start=None)。"""
+        if use_block_generation:
+            b_start = 0
+            while b_start + window_size <= seq_len:
+                b_end = min(b_start + block_size, seq_len)
+                # 块内 i：i + window_size ≤ b_end
+                i_lo = b_start
+                i_hi = b_end - window_size  # i+window_size ≤ b_end
+                for i in range(i_lo, i_hi + 1):
+                    yield i, b_start
+                b_start = b_end
+        else:
+            for i in range(seq_len - window_size + 1):
+                yield i, None  # time 模式无 block 归一化
 
     for symbol, data in tqdm(raw_data.items(), desc="Creating samples"):
-        # 检测数据格式
         if hasattr(data, 'columns'):
-            # DataFrame 格式
             seq_len = len(data)
-            total_required = window_size + required_history
-
-            if seq_len < total_required:
+            if seq_len < window_size:
                 continue
-
-            # 创建样本
-            for i in range(seq_len - total_required + 1):
-                start = i + required_history
-                sample = SampleSchema(
+            for i, b_start in _gen_range(seq_len):
+                samples.append(SampleSchema(
                     symbol=symbol,
                     window_start=i,
-                    lookback_start=start,
-                    lookback_end=start + lookback,
-                    target_start=start + lookback,
-                    target_end=start + lookback + predict,
-                    split='unknown',  # 后续分割时填充
-                    values=data.values[i:i + window_size + required_history],
-                    index=data.index[i:i + window_size + required_history],
-                )
-                samples.append(sample)
+                    lookback_start=i,
+                    lookback_end=i + lookback,
+                    target_start=i + lookback,
+                    target_end=i + lookback + predict,
+                    split='unknown',
+                    block_start=b_start,
+                    values=data.values[i:i + window_size],
+                    index=data.index[i:i + window_size],
+                ))
         else:
-            # dict 格式（原始 OHLCV）
             values = data.get('values', data.get('original'))
             index = data.get('index')
-
             if values is None:
                 continue
-
             seq_len = len(values)
-            total_required = window_size + required_history
-
-            if seq_len < total_required:
+            if seq_len < window_size:
                 continue
-
-            for i in range(seq_len - total_required + 1):
-                start = i + required_history
-                sample = SampleSchema(
+            for i, b_start in _gen_range(seq_len):
+                samples.append(SampleSchema(
                     symbol=symbol,
                     window_start=i,
-                    lookback_start=start,
-                    lookback_end=start + lookback,
-                    target_start=start + lookback,
-                    target_end=start + lookback + predict,
+                    lookback_start=i,
+                    lookback_end=i + lookback,
+                    target_start=i + lookback,
+                    target_end=i + lookback + predict,
                     split='unknown',
-                    values=values[i:i + window_size + required_history],
-                    index=index[i:i + window_size + required_history] if index is not None else None,
-                )
-                samples.append(sample)
+                    block_start=b_start,
+                    values=values[i:i + window_size],
+                    index=index[i:i + window_size] if index is not None else None,
+                ))
 
     print(f"Created {len(samples)} samples")
     return samples
@@ -186,10 +190,7 @@ def apply_split(
     elif config.split_mode == 'block':
         return block_split(
             samples,
-            train_ratio=0.6,
-            val_ratio=0.2,
-            test_ratio=0.2,
-            block_size=50,
+            block_size=config.block_size,
             seed=config.seed
         )
 
@@ -332,64 +333,114 @@ def save_split_data(
     """
     保存分割数据（可直接使用的归一化数据）
 
-    存储格式（与旧 ma60_norm pkl 一致，dataset 拿来即用）：
+    block 模式（per-block 归一化，防止跨 split 泄露）：
         {symbol: {
-            'normalized': (T, 6),   # 整条序列归一化
+            'mode': 'block',
+            'blocks': {b_start: {
+                'normalized': (block_len, 6),  # 仅此 block 归一化（block 内 sliding_ma，块首 expanding）
+                'means': (block_len, 6),
+                'stds': (block_len, 6),
+                'original': (block_len, 6),
+                'index': (block_len,),
+                'windows': (N,),  # 该 block 的窗口起点（绝对位置，在 b_start..b_end 内）
+            }},
+        }}
+    time 模式（整条归一化，时间正序无泄露）：
+        {symbol: {
+            'mode': 'time',
+            'normalized': (T, 6),
             'means': (T, 6),
             'stds': (T, 6),
-            'original': (T, 6),     # 原始数据
-            'index': (T,),          # 时间戳
-            'windows': (N,),        # 该 split 的窗口起点索引
+            'original': (T, 6),
+            'index': (T,),
+            'windows': (N,),
         }}
-
-    每只股票存一条完整归一化序列，windows 标记该 split 实际用到的窗口起点。
-    dataset 按 windows 起点从 normalized 切片。
 
     Args:
         split_samples: 分割后的样本列表
         output_path: 输出路径
-        config: DataConfig
-        raw_data: 原始数据（用于按股票归一化整条序列）
+        config: DataConfig（含 split_mode/block_size）
+        raw_data: 原始数据
     """
-    # 按股票收集窗口起点
-    windows_by_symbol = defaultdict(list)
-    for sample in split_samples:
-        windows_by_symbol[sample.symbol].append(sample.window_start)
-
     normalizer = NormalizerFactory.create(config.norm_mode, clip=config.clip)
+    use_block = (config.split_mode == 'block')
 
-    data_by_symbol = {}
-    for symbol, windows in windows_by_symbol.items():
-        raw = raw_data.get(symbol)
-        if raw is None:
-            continue
+    if use_block:
+        # 按 (symbol, b_start) 收集窗口起点
+        blocks_by_key = defaultdict(list)  # (symbol, b_start) -> [window_start, ...]
+        for sample in split_samples:
+            blocks_by_key[(sample.symbol, sample.block_start)].append(sample.window_start)
 
-        # 取整条原始序列
-        if hasattr(raw, 'columns'):
-            values = raw.values.astype(np.float32)
-            index = raw.index
-        else:
-            values = np.asarray(raw['values'], dtype=np.float32)
-            index = raw['index']
+        data_by_symbol = {}
+        for symbol in {s.symbol for s in split_samples}:
+            raw = raw_data.get(symbol)
+            if raw is None:
+                continue
+            if hasattr(raw, 'columns'):
+                full_values = raw.values.astype(np.float32)
+                full_index = raw.index
+            else:
+                full_values = np.asarray(raw['values'], dtype=np.float32)
+                full_index = raw['index']
 
-        # 归一化整条序列（sliding_ma 依赖前缀历史，整条归一化保证边界一致）
-        normalized, means, stds = normalizer.normalize(values)
+            blocks_data = {}
+            for (sym, b_start), windows in blocks_by_key.items():
+                if sym != symbol:
+                    continue
+                b_end = min(b_start + config.block_size, len(full_values))
+                block_values = full_values[b_start:b_end]
+                block_index = full_index[b_start:b_end]
+                # block 内独立归一化（sliding_ma 仅用 block 内数据，块首 expanding）
+                norm, means, stds = normalizer.normalize(block_values)
+                blocks_data[b_start] = {
+                    'normalized': norm.astype(np.float32),
+                    'means': means.astype(np.float32),
+                    'stds': stds.astype(np.float32),
+                    'original': block_values,
+                    'index': block_index,
+                    'windows': np.array(sorted(set(windows)), dtype=np.int64),
+                }
+            if blocks_data:
+                data_by_symbol[symbol] = {'mode': 'block', 'blocks': blocks_data}
+    else:
+        # time 模式：整条序列归一化
+        windows_by_symbol = defaultdict(list)
+        for sample in split_samples:
+            windows_by_symbol[sample.symbol].append(sample.window_start)
 
-        data_by_symbol[symbol] = {
-            'normalized': normalized.astype(np.float32),
-            'means': means.astype(np.float32),
-            'stds': stds.astype(np.float32),
-            'original': values,
-            'index': index,
-            'windows': np.array(sorted(set(windows)), dtype=np.int64),
-        }
+        data_by_symbol = {}
+        for symbol, windows in windows_by_symbol.items():
+            raw = raw_data.get(symbol)
+            if raw is None:
+                continue
+            if hasattr(raw, 'columns'):
+                values = raw.values.astype(np.float32)
+                index = raw.index
+            else:
+                values = np.asarray(raw['values'], dtype=np.float32)
+                index = raw['index']
+            normalized, means, stds = normalizer.normalize(values)
+            data_by_symbol[symbol] = {
+                'mode': 'time',
+                'normalized': normalized.astype(np.float32),
+                'means': means.astype(np.float32),
+                'stds': stds.astype(np.float32),
+                'original': values,
+                'index': index,
+                'windows': np.array(sorted(set(windows)), dtype=np.int64),
+            }
 
     ensure_dir(output_path)
     with open(output_path, 'wb') as f:
         pickle.dump(data_by_symbol, f)
 
-    n_samples = sum(len(d['windows']) for d in data_by_symbol.values())
-    print(f"Saved {n_samples} samples ({len(data_by_symbol)} symbols) to {output_path}")
+    if use_block:
+        n_samples = sum(len(b['windows']) for d in data_by_symbol.values() for b in d['blocks'].values())
+        n_blocks = sum(len(d['blocks']) for d in data_by_symbol.values())
+        print(f"Saved {n_samples} samples ({len(data_by_symbol)} symbols, {n_blocks} blocks, per-block normalized) to {output_path}")
+    else:
+        n_samples = sum(len(d['windows']) for d in data_by_symbol.values())
+        print(f"Saved {n_samples} samples ({len(data_by_symbol)} symbols, full-series normalized) to {output_path}")
 
 
 def save_meta(
@@ -556,6 +607,8 @@ def main():
     parser.add_argument('--skip-backtest', action='store_true',
                         help='跳过 backtest 样本生成')
     parser.add_argument('--seed', type=int, default=42)
+    parser.add_argument('--samples-per-block', type=int, default=100,
+                        help='每块窗口数（stride=1）。block_size 自动计算：window_size + samples_per_block - 1')
     args = parser.parse_args()
 
     config = DataConfig(
@@ -564,6 +617,7 @@ def main():
         predict=args.predict,
         split_mode=args.split_mode,
         seed=args.seed,
+        samples_per_block=args.samples_per_block,
     )
 
     raw_path = args.raw_data or get_raw_path()
@@ -579,6 +633,12 @@ def main():
     print(f"lookback: {config.lookback}")
     print(f"predict: {config.predict}")
     print(f"split_mode: {config.split_mode}")
+    if config.split_mode == 'block':
+        print(f"samples_per_block: {config.samples_per_block}")
+        print(f"block_size: {config.block_size} (= window_size {config.lookback + config.predict} + samples_per_block {config.samples_per_block} - 1)")
+    else:
+        print(f"train_end: {args.train_end}")
+        print(f"val_end: {args.val_end}")
     print(f"raw_data: {raw_path}")
     print(f"backtest_raw: {backtest_raw_path}")
     print(f"validate: {args.validate}")
