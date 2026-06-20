@@ -48,15 +48,30 @@ python finetune/predictor/preprocess.py \
     --predict 10 \
     --split-mode block
 
-# time split（按序列内位置切，需传 --train-end/--val-end 整数位置）
-# 位置≈交易日序号（A 股约 244/年）。下例 ≈ train至2023-06 / val至2024-12
+# time split（按序列内时间位置切，需传 --train-end/--val-end 整数位置）
+# 位置 = 交易日序号（从数据起始日期 2018-01-02 开始计数）
+# A 股约 244 交易日/年，交易日累计表：
+#   年份    累计位置    说明
+#   2018    0~244      数据起始年
+#   2019    244~488    
+#   2020    488~732    
+#   2021    732~976    
+#   2022    976~1220   
+#   2023    1220~1464  
+#   2024    1464~1708  
+#   2025    1708~1952  
+#   2026    1952~2050   数据截止 2026-05-18（约100天）
+
+# 旧版本约定时间边界（train_end: 2023-06-30, val_end: 2024-12-31）
+# 2023-06-30 ≈ 1220 + 122（半年） = 1342
+# 2024-12-31 = 1708（年末）
 python finetune/predictor/preprocess.py \
     --norm-mode sliding_ma60 \
     --lookback 400 \
     --predict 10 \
     --split-mode time \
-    --train-end 1340 \
-    --val-end 1710 \
+    --train-end 1342 \
+    --val-end 1708 \
     --validate
 ```
 
