@@ -169,11 +169,36 @@ class KronosDataset(Dataset):
         """
         d = self.data[symbol]
 
-        normalized = d['normalized'][start:end].astype(np.float32)
-        original = d['original'][start:end]
-        means = d['means'][start:end]
-        stds = d['stds'][start:end]
-        timestamps = d['index'][start:end]
+        # 支持两种存储模式：block（per-block 归一化）/ time（整条归一化）
+        mode = d.get('mode', 'time')  # 旧数据无 mode 字段，按 time 兼容
+        if mode == 'block':
+            # 找包含 start 的 block（window_start 在 [b_start, b_end) 内）
+            block = None
+            b_start = None
+            for bs, blk in d['blocks'].items():
+                # block 范围 [bs, bs+len(blk['original']))
+                b_end = bs + len(blk['original'])
+                if bs <= start < b_end:
+                    block = blk
+                    b_start = bs
+                    break
+            if block is None:
+                raise ValueError(f"window_start {start} not found in any block of {symbol}")
+            # block 内相对位置
+            rel_start = start - b_start
+            rel_end = end - b_start
+            normalized = block['normalized'][rel_start:rel_end].astype(np.float32)
+            original = block['original'][rel_start:rel_end]
+            means = block['means'][rel_start:rel_end]
+            stds = block['stds'][rel_start:rel_end]
+            timestamps = block['index'][rel_start:rel_end]
+        else:
+            # time 模式：整条归一化
+            normalized = d['normalized'][start:end].astype(np.float32)
+            original = d['original'][start:end]
+            means = d['means'][start:end]
+            stds = d['stds'][start:end]
+            timestamps = d['index'][start:end]
 
         # 归一化数据已预计算，直接使用
         x_norm = normalized[:self.lookback]

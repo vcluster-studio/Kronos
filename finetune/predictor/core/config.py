@@ -26,6 +26,9 @@ class DataConfig:
     lookback: int = 400
     predict: int = 10
     split_mode: str = 'block'  # 'time' | 'block'
+    samples_per_block: int = 100  # 每块窗口数（stride=1）
+    # block_size 由 __post_init__ 自动计算：window_size + samples_per_block - 1
+    block_size: int = field(init=False)
     min_samples: int = field(init=False)
     features: List[str] = field(default_factory=lambda: ['open', 'high', 'low', 'close', 'vol', 'amt'])
     time_features: List[str] = field(default_factory=lambda: ['minute', 'hour', 'weekday', 'day', 'month'])
@@ -36,8 +39,10 @@ class DataConfig:
     VALID_NORM_MODES = ['full_window', 'sliding_ma20', 'sliding_ma60', 'sliding_ma120']
 
     def __post_init__(self):
-        """初始化后自动计算 min_samples 并校验"""
-        self.min_samples = self.lookback + self.predict  # 禁止 +1
+        """初始化后自动计算 block_size 和 min_samples 并校验"""
+        window_size = self.lookback + self.predict
+        self.block_size = window_size + self.samples_per_block - 1  # 块内正好 samples_per_block 个窗口
+        self.min_samples = window_size  # 禁止 +1
         self.validate()
 
     def validate(self):
@@ -53,6 +58,16 @@ class DataConfig:
         # lookback/predict 正数约束
         assert self.lookback > 0, "lookback must be positive"
         assert self.predict > 0, "predict must be positive"
+
+        # block_size 约束：必须 ≥ window_size，否则块内放不下一个完整窗口
+        # block_size = window_size + samples_per_block - 1，由 __post_init__ 计算
+        window_size = self.lookback + self.predict
+        assert self.block_size >= window_size, \
+            f"block_size ({self.block_size}) < window_size ({window_size})，块内放不下一个完整窗口"
+        # 验证窗口数
+        actual_windows = self.block_size - window_size + 1
+        assert actual_windows == self.samples_per_block, \
+            f"块内窗口数 {actual_windows} != samples_per_block {self.samples_per_block}"
 
     def get_window_size(self) -> int:
         """获取完整窗口大小（不含泄露）"""

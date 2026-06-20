@@ -398,6 +398,64 @@ safetensors_path = os.path.join(model_dir, 'model.safetensors')  # 直接在 mod
 **当前状态**:✅ **已修复(2026-06-20)**。backtest.py 加 `--checkpoint` CLI(默认 best_combined_model,与 eval 一致)+ 用 `get_checkpoint_path(model_dir, args.checkpoint)` 拼接 `checkpoints/{name}` 正确路径。--model 默认从 legacy `final_models/Kronos-mini-MA60` 改为 `mini`(新体系)。手册 §5 已同步(去掉限制标注,Q6 删除)。
 
 **手册同步**:`docs/guide/predictor_usage.md` §5 已改为反映修复后 CLI(有 --checkpoint,定位 checkpoints/{name}),与代码一致。
+
+### 6.12 block_split 重设计(2026-06-20,修复运行报错)
+
+**问题**:用户跑 preprocess 报错 `AssertionError: Block 0 and 1 target intervals overlap: [509,519) vs [510,520)`。根因:create_samples 先全序列 stride=1 生成样本,再 create_target_blocks 分块 → 样本 target 跨块边界 → 块间重叠(I6 修复"不丢跨块样本"破坏了"块间不相交")。
+
+**用户方案(关键洞察)**:分块和滑动窗口应分层——**先按 block_size 切不重叠大块,块内 stride=1 生成窗口(target 不超块)**。这样块间天然不相交,块内 target 重叠 OK(同块内)。
+
+**修复(评审人改)**:
+1. `config.py`:DataConfig 加 `block_size` 字段(默认 600,覆盖 sliding_ma120 footprint=530);validate 校验 `block_size ≥ required_history+lookback+predict`(footprint)
+2. `preprocess.py create_samples_from_raw`:改为按块生成——block 模式下,外层按 block_size 切块(b_start=0, block_size, 2*block_size...),块内 stride=1 生成窗口(`i+footprint ≤ b_end`,target 不超块);time 模式仍全序列 stride=1
+3. `splitting.py create_target_blocks`:重设计——样本已按块生成,按 `window_start // block_size` 分组(block_id 与 create_samples 块边界一致),扫描线检查保留作 sanity(应永不触发)
+4. `splitting.py block_split`:block_size 默认 50→600
+5. `preprocess.py apply_split`:传 `config.block_size`(去掉硬编码 50)
+
+**关键修正**:block_size 须 ≥ **footprint**(required_history+lookback+predict),非 lookback+predict。sliding_ma60 footprint=60+410=470,sliding_ma120=120+410=530。默认 600 覆盖所有 norm_mode。
+
+**验证**:单测构造 seq_len=2000 模拟样本,生成 333 样本分 3 块,block_split 成功无重叠报错。✅
+
+**影响**:
+- block 模式样本数减少(块边界处丢 footprint-1 个窗口,但块间无 gap)。原全序列 stride=1 生成 5987454 样本 → 现按块生成,样本数略减但防泄露正确
+- 块间 target 不相交自动成立(块边界即隔离),无需依赖扫描线(保留作 sanity)
+- I6(不丢跨块样本)被此方案取代——根本解法是"不生成跨块样本"而非"跨块样本归起始块"
+
+**方案 §1.3 同步**:已更新 create_target_blocks 设计说明(先分块再块内 stride=1)。
+
+### 6.13 block 模式 per-block 归一化(2026-06-20,修复跨 split 泄露)
+
+**问题**:用户指出"分块和归一化顺序"问题——原 `save_split_data` 对**整条序列**归一化,而 block 模式下 train/test 块时间倒挂,导致 train 块的归一化统计量(rolling)吸收了 test 块数据,即 train 训练时通过归一化"看到"了 test 数据(泄露)。
+
+**用户方案**:先 block split,再在每个 block 内部做 sliding_ma 归一化(block 内 rolling,块首用 expanding 即 `min_periods=1`)。每个 block 的归一化只用自己的数据,不跨 block/split。
+
+**实现(评审人改)**:
+1. `schema.py`:SampleSchema 加 `block_start` 字段(Optional,block 模式填,time 模式 None);`sample_to_dict` 同步
+2. `preprocess.py create_samples`:`_gen_range` 返回 `(i, block_start)`,每个样本填 block_start(block 模式=b_start,time 模式=None)
+3. `preprocess.py save_split_data`:区分模式——
+   - block 模式:按 `(symbol, b_start)` 分组,每个 block 的原始片段独立归一化(`normalizer.normalize(block_values)`),存 `{symbol: {'mode':'block', 'blocks': {b_start: {normalized, means, stds, original, index, windows}}}}`
+   - time 模式:保持整条归一化,存 `{symbol: {'mode':'time', normalized, ...}}`
+4. `dataset.py _get_dict_sample`:读 `d['mode']`,block 模式按 window_start 找所属 block(遍历 `d['blocks']` 找包含 start 的),用 block 内相对位置取数据;time 模式按原逻辑
+5. `train.py`/`eval.py` 的 indices 构建:加 block 模式分支(遍历 `d['blocks']` 取每个 block 的 windows)
+
+**关键点**:
+- block 内归一化用 sliding_ma(block 内 rolling),块首 N 步用 expanding(`min_periods=1`,已有实现)——始终是 ma 思想,只是块首统计量基于少量样本(可接受,非泄露)
+- 窗口的 required_history 在 block 内部(i-60 ≥ b_start),不跨 block
+- time 模式不变(时间正序,target 不交叉即无泄露)
+
+**验证(端到端测试)**:
+- 构造 3 股票 3000 行假数据:create_samples 生成 1785 样本,block_start 已填
+- block_split:train=1119/val=273/test=393
+- save_split_data:mode='block',per-block 结构,每 block ≤600
+- **block 不跨 split 验证通过**(train_blocks ∩ test_blocks = ∅)
+- **dataset 取样本通过**:x_norm(400,6)/x_stamp(400,5)/y_stamp(10,5)/meta 齐全
+
+**影响**:
+- 修复跨 split 泄露(train 不再通过归一化吸收 test 数据)
+- 数据结构变化:block 模式从 per-symbol 整条 → per-block 分块,dataset/indices 已适配
+- time 模式完全不变(向后兼容)
+
+**未改**:time 模式(用户确认时间正序 + target 不交叉即无泄露,保持整条归一化)。
 - EV2/B1 strict=False 宽容——已有 WARNING,非致命,保留
 - M3/M5/M6/UT3——非阻断
 

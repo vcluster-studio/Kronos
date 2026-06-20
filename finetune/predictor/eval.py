@@ -183,7 +183,14 @@ def evaluate(
     # 构建窗口索引
     indices = []
     for symbol, d in test_data.items():
-        if 'windows' in d:
+        mode = d.get('mode', 'time') if isinstance(d, dict) else None
+        if mode == 'block':
+            # block 模式：遍历各 block 的 windows
+            for b_start, blk in d['blocks'].items():
+                for w in blk['windows']:
+                    indices.append((symbol, int(w)))
+        elif 'windows' in d:
+            # time 模式（或有预分配 windows）
             for w in d['windows']:
                 indices.append((symbol, int(w)))
         elif hasattr(d, 'columns'):

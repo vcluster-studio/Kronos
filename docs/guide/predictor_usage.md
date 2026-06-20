@@ -34,12 +34,13 @@ python finetune/predictor/preprocess.py \
     --split-mode block \
     --validate
 
-# sliding_ma120（更长历史窗口）
+# sliding_ma120（更长归一化窗口，block_size 与 norm_mode 无关，无需调参）
 python finetune/predictor/preprocess.py \
     --norm-mode sliding_ma120 \
     --lookback 400 \
     --predict 10 \
-    --split-mode block
+    --split-mode block \
+    --validate
 
 # full_window（全窗口归一化）
 python finetune/predictor/preprocess.py \
@@ -75,6 +76,33 @@ python finetune/predictor/preprocess.py \
     --validate
 ```
 
+### 1.2.1 预处理参数
+
+| 参数 | 默认值 | 说明 |
+|------|--------|------|
+| `--norm-mode` | sliding_ma60 | 归一化模式（full_window/sliding_ma20/sliding_ma60/sliding_ma120） |
+| `--lookback` | 400 | 回看窗口长度（context K线根数） |
+| `--predict` | 10 | 预测步数（target K线根数） |
+| `--split-mode` | block | 分割模式（block=time_split/block_split） |
+| `--train-end` | None | time split 模式的训练集边界（target_end 位置序号，必须与 `--val-end` 同时传） |
+| `--val-end` | None | time split 模式的验证集边界（target_end 位置序号） |
+| `--raw-data` | None | 自定义训练 raw 路径（默认 `finetune/data/raw/kline_daily_raw.pkl`） |
+| `--backtest-raw` | None | 自定义回测 raw 路径（默认 `finetune/data/raw/backtest_raw.pkl`） |
+| `--validate` | True | 运行泄露检查（默认开启） |
+| `--no-validate` | - | 跳过泄露检查 |
+| `--skip-backtest` | False | 跳过 backtest 样本生成 |
+| `--samples-per-block` | 100 | 每块窗口数（块内 stride=1）。`block_size` 自动计算：`window_size + samples_per_block - 1`（window_size = lookback + predict） |
+| `--seed` | 42 | 随机种子（block split 分组用） |
+
+**关键概念**：
+
+- **norm_mode**：决定归一化方式。`sliding_ma60` 用前 60 步滚动均值/std，`full_window` 用全序列均值/std。不同 norm_mode 生成不同 processed 数据，tokenizer 需按 norm_mode 微调。
+- **lookback**：模型看到的 context 长度。Kronos-mini 最大 2048，small/base 最大 512。超过限制会被截断。
+- **samples_per_block / block_size**：`--samples-per-block` 控制每个时间块的窗口数（块内 stride=1），`block_size = window_size + samples_per_block - 1`（window_size = lookback + predict，lb400/pd10 时为 410，故默认 block_size=509）。block 模式下归一化**按块独立**进行（块内 sliding_ma，块首用 expanding，`min_periods=1`），因此 block_size **只取决于 window_size，与 norm_mode 无关**——sliding_ma120 无需更大的块。块数 = 序列长度 // block_size；若 `--samples-per-block` 过大导致每只股票块数过少（≤1），可能出现 val=0/test=0（见 Q6）。
+- **split_mode**：
+  - `block`：先按 block_size 切不重叠时间段，块内 stride=1 生成窗口（target 不超块），再以块为单位按 deficit 算法分配 train/val/test（默认 0.75/0.15/0.15，相邻 target 不跨 split，无泄露）
+  - `time`：按每只股票序列内位置切分，位置序号从数据起始（2018-01-02）开始计数
+
 ### 1.3 输出说明
 
 预处理生成以下文件：
@@ -88,10 +116,33 @@ finetune/data/processed/{norm_mode}/lb{lookback}_pd{predict}/{split_mode}/
 ```
 
 **数据格式**（每个 pkl 内部）：
+
+block 模式（默认，按块独立归一化，防止跨 split 泄露）：
 ```python
 {
     symbol: {
-        'normalized': np.ndarray (T, 6),   # 归一化后的完整序列
+        'mode': 'block',
+        'blocks': {
+            b_start: {                       # b_start = 块在原始序列的起点
+                'normalized': (block_len, 6), # 仅此块独立归一化（块内 sliding_ma，块首 expanding）
+                'means': (block_len, 6),
+                'stds': (block_len, 6),
+                'original': (block_len, 6),
+                'index': (block_len,),
+                'windows': (N,),             # 该块的窗口起点（绝对位置，落在 [b_start, b_start+block_size) 内）
+            },
+            ...
+        }
+    }
+}
+```
+
+time 模式（整条序列归一化，时间正序无泄露）：
+```python
+{
+    symbol: {
+        'mode': 'time',
+        'normalized': np.ndarray (T, 6),   # 整条序列归一化
         'means': np.ndarray (T, 6),       # 滚动均值
         'stds': np.ndarray (T, 6),        # 滚动标准差
         'original': np.ndarray (T, 6),    # 原始 OHLCV
@@ -109,15 +160,23 @@ KronosTokenizer 是预训练的 VQ-VAE quantizer，**按 norm_mode 微调**（�
 
 ### 2.1 设计要点
 
+- **与 predictor 概念解耦**：tokenizer 只依赖 norm_mode（归一化分布），与 train/val/test 分割、lookback/predict、block/time 等 predictor 概念无关。tokenizer 做无监督重建（重建输入自身），无「泄露」概念，故用**全量数据 + 整条归一化**（由 `finetune/tokenizer/preprocess.py` 生成），不分割 train/val/test。
 - 架构由 model_type 决定：mini→Kronos-Tokenizer-2k，small/base→Kronos-Tokenizer-base
 - vocab_size 由预训练架构固定，不是微调参数
 - 不同 norm_mode 数据分布不同，必须各自微调
-- 微调损失：`recon_loss + bsq_loss`
+- 微调损失：`recon_loss + bsq_loss`（MSE 重建 + BSQ，与旧代码一致）
+- val：随机抽 10% 股票作 held-out（仅 early-stop/验证信号，非防泄露），train/validate 复用同一 `--seed`/`--val-holdout-ratio` 保证 val 集一致
 
 ### 2.2 微调命令
 
+tokenizer 有**独立的预处理**（`finetune/tokenizer/preprocess.py`），与 predictor 的 preprocess 完全分开：只按 norm_mode 整条归一化全量数据，不分割、不切窗口。
+
 ```bash
-# 按 norm_mode 微调 tokenizer
+# Step 1: tokenizer 专用预处理（生成 all.pkl，整条归一化，无分割）
+python finetune/tokenizer/preprocess.py \
+    --norm-mode sliding_ma60
+
+# Step 2: 按 norm_mode 微调 tokenizer
 python finetune/tokenizer/train.py \
     --norm-mode sliding_ma60 \
     --model mini \
@@ -126,12 +185,46 @@ python finetune/tokenizer/train.py \
     --lr 0.001 \
     --n-train-iter 2000
 
-# sliding_ma120 微调
+# sliding_ma120 微调（先跑对应 preprocess）
+python finetune/tokenizer/preprocess.py --norm-mode sliding_ma120
 python finetune/tokenizer/train.py \
     --norm-mode sliding_ma120 \
     --model mini \
     --epochs 30
+
+# 多卡微调（DDP，与 predictor 一致；卡数自动探测，无需手写）
+torchrun --nproc_per_node=$(nvidia-smi -L | wc -l) finetune/tokenizer/train.py \
+    --norm-mode sliding_ma60 \
+    --model mini \
+    --epochs 30 \
+    --batch-size 256 \
+    --lr 0.001 \
+    --n-train-iter 2000
 ```
+
+**多卡（DDP）说明**：
+- 启动方式与 predictor 一致：`torchrun --nproc_per_node=N`。`N` 用 `$(nvidia-smi -L | wc -l)` 自动取可见 GPU 数，无需手写——写大了会报 `CUDA error: invalid device ordinal`。单卡仍可用 `python finetune/tokenizer/train.py`，自动 `use_ddp=False`。
+- 各 rank 用不同 seed 采样不同样本；val_loss 跨 rank all_reduce 聚合，early-stop 决定各 rank 一致（防死锁）。
+- `--batch-size` 是**每卡**批大小，N 卡有效 batch = `batch_size × N`。
+- 日志、checkpoint 保存只由 rank0 执行，避免 N 份重复。
+- 若报 `use_libuv ... PyTorch was built without libuv support`（少数 torch 构建），加前缀 `USE_LIBUV=0 torchrun ...`。
+
+### 2.2.1 微调参数
+
+| 参数 | 默认值 | 说明 |
+|------|--------|------|
+| `--norm-mode` | sliding_ma60 | 归一化模式（决定数据分布，tokenizer 唯一依赖，须与 predictor 一致） |
+| `--model` | mini | 模型类型（mini→Kronos-Tokenizer-2k，small/base→Kronos-Tokenizer-base） |
+| `--seq-len` | 400 | tokenizer 重建窗口长度（与 predictor lookback 无关） |
+| `--epochs` | 30 | 最大微调轮数 |
+| `--batch-size` | 16 | 批大小 |
+| `--lr` | 0.001 | 学习率 |
+| `--n-train-iter` | 2000 | 每 epoch 采样步数倍数（实际步数 = n_train_iter × batch_size） |
+| `--n-val-iter` | 400 | val 采样步数倍数 |
+| `--patience` | 5 | Early stopping 耐心值（连续 N epoch 无改进则停） |
+| `--grace-period` | 3 | Early stopping 起始宽容期（前 N epoch 不判断） |
+| `--seed` | 42 | 随机种子（也决定 val 股票划分，须与 validate 一致） |
+| `--val-holdout-ratio` | 0.1 | val 股票比例（须与 validate 一致，否则 val 集不同步） |
 
 **采样机制（关键）**：步数驱动放回采样，非比例抽样。每 epoch 采样步数 = `--n-train-iter` × `--batch-size`（默认 2000×16 = 32000 步）。val 同理 `--n-val-iter`（默认 400×16 = 6400 步）。跨多 epoch 覆盖全量数据。
 
@@ -155,14 +248,28 @@ outputs/tokenizers/{norm_mode}/{model_type}/
 微调完成后，验证 tokenizer 是否比预训练版本更好地适应目标分布：
 
 ```bash
+# 验证（val 集复用 train 的 seed/val_holdout_ratio 划分，故参数须与 train 一致）
 python finetune/tokenizer/validate.py \
     --norm-mode sliding_ma60 \
-    --model mini
+    --model mini \
+    --seq-len 400
 ```
+
+### 2.4.1 验证参数
+
+| 参数 | 默认值 | 说明 |
+|------|--------|------|
+| `--norm-mode` | sliding_ma60 | 归一化模式（须与 train 一致） |
+| `--model` | mini | 模型类型 |
+| `--seq-len` | 400 | tokenizer 重建窗口长度（须与 train 一致） |
+| `--n-val-iter` | 400 | val 采样步数倍数 |
+| `--batch-size` | 16 | 批大小 |
+| `--seed` | 42 | val 划分种子（须与 train 一致） |
+| `--val-holdout-ratio` | 0.1 | val 股票比例（须与 train 一致） |
 
 **输出示例**：
 ```
-[Reconstruction Loss on Val Data]
+[Reconstruction Loss on Val Data (held-out stocks)]
 Pretrained (pretrained/Kronos-Tokenizer-2k):
   Mean: 0.001234
   Std:  0.000456
@@ -219,8 +326,8 @@ python finetune/predictor/train.py \
 ### 3.2 多卡训练（DDP）
 
 ```bash
-# 4 卡训练
-torchrun --nproc_per_node=4 finetune/predictor/train.py \
+# 多卡训练（卡数自动探测，无需手写；写大过实际卡数会报 invalid device ordinal）
+torchrun --nproc_per_node=$(nvidia-smi -L | wc -l) finetune/predictor/train.py \
     --norm-mode sliding_ma60 \
     --lookback 400 \
     --predict 10 \
@@ -228,12 +335,6 @@ torchrun --nproc_per_node=4 finetune/predictor/train.py \
     --model mini \
     --epochs 50 \
     --lr 0.01
-
-# 8 卡训练
-torchrun --nproc_per_node=8 finetune/predictor/train.py \
-    --norm-mode sliding_ma60 \
-    --model mini \
-    --epochs 50
 ```
 
 ### 3.3 训练参数
@@ -253,6 +354,9 @@ torchrun --nproc_per_node=8 finetune/predictor/train.py \
 | `--resume` | None | 断点续训，传 checkpoint 路径（加载 latest + optimizer/scheduler/best 状态） |
 | `--output-folder` | None | 自定义输出目录名（默认按 norm_mode/lb/pd/split/model 自动生成） |
 | `--use-block` | False | 兼容旧 block_lb400_pd10 数据（legacy） |
+| `--max-train-batches` | None | 每 epoch 最大批数（调试用，默认全量） |
+| `--max-val-batches` | 100 | val loss 计算最大批数 |
+| `--max-ic-samples` | -1 | IC 评估样本数（-1 全量） |
 
 > **注**：`early_stopping_patience`(12)、`early_stopping_grace_period`(8)、`warmup_epochs`(2)、`lr_min`(1e-5)、`ic_patience_reset`(True)、`combined_ic_weight`(0.6)/`combined_da_weight`(0.4) 在 `TrainConfig` 中定义，**未通过 CLI 暴露**，需改代码调整。详见 `core/config.py`。
 
@@ -303,14 +407,30 @@ python finetune/predictor/eval.py \
     --checkpoint best_combined_model \
     --n-samples -1   # 全量评估
 
-# 多卡 DDP（卡数由 torchrun 控制，单卡即 nproc_per_node=1）
-torchrun --nproc_per_node=4 finetune/predictor/eval.py \
+# 多卡 DDP（卡数自动探测，单卡即 nproc_per_node=1）
+torchrun --nproc_per_node=$(nvidia-smi -L | wc -l) finetune/predictor/eval.py \
     --norm-mode sliding_ma60 \
     --model mini \
     --checkpoint best_combined_model
 ```
 
 **评估支持 DDP**：各 rank 按 `idx % world_size` 分片处理样本，IC/DA 用 `aggregate_ic`/`aggregate_da` 聚合（all_gather）。`--n-samples` 抽样时所有 rank 同 seed 抽同样本再分片，保证覆盖正确。
+
+### 4.1.1 评估参数
+
+| 参数 | 默认值 | 说明 |
+|------|--------|------|
+| `--norm-mode` | sliding_ma60 | 归一化模式 |
+| `--lookback` | 400 | 回看窗口长度 |
+| `--predict` | 10 | 预测步数 |
+| `--split-mode` | block | 分割模式（定位 test 数据 + checkpoint） |
+| `--model` | mini | 模型类型 |
+| `--models` | None | 多模型对比（逗号分隔，如 `mini,small,base`） |
+| `--checkpoint` | best_combined_model | Checkpoint 名称（best_model/best_ic_model/best_combined_model/latest_model） |
+| `--n-samples` | -1 | 评估样本数（-1 全量） |
+| `--seed` | 42 | 随机种子（抽样用） |
+| `--limit-pct` | 0.10 | 涨跌停阈值（主板 10%，创业板 20%） |
+| `--use-block` | False | 兼容旧 block_lb400_pd10 数据（legacy） |
 
 ### 4.2 评估输出示例
 
@@ -362,14 +482,27 @@ python finetune/predictor/backtest.py \
     --n-samples 100
 ```
 
-**参数说明**:
-- `--model`:模型类型（mini/small/base）或直接传 checkpoint 目录完整路径。传 model_type 时按 `outputs/models/{norm_mode}/lb{lookback}_pd{predict}/{split_mode}/{model_type}/checkpoints/{checkpoint}/` 定位。
-- `--checkpoint`:checkpoint 名称（best_combined_model/best_ic_model/best_model/latest_model，默认 best_combined_model），与 eval 一致。
-- `--split-mode`:定位 checkpoint 的分割模式（须与训练时一致）。
-- `--n-samples`:回测股票数（-1 全量，默认 100）。
-- `--signal-center`/`--signal-steepness`:因子打分 sigmoid 参数（默认 0.084/21）。
+### 5.1 回测参数
 
-**回测数据**:
+| 参数 | 默认值 | 说明 |
+|------|--------|------|
+| `--model` | mini | 模型类型（mini/small/base）或 checkpoint 目录完整路径。传 model_type 时按约定路径定位 |
+| `--checkpoint` | best_combined_model | Checkpoint 名称（best_combined_model/best_ic_model/best_model/latest_model） |
+| `--tokenizer` | None | 自定义 tokenizer 路径（默认按 norm_mode/model 定位） |
+| `--norm-mode` | sliding_ma60 | 归一化模式 |
+| `--lookback` | 400 | 回看窗口长度 |
+| `--predict` | 10 | 预测步数 |
+| `--split-mode` | block | 分割模式（定位 checkpoint） |
+| `--n-samples` | 100 | 回测股票数（-1 全量） |
+| `--batch-size` | 64 | 批大小（推理用） |
+| `--seed` | 42 | 随机种子（抽样用） |
+| `--limit-pct` | 0.10 | 涨跌停阈值 |
+| `--signal-center` | 0.084 | 因子打分 sigmoid 中心 |
+| `--signal-steepness` | 21.0 | 因子打分 sigmoid 陡度 |
+
+> **checkpoint 定位规则**：传 `--model mini` 时，按 `outputs/models/{norm_mode}/lb{lookback}_pd{predict}/{split_mode}/{model_type}/checkpoints/{checkpoint}/` 定位。传完整路径则直接使用。
+
+### 5.2 回测数据
 - context 来自 `kline_daily_raw.pkl`（末尾 lookback 根）
 - target 来自 `backtest_raw.pkl`（时间隔离）
 
@@ -390,6 +523,7 @@ LOOKBACK=400
 PREDICT=10
 MODEL="mini"
 EPOCHS=50
+N_GPU=$(nvidia-smi -L | wc -l)  # 自动探测 GPU 数；1 则单卡 python，>1 用 torchrun 多卡
 
 echo "=== Step 1: Preprocess ==="
 python finetune/predictor/preprocess.py \
@@ -399,11 +533,21 @@ python finetune/predictor/preprocess.py \
     --split-mode block \
     --validate
 
-echo "=== Step 2: Fine-tune Tokenizer ==="
-python finetune/tokenizer/train.py \
-    --norm-mode $NORM_MODE \
-    --model $MODEL \
-    --epochs 30
+echo "=== Step 2: Preprocess + Fine-tune Tokenizer ==="
+# tokenizer 专用预处理（独立于 predictor preprocess，整条归一化全量数据，不分割）
+python finetune/tokenizer/preprocess.py --norm-mode $NORM_MODE
+
+if [ "$N_GPU" -gt 1 ]; then
+    torchrun --nproc_per_node=$N_GPU finetune/tokenizer/train.py \
+        --norm-mode $NORM_MODE \
+        --model $MODEL \
+        --epochs 30
+else
+    python finetune/tokenizer/train.py \
+        --norm-mode $NORM_MODE \
+        --model $MODEL \
+        --epochs 30
+fi
 
 echo "=== Step 2.5: Validate Tokenizer ==="
 python finetune/tokenizer/validate.py \
@@ -443,16 +587,20 @@ finetune/
 │   │   ├── kline_daily_raw.pkl   # 训练原始数据
 │   │   └── backtest_raw.pkl      # 回测原始数据
 │   └── processed/
-│       └── {norm_mode}/lb{lookback}_pd{predict}/
-│           ├── {split_mode}/
-│           │   ├── train.pkl
-│           │   ├── val.pkl
-│           │   ├── test.pkl
-│           │   └── meta.pkl
-│           └── backtest/
-│               ├── samples.pkl
-│               └── meta.pkl
+│       └── {norm_mode}/
+│           ├── tokenizer/
+│           │   └── all.pkl        # tokenizer 专用（整条归一化，无分割）
+│           └── lb{lookback}_pd{predict}/
+│               ├── {split_mode}/
+│               │   ├── train.pkl
+│               │   ├── val.pkl
+│               │   ├── test.pkl
+│               │   └── meta.pkl
+│               └── backtest/
+│                   ├── samples.pkl
+│                   └── meta.pkl
 ├── tokenizer/
+│   ├── preprocess.py             # tokenizer 专用预处理（整条归一化，无分割）
 │   ├── train.py                  # tokenizer 微调入口
 │   └── validate.py               # 微调效果检验
 ├── predictor/
@@ -520,6 +668,25 @@ eval/backtest 加载 checkpoint 时，若权重与模型架构对不上（missin
 
 检查 `--model`/`--checkpoint`/`--norm-mode` 是否与训练时一致。
 
+### Q6: block split 验证集为空 (val=0)？
+
+**原因**：`--samples-per-block` 过大 → `block_size` 过大 → 每只股票产生的块数过少。block_split 以块为单位按 deficit 算法（默认 0.75/0.15/0.15）分配 train/val/test，块数太少时 train 优先吸走块，val/test 可能为空。极端情况：某只股票只有 1 个块，该块必归 train，val=test=0。
+
+**触发条件**：序列较短 + `--samples-per-block` 较大时常见（每只股票块数 ≤ 2 即有风险）。以 lb400/pd10（window_size=410）、8 年数据（≈2050 天）为例：
+- `--samples-per-block 1000` → block_size=1409，每只股票 2 块 → 分配结果可能 val 或 test 为空（实测 val=1000/test=0）
+- `--samples-per-block 1500` → block_size=1909，每只股票 1 块 → val=test=0
+
+**解决**：减小 `--samples-per-block`，使每只股票产生足够多的块（实测默认 100 → 4 块/股，train/val/test 均非空）：
+```bash
+# 默认 100 即可（lb400/pd10 → block_size=509，8 年数据 ≈ 4 块/股）
+python finetune/predictor/preprocess.py \
+    --norm-mode sliding_ma60 \
+    --samples-per-block 100 \
+    --split-mode block
+```
+
+注：sliding_ma120 **不需要**调大 `--samples-per-block`。block 模式归一化按块独立、块首 expanding（`min_periods=1`），block_size 只取决于 window_size（lookback+predict），与 norm_mode 的归一化窗口（60/120）无关。
+
 ---
 
 ## 9. 参数速查表
@@ -558,3 +725,35 @@ eval/backtest 加载 checkpoint 时，若权重与模型架构对不上（missin
 - §4.1 评估命令：补多卡 DDP 示例（`torchrun`）+ DDP 分片/聚合说明（I3）
 - §5 回测命令：补 `--checkpoint` 参数（§6.11 修复：backtest 现支持 --checkpoint 定位 checkpoints/{name}，与 eval 一致）；补 `--model`/`--split-mode`/`--n-samples`/`--signal-*` 说明；补 PR4 自动校验 + 加载校验说明
 - §8 新增 Q5（加载 checkpoint 报错原因，2-1 修复：对不上直接 raise）
+
+**2026-06-20 三次对齐（参数表补全）**：
+- §1.2 新增 1.2.1 预处理参数表（12 项参数 + 关键概念说明）
+- §2.2 新增 2.2.1 微调参数表（12 项参数）；示例命令补 `--split-mode`
+- §2.4 新增 2.4.1 验证参数表（7 项参数）；示例命令补 `--split-mode`
+- §3.3 训练参数表：补 `--max-train-batches`/`--max-val-batches`/`--max-ic-samples`
+- §4.1 新增 4.1.1 评估参数表（11 项参数）
+- §5 inline 参数说明改为 5.1 回测参数表（12 项参数 + checkpoint 定位规则）
+- §6 一键脚本：tokenizer train/validate 补 `--split-mode block`
+
+**2026-06-20 四次对齐（block_size 修复）**：
+- §1.2.1 预处理参数表：参数为 `--samples-per-block`（默认 100），`block_size` 由其自动计算（`window_size + samples_per_block - 1`），非直接 CLI
+- §1.2 示例命令：删除不存在的 `--block-size 800`（sliding_ma120 无需调大块）
+- §1.3 数据格式：补 block 模式 per-block 归一化结构（默认）+ time 模式结构
+- §8 新增 Q6（block split val=0 原因：samples_per_block 过大致块数不足，及解决）
+- preprocess.py：CLI 为 `--samples-per-block`；block_size 只取决于 window_size，与 norm_mode 无关（per-block 归一化 + 块首 expanding）
+
+**2026-06-20 五次对齐（tokenizer DDP + 日志）**：
+- §2.2 微调命令：补 `torchrun --nproc_per_node=$(nvidia-smi -L | wc -l)` 多卡示例（自动探测卡数，无需手写，写大会报 invalid device ordinal）+ DDP 说明（各 rank 采样不同样本、val_loss all_reduce、batch_size 为每卡、rank0 存 ckpt/日志、libuv 报错加 `USE_LIBUV=0`）
+- §6 一键脚本：`N_GPU=$(nvidia-smi -L | wc -l)` 自动探测，tokenizer 步骤按 `N_GPU>1` 自动切 torchrun/python
+- tokenizer train.py：加 DDP（复用 predictor 同款 `get_rank_info`/`DDP`/`all_reduce`/`cleanup_ddp`）+ batch 级日志（每 50 batch）+ epoch 耗时
+
+**2026-06-20 六次对齐（tokenizer/predictor 概念解耦）**：
+- 核心改动：tokenizer 只依赖 norm_mode，与 train/val/test、lookback/predict、block/time 等 predictor 概念彻底解耦。tokenizer 做无监督重建（无泄露概念），改用**全量数据 + 整条归一化**，不再读 predictor 的 split pkl
+- 新增 `finetune/tokenizer/preprocess.py`：tokenizer 专用预处理入口，输出 `finetune/data/processed/{norm_mode}/tokenizer/all.pkl`（每只股票整条归一化，无 windows、无分割）
+- §2.1 设计要点：补解耦原则 + val 机制（随机抽 10% 股票 held-out，仅 early-stop 信号）
+- §2.2 微调命令：新增 tokenizer preprocess 步骤；删除 `--split-mode`/`--lookback`/`--predict`
+- §2.2.1/§2.4.1 参数表：删 `--lookback`/`--predict`/`--split-mode`，新增 `--seq-len`（默认 400，tokenizer 重建窗口，与 predictor lookback 无关）+ `--val-holdout-ratio`（train/validate 须一致）
+- §2.4 验证命令：合并为单条（norm_mode + seq-len），val 集复用 train 的 seed/val_holdout_ratio 划分（`split_val_symbols` 共享，保证一致）
+- §6 一键脚本：tokenizer 步骤加 preprocess，删 `--split-mode`
+- §7 目录结构：tokenizer/ 加 `preprocess.py`；processed/ 加 `tokenizer/all.pkl`
+- predictor 完全不动

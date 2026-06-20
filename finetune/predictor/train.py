@@ -1072,7 +1072,12 @@ def main():
     # 构建索引
     train_indices = []
     for symbol, d in train_data.items():
-        if 'windows' in d:
+        mode = d.get('mode', 'time') if isinstance(d, dict) else None
+        if mode == 'block':
+            for b_start, blk in d['blocks'].items():
+                for w in blk['windows']:
+                    train_indices.append((symbol, int(w)))
+        elif 'windows' in d:
             for w in d['windows']:
                 train_indices.append((symbol, int(w)))
         elif hasattr(d, 'columns'):
@@ -1084,7 +1089,12 @@ def main():
 
     val_indices = []
     for symbol, d in val_data.items():
-        if 'windows' in d:
+        mode = d.get('mode', 'time') if isinstance(d, dict) else None
+        if mode == 'block':
+            for b_start, blk in d['blocks'].items():
+                for w in blk['windows']:
+                    val_indices.append((symbol, int(w)))
+        elif 'windows' in d:
             # 已预处理的窗口列表
             for w in d['windows']:
                 val_indices.append((symbol, int(w)))

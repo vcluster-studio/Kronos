@@ -3,6 +3,11 @@ Kronos Tokenizer Fine-tuning Effectiveness Validation
 
 对比「预训练 tokenizer vs 微调后」在同一 val 数据上的重建误差。
 
+tokenizer 与 predictor 概念解耦：只依赖 norm_mode，数据来自
+finetune/data/processed/{norm_mode}/tokenizer/all.pkl（整条归一化，无分割）。
+val 集复用 train 的划分（split_val_symbols，同 seed/比例），保证验证的就是
+early-stop 用到的 held-out 股票。
+
 验收标准：
 - 微调后 val 重建损失 < 预训练在同数据重建损失（必要）
 - 重建损失收敛（early stopping 触发，非暴力训满）（必要）
@@ -15,6 +20,7 @@ Kronos Tokenizer Fine-tuning Effectiveness Validation
 
 import os
 import sys
+import json
 import argparse
 import pickle
 import numpy as np
@@ -27,46 +33,44 @@ project_root = os.path.dirname(os.path.dirname(script_dir))
 sys.path.insert(0, project_root)
 
 from model.kronos import KronosTokenizer
-from finetune.predictor.core.config import DataConfig
-from finetune.predictor.core.paths import (
-    get_split_data_path,
-    get_tokenizer_path,
-    PROJECT_ROOT,
-)
+from finetune.predictor.core.paths import get_tokenizer_path, PROJECT_ROOT
 from finetune.predictor.core.utils import get_device
+from finetune.tokenizer.preprocess import get_tokenizer_data_path, split_val_symbols
 from finetune.tokenizer.train import PRETRAINED_MAP, TokenizerDataset
 
 
 def validate_tokenizer(
     norm_mode: str,
     model_type: str,
-    lookback: int = 400,
-    predict: int = 10,
-    split_mode: str = 'block',
+    seq_len: int = 400,
     n_val_iter_multiplier: int = 400,
     batch_size: int = 16,
+    seed: int = 42,
+    val_holdout_ratio: float = 0.1,
 ):
     """
     验证 tokenizer 微调效果
 
     对比预训练 tokenizer 与微调后 tokenizer 在同一 val 数据上的重建损失。
+    val 集复用 train 的 split_val_symbols 划分（同 seed/比例），保证验证的就是
+    train early-stop 用到的 held-out 股票。
 
     Args:
-        norm_mode: 归一化模式
+        norm_mode: 归一化模式（决定数据分布，tokenizer 唯一依赖）
         model_type: 模型类型（mini/small/base）
-        lookback: 回看窗口
-        predict: 预测步数
-        split_mode: 分割模式
+        seq_len: tokenizer 重建窗口长度（须与 train 一致）
         n_val_iter_multiplier: val 采样步数倍数
         batch_size: 批大小
+        seed: 划分种子（须与 train 一致，否则 val 集不同步）
+        val_holdout_ratio: val 股票比例（须与 train 一致）
 
     Returns:
         dict: 包含预训练和微调后 tokenizer 的重建损失统计
     """
     device = get_device()
 
-    # 数据路径
-    val_path = get_split_data_path(norm_mode, lookback, predict, split_mode, 'val')
+    # 数据路径（tokenizer 专用，只按 norm_mode 键控）
+    data_path = get_tokenizer_data_path(norm_mode)
     finetuned_path = get_tokenizer_path(norm_mode, model_type)
     pretrained_path = os.path.join(PROJECT_ROOT, PRETRAINED_MAP[model_type])
 
@@ -75,9 +79,11 @@ def validate_tokenizer(
     print("=" * 60)
     print(f"norm_mode: {norm_mode}")
     print(f"model_type: {model_type}")
+    print(f"seq_len: {seq_len}")
     print(f"pretrained_path: {pretrained_path}")
     print(f"finetuned_path: {finetuned_path}")
-    print(f"val_data: {val_path}")
+    print(f"data_path: {data_path}")
+    print(f"seed: {seed}, val_holdout_ratio: {val_holdout_ratio}")
     print("=" * 60)
 
     # 1. 检查微调 tokenizer 是否存在
@@ -87,28 +93,20 @@ def validate_tokenizer(
         print(f"  python finetune/tokenizer/train.py --norm-mode {norm_mode} --model {model_type}")
         return None
 
-    # 2. 加载 val 数据
-    print("\n[1] Loading validation data...")
-    with open(val_path, 'rb') as f:
-        val_data = pickle.load(f)
+    # 2. 加载 tokenizer 专用数据（整条归一化，无分割）+ 复用 train 的 val 划分
+    print("\n[1] Loading data and reproducing val split...")
+    if not os.path.exists(data_path):
+        raise FileNotFoundError(
+            f"Tokenizer data not found at {data_path}. "
+            f"Please run: python finetune/tokenizer/preprocess.py --norm-mode {norm_mode}"
+        )
+    with open(data_path, 'rb') as f:
+        all_data = pickle.load(f)
+    _, val_data, val_symbols = split_val_symbols(all_data, seed, val_holdout_ratio)
+    print(f"Loaded {len(all_data)} stocks; val (held-out) = {len(val_data)} stocks")
 
-    # 构建索引
-    val_indices = []
-    for symbol, d in val_data.items():
-        if 'windows' in d:
-            for w in d['windows']:
-                val_indices.append((symbol, int(w)))
-
-    print(f"Total val windows: {len(val_indices)}")
-
-    # 创建数据集
-    config = DataConfig(
-        norm_mode=norm_mode,
-        lookback=lookback,
-        predict=predict,
-        split_mode=split_mode,
-    )
-    val_dataset = TokenizerDataset(val_data, val_indices, config)
+    # 创建数据集（从整条 normalized 随机切 seq_len 窗口）
+    val_dataset = TokenizerDataset(val_data, seq_len)
 
     # 采样器
     n_val_iter = n_val_iter_multiplier * batch_size
@@ -117,6 +115,7 @@ def validate_tokenizer(
         sampler=RandomSampler(val_dataset, replacement=True, num_samples=n_val_iter),
         num_workers=0, drop_last=False,
     )
+    print(f"Val loader: {len(val_loader)} batches (seq_len={seq_len})")
 
     # 3. 加载预训练 tokenizer
     print("\n[2] Loading pretrained tokenizer...")
@@ -163,7 +162,7 @@ def validate_tokenizer(
     print("\n" + "=" * 60)
     print("Validation Results")
     print("=" * 60)
-    print(f"\n[Reconstruction Loss on Val Data]")
+    print(f"\n[Reconstruction Loss on Val Data (held-out stocks)]")
     print(f"Pretrained ({PRETRAINED_MAP[model_type]}):")
     print(f"  Mean: {pretrained_mean:.6f}")
     print(f"  Std:  {pretrained_std:.6f}")
@@ -191,7 +190,6 @@ def validate_tokenizer(
     # 标准 2：检查 early stopping 是否生效
     meta_path = os.path.join(finetuned_path, 'meta.json')
     if os.path.exists(meta_path):
-        import json
         with open(meta_path, 'r') as f:
             meta = json.load(f)
         actual_epochs = meta.get('actual_epochs', meta.get('epochs', 30))
@@ -238,22 +236,25 @@ def main():
                         choices=['full_window', 'sliding_ma20', 'sliding_ma60', 'sliding_ma120'])
     parser.add_argument('--model', type=str, default='mini',
                         choices=['mini', 'small', 'base'])
-    parser.add_argument('--lookback', type=int, default=400)
-    parser.add_argument('--predict', type=int, default=10)
-    parser.add_argument('--split-mode', type=str, default='block')
+    parser.add_argument('--seq-len', type=int, default=400,
+                        help='tokenizer 重建窗口长度（须与 train 一致）')
     parser.add_argument('--n-val-iter', type=int, default=400,
                         help='val 采样步数倍数')
     parser.add_argument('--batch-size', type=int, default=16)
+    parser.add_argument('--seed', type=int, default=42,
+                        help='val 划分种子（须与 train 一致）')
+    parser.add_argument('--val-holdout-ratio', type=float, default=0.1,
+                        help='val 股票比例（须与 train 一致）')
     args = parser.parse_args()
 
     validate_tokenizer(
         norm_mode=args.norm_mode,
         model_type=args.model,
-        lookback=args.lookback,
-        predict=args.predict,
-        split_mode=args.split_mode,
+        seq_len=args.seq_len,
         n_val_iter_multiplier=args.n_val_iter,
         batch_size=args.batch_size,
+        seed=args.seed,
+        val_holdout_ratio=args.val_holdout_ratio,
     )
 
 

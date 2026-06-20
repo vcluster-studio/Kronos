@@ -18,13 +18,16 @@ Kronos Tokenizer Fine-tuning Entry
 
 import os
 import sys
+import time
 import argparse
 import pickle
 import json
 import numpy as np
 from datetime import datetime
 import torch
+import torch.distributed as dist
 import torch.nn.functional as F
+from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data import DataLoader, RandomSampler
 
 script_dir = os.path.dirname(os.path.abspath(__file__))
@@ -32,16 +35,13 @@ project_root = os.path.dirname(os.path.dirname(script_dir))
 sys.path.insert(0, project_root)
 
 from model.kronos import KronosTokenizer
-from finetune.predictor.core.config import DataConfig
 from finetune.predictor.core.paths import (
-    get_split_data_path,
     get_tokenizer_path,
     ensure_dir,
     PROJECT_ROOT,
 )
-from finetune.predictor.core.dataset import KronosDataset
 from finetune.predictor.core.schema import compute_fingerprint
-from finetune.predictor.core.utils import safe_save_json, get_device, set_seed
+from finetune.predictor.core.utils import safe_save_json, get_device, set_seed, get_rank_info, cleanup_ddp
 
 
 # 预训练 tokenizer 映射（架构由 model_type 决定）
@@ -64,23 +64,35 @@ def finetune_tokenizer(
     early_stopping_min_delta: float = 1e-5,
     early_stopping_grace_period: int = 3,
     seed: int = 42,
-    lookback: int = 400,
-    predict: int = 10,
-    split_mode: str = 'block',
+    seq_len: int = 400,                    # tokenizer 重建窗口长度（与 predictor lookback 无关）
+    val_holdout_ratio: float = 0.1,        # 随机抽此比例股票作 val
+    rank: int = 0,
+    local_rank: int = 0,
+    world_size: int = 1,
+    use_ddp: bool = False,
+    device=None,
 ):
     """
     微调 tokenizer（非从零训练）
 
+    tokenizer 与 predictor 概念解耦：只依赖 norm_mode（归一化分布），不依赖
+    train/val/test 分割、lookback/predict、block/time。做无监督重建（重建输入
+    自身），无泄露概念，故用全量数据、整条归一化（由 tokenizer/preprocess.py 生成）。
+
     步骤：
     1. 按 model_type 选预训练 tokenizer
-    2. 加载 train/val 数据
-    3. 步数驱动放回采样（关键：非比例抽样）
-    4. 微调循环：recon_loss + bsq_loss
-    5. 每 epoch 用 val 算重建损失，early stopping
-    6. 保存到 outputs/tokenizers/{norm_mode}/{model_type}/
+    2. 加载 tokenizer 专用数据（all.pkl，整条归一化）
+    3. 随机抽 val_holdout_ratio 比例股票作 val（仅 early-stop 信号，非防泄露）
+    4. 步数驱动放回采样：从整条 normalized 随机切 seq_len 窗口
+    5. 微调循环：recon_loss + bsq_loss（MSE，与旧代码一致）
+    6. 每 epoch 用 val 算重建损失，early stopping
+    7. 保存到 outputs/tokenizers/{norm_mode}/{model_type}/
+
+    DDP：各 rank 用不同 seed 采样不同样本；val_loss 跨 rank all_reduce 保证
+    early-stop 决定一致（防死锁）；checkpoint 仅 rank0 保存。
 
     Args:
-        norm_mode: 归一化模式（决定数据分布）
+        norm_mode: 归一化模式（决定数据分布，tokenizer 唯一依赖）
         model_type: 模型类型（决定架构）
         epochs: 最大微调轮数
         batch_size: 批大小
@@ -91,74 +103,75 @@ def finetune_tokenizer(
         early_stopping_min_delta: 最小改进阈值
         early_stopping_grace_period: 起始宽容期
         seed: 随机种子
-        lookback: 回看窗口
-        predict: 预测步数
-        split_mode: 分割模式
+        seq_len: tokenizer 重建窗口长度（喂给 KronosTokenizer 的 seq_len，默认 400）
+        val_holdout_ratio: 随机抽此比例股票作 val
+        rank: DDP rank（0 = 主进程）
+        local_rank: DDP 本地 rank（用于指定 GPU）
+        world_size: DDP 进程数
+        use_ddp: 是否启用 DDP
+        device: 计算设备
     """
-    set_seed(seed)
-    device = get_device()
+    is_main = (rank == 0)
+    set_seed(seed + rank)  # 各 rank seed 不同，RandomSampler 采不同样本
+    if device is None:
+        device = get_device(local_rank=0 if use_ddp else None)
 
-    # 数据路径
-    train_path = get_split_data_path(norm_mode, lookback, predict, split_mode, 'train')
-    val_path = get_split_data_path(norm_mode, lookback, predict, split_mode, 'val')
+    # 数据路径（tokenizer 专用，只按 norm_mode 键控）
+    from finetune.tokenizer.preprocess import get_tokenizer_data_path, split_val_symbols
+    data_path = get_tokenizer_data_path(norm_mode)
 
     pretrained_path = os.path.join(PROJECT_ROOT, PRETRAINED_MAP[model_type])
     output_path = get_tokenizer_path(norm_mode, model_type)
 
-    print("=" * 60)
-    print("Kronos Tokenizer Fine-tuning")
-    print("=" * 60)
-    print(f"norm_mode: {norm_mode}")
-    print(f"model_type: {model_type}")
-    print(f"pretrained: {PRETRAINED_MAP[model_type]}")
-    print(f"train_path: {train_path}")
-    print(f"val_path: {val_path}")
-    print(f"output_path: {output_path}")
-    print(f"epochs: {epochs}")
-    print(f"batch_size: {batch_size}")
-    print(f"n_train_iter: {n_train_iter_multiplier * batch_size}")
-    print(f"n_val_iter: {n_val_iter_multiplier * batch_size}")
-    print("=" * 60)
+    if is_main:
+        print("=" * 60)
+        print("Kronos Tokenizer Fine-tuning")
+        print("=" * 60)
+        print(f"norm_mode: {norm_mode}")
+        print(f"model_type: {model_type}")
+        print(f"pretrained: {PRETRAINED_MAP[model_type]}")
+        print(f"data_path: {data_path}")
+        print(f"output_path: {output_path}")
+        print(f"seq_len: {seq_len}")
+        print(f"val_holdout_ratio: {val_holdout_ratio}")
+        print(f"epochs: {epochs}")
+        print(f"batch_size: {batch_size}")
+        print(f"world_size: {world_size}")
+        print(f"n_train_iter: {n_train_iter_multiplier * batch_size}")
+        print(f"n_val_iter: {n_val_iter_multiplier * batch_size}")
+        print("=" * 60)
 
     # 1. 加载预训练 tokenizer（架构由 model_type 决定）
-    print("\n[1] Loading pretrained tokenizer...")
+    if is_main:
+        print("\n[1] Loading pretrained tokenizer...")
     tokenizer = KronosTokenizer.from_pretrained(pretrained_path)
     tokenizer.to(device)
-    print(f"Tokenizer loaded from: {pretrained_path}")
+    if is_main:
+        print(f"Tokenizer loaded from: {pretrained_path}")
 
-    # 2. 加载 train/val 数据
-    print("\n[2] Loading data...")
-    with open(train_path, 'rb') as f:
-        train_data = pickle.load(f)
-    with open(val_path, 'rb') as f:
-        val_data = pickle.load(f)
-    print(f"Loaded train: {len(train_data)} stocks, val: {len(val_data)} stocks")
+    # 2. 加载 tokenizer 专用数据（整条归一化，无分割）
+    if is_main:
+        print("\n[2] Loading data...")
+    if not os.path.exists(data_path):
+        raise FileNotFoundError(
+            f"Tokenizer data not found at {data_path}. "
+            f"Please run: python finetune/tokenizer/preprocess.py --norm-mode {norm_mode}"
+        )
+    with open(data_path, 'rb') as f:
+        all_data = pickle.load(f)
+    if is_main:
+        print(f"Loaded {len(all_data)} stocks (full-series normalized)")
 
-    # 构建索引
-    train_indices = []
-    for symbol, d in train_data.items():
-        if 'windows' in d:
-            for w in d['windows']:
-                train_indices.append((symbol, int(w)))
+    # 随机抽 val_holdout_ratio 比例股票作 val（仅 early-stop 信号，非防泄露）
+    # 用 rank0 的 seed 划分，保证各 rank 划分一致（否则 val 集不同步）
+    # 复用 preprocess.split_val_symbols，保证 train/validate 用同一 val 集
+    train_data, val_data, _ = split_val_symbols(all_data, seed, val_holdout_ratio)
+    if is_main:
+        print(f"Split by symbol: train={len(train_data)} stocks, val={len(val_data)} stocks (holdout {val_holdout_ratio})")
 
-    val_indices = []
-    for symbol, d in val_data.items():
-        if 'windows' in d:
-            for w in d['windows']:
-                val_indices.append((symbol, int(w)))
-
-    print(f"Total windows: train={len(train_indices)}, val={len(val_indices)}")
-
-    # 创建数据集
-    config = DataConfig(
-        norm_mode=norm_mode,
-        lookback=lookback,
-        predict=predict,
-        split_mode=split_mode,
-    )
-
-    train_dataset = TokenizerDataset(train_data, train_indices, config)
-    val_dataset = TokenizerDataset(val_data, val_indices, config)
+    # 创建数据集（从整条 normalized 随机切 seq_len 窗口）
+    train_dataset = TokenizerDataset(train_data, seq_len)
+    val_dataset = TokenizerDataset(val_data, seq_len)
 
     # 3. 步数驱动放回采样（关键：非比例抽样）
     n_train_iter = n_train_iter_multiplier * batch_size
@@ -175,11 +188,17 @@ def finetune_tokenizer(
         num_workers=0, drop_last=False,
     )
 
-    print(f"Train loader: {len(train_loader)} batches/epoch")
-    print(f"Val loader: {len(val_loader)} batches")
+    if is_main:
+        print(f"Train loader: {len(train_loader)} batches/epoch")
+        print(f"Val loader: {len(val_loader)} batches")
+
+    # DDP 包装（forward 必须走包装对象触发梯度 all-reduce）
+    if use_ddp:
+        tokenizer = DDP(tokenizer, device_ids=[local_rank])
 
     # 4. 微调循环
-    print("\n[3] Fine-tuning...")
+    if is_main:
+        print("\n[3] Fine-tuning...")
     optimizer = torch.optim.AdamW(
         tokenizer.parameters(),
         lr=learning_rate,
@@ -201,11 +220,18 @@ def finetune_tokenizer(
     ensure_dir(checkpoint_path)
 
     for epoch_idx in range(epochs):
+        epoch_start = time.time()
         tokenizer.train()
         epoch_losses = []
+        total_batches = len(train_loader)
+        current_lr = optimizer.param_groups[0]['lr']
 
-        for batch_x in train_loader:
-            batch_x = batch_x.to(device)
+        if is_main:
+            print(f"\n=== Epoch {epoch_idx + 1}/{epochs} ===")
+            print(f"LR: {current_lr:.6f}")
+
+        for batch_idx, batch_x in enumerate(train_loader):
+            batch_x = batch_x.to(device, non_blocking=True)
 
             # Forward
             zs, bsq_loss, _, _ = tokenizer(batch_x)
@@ -224,8 +250,13 @@ def finetune_tokenizer(
 
             epoch_losses.append(loss.item())
 
-        avg_train_loss = np.mean(epoch_losses)
-        current_lr = optimizer.param_groups[0]['lr']
+            # batch 级进度日志（每 50 batch + 首个 batch），仅 rank0
+            if is_main and (batch_idx % 50 == 0 or batch_idx == 0):
+                avg_loss = sum(epoch_losses[-50:]) / min(len(epoch_losses[-50:]), 50)
+                elapsed = time.time() - epoch_start
+                print(f"  Batch {batch_idx + 1}/{total_batches} - loss: {loss.item():.4f}, avg: {avg_loss:.4f}, lr: {current_lr:.6f} [{elapsed:.0f}s]", flush=True)
+
+        avg_train_loss = sum(epoch_losses) / len(epoch_losses)
 
         # 5. val 重建损失
         tokenizer.eval()
@@ -240,39 +271,56 @@ def finetune_tokenizer(
                 val_loss_sum += vl.item() * batch_x.size(0)
                 val_count += batch_x.size(0)
 
+        # DDP：跨 rank 聚合 val_loss，保证各 rank 拿到同一值 → early-stop 决定一致（防死锁）
+        if use_ddp:
+            sum_tensor = torch.tensor([val_loss_sum, val_count], device=device, dtype=torch.float64)
+            dist.all_reduce(sum_tensor, op=dist.ReduceOp.SUM)
+            val_loss_sum = sum_tensor[0].item()
+            val_count = sum_tensor[1].item()
+
         avg_val_loss = val_loss_sum / val_count
 
         history['train_loss'].append(avg_train_loss)
         history['val_loss'].append(avg_val_loss)
         history['lr'].append(current_lr)
 
-        print(f"Epoch {epoch_idx+1}/{epochs}: train={avg_train_loss:.6f}, val={avg_val_loss:.6f}, lr={current_lr:.6f}")
+        epoch_elapsed = time.time() - epoch_start
+        if is_main:
+            print(f"Epoch {epoch_idx + 1}/{epochs}: train={avg_train_loss:.6f}, val={avg_val_loss:.6f}, lr={current_lr:.6f} [{epoch_elapsed:.0f}s]", flush=True)
 
         # Early stopping（跳过 grace period）
         if epoch_idx >= early_stopping_grace_period:
             if avg_val_loss < best_val_loss - early_stopping_min_delta:
                 best_val_loss = avg_val_loss
                 patience_counter = 0
-                tokenizer.save_pretrained(os.path.join(checkpoint_path, 'best_model'))
-                print(f"  [BEST] val_loss={best_val_loss:.6f}")
+                if is_main:
+                    unwrapped = tokenizer.module if use_ddp else tokenizer
+                    unwrapped.save_pretrained(os.path.join(checkpoint_path, 'best_model'))
+                    print(f"  [BEST] val_loss={best_val_loss:.6f}", flush=True)
+                if use_ddp:
+                    dist.barrier()
             else:
                 patience_counter += 1
                 if patience_counter >= early_stopping_patience:
-                    print(f"\n[EARLY STOP] No improvement for {patience_counter} epochs")
+                    if is_main:
+                        print(f"\n[EARLY STOP] No improvement for {patience_counter} epochs", flush=True)
                     break
 
     # 6. 保存最终（TK5 修复：同时保存到 output_path 根目录，方便 validate/eval 加载）
-    print("\n[4] Saving tokenizer...")
-    tokenizer.save_pretrained(os.path.join(checkpoint_path, 'final_model'))
-    # 同时保存到 output_path 根目录（validate/eval 期望的路径）
-    tokenizer.save_pretrained(output_path)
+    # 仅 rank0 保存，DDP 包装对象无 save_pretrained，需解包
+    if is_main:
+        print("\n[4] Saving tokenizer...")
+        unwrapped = tokenizer.module if use_ddp else tokenizer
+        unwrapped.save_pretrained(os.path.join(checkpoint_path, 'final_model'))
+        # 同时保存到 output_path 根目录（validate/eval 期望的路径）
+        unwrapped.save_pretrained(output_path)
 
     # 记录元数据
     meta = {
         'norm_mode': norm_mode,
         'model_type': model_type,
         'pretrained_base': PRETRAINED_MAP[model_type],
-        'data_fingerprint': compute_fingerprint(train_path),
+        'data_fingerprint': compute_fingerprint(all_data),
         'epochs': epochs,
         'actual_epochs': epoch_idx + 1,
         'learning_rate': learning_rate,
@@ -281,43 +329,49 @@ def finetune_tokenizer(
         'n_val_iter': n_val_iter,
         'best_val_loss': float(best_val_loss),
         'early_stopping_patience': early_stopping_patience,
+        'world_size': world_size,
+        'use_ddp': use_ddp,
         'created_at': datetime.now().isoformat(),
     }
-    safe_save_json(meta, os.path.join(output_path, 'meta.json'))
+    if is_main:
+        safe_save_json(meta, os.path.join(output_path, 'meta.json'))
 
     # 保存训练历史
-    safe_save_json(history, os.path.join(output_path, 'history.json'))
+    if is_main:
+        safe_save_json(history, os.path.join(output_path, 'history.json'))
+        print(f"\nTokenizer saved to: {output_path}")
+        print(f"Best val loss: {best_val_loss:.6f}")
+        print(f"Actual epochs: {epoch_idx + 1}/{epochs}")
+        print("=" * 60)
 
-    print(f"\nTokenizer saved to: {output_path}")
-    print(f"Best val loss: {best_val_loss:.6f}")
-    print("=" * 60)
+    # 所有 rank 同步后再清理，防 rank0 退出后其他 rank 还在通信
+    if use_ddp:
+        dist.barrier()
+    cleanup_ddp()
 
     return tokenizer, best_val_loss
 
 
 class TokenizerDataset:
-    """Tokenizer 微调用的数据集"""
+    """Tokenizer 微调用的数据集：预建所有 (symbol, start) 窗口索引，RandomSampler 随机采样"""
 
-    def __init__(self, data, indices, config):
+    def __init__(self, data, seq_len):
         self.data = data
-        self.indices = indices
-        self.config = config
+        self.seq_len = seq_len
+        # 预建所有合法窗口索引：(symbol, start)，start ∈ [0, T - seq_len]
+        self.indices = []
+        for symbol, d in data.items():
+            T = len(d['normalized'])
+            for start in range(0, max(0, T - seq_len + 1)):
+                self.indices.append((symbol, start))
 
     def __len__(self):
         return len(self.indices)
 
     def __getitem__(self, idx):
-        symbol, window_start = self.indices[idx]
+        symbol, start = self.indices[idx]
         d = self.data[symbol]
-
-        if 'normalized' in d:
-            x_norm = d['normalized'][window_start:window_start + self.config.lookback]
-        else:
-            x_raw = d['original'][window_start:window_start + self.config.lookback]
-            x_mean = np.mean(x_raw, axis=0)
-            x_std = np.std(x_raw, axis=0) + 1e-5
-            x_norm = np.clip((x_raw - x_mean) / x_std, -self.config.clip, self.config.clip)
-
+        x_norm = d['normalized'][start:start + self.seq_len]
         return torch.from_numpy(x_norm.astype(np.float32))
 
 
@@ -328,9 +382,8 @@ def main():
     parser.add_argument('--model', type=str, default='mini',
                         choices=['mini', 'small', 'base'],
                         help='mini→Kronos-Tokenizer-2k, small/base→Kronos-Tokenizer-base')
-    parser.add_argument('--lookback', type=int, default=400)
-    parser.add_argument('--predict', type=int, default=10)
-    parser.add_argument('--split-mode', type=str, default='block')
+    parser.add_argument('--seq-len', type=int, default=400,
+                        help='tokenizer 重建窗口长度（与 predictor lookback 无关）')
     parser.add_argument('--epochs', type=int, default=30)
     parser.add_argument('--batch-size', type=int, default=16)
     parser.add_argument('--lr', type=float, default=0.001)
@@ -343,7 +396,13 @@ def main():
     parser.add_argument('--grace-period', type=int, default=3,
                         help='Early stopping grace period')
     parser.add_argument('--seed', type=int, default=42)
+    parser.add_argument('--val-holdout-ratio', type=float, default=0.1,
+                        help='val 股票比例（须与 validate 一致，否则 val 集不同步）')
     args = parser.parse_args()
+
+    # DDP setup（torchrun 自动注入 RANK/LOCAL_RANK/WORLD_SIZE；单卡 python 直接跑则 use_ddp=False）
+    rank, local_rank, world_size, use_ddp = get_rank_info()
+    device = get_device(local_rank)
 
     finetune_tokenizer(
         norm_mode=args.norm_mode,
@@ -356,9 +415,13 @@ def main():
         early_stopping_patience=args.patience,
         early_stopping_grace_period=args.grace_period,
         seed=args.seed,
-        lookback=args.lookback,
-        predict=args.predict,
-        split_mode=args.split_mode,
+        seq_len=args.seq_len,
+        val_holdout_ratio=args.val_holdout_ratio,
+        rank=rank,
+        local_rank=local_rank,
+        world_size=world_size,
+        use_ddp=use_ddp,
+        device=device,
     )
 
 

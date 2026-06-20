@@ -47,6 +47,7 @@ WORKDIR /app
 # Copy source code (training/eval only)
 COPY model/ ./model/
 COPY finetune/predictor/ ./finetune/predictor/
+COPY finetune/tokenizer/ ./finetune/tokenizer/
 
 # Entrypoint script
 COPY docker/entrypoint.sh ./entrypoint.sh

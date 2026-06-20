@@ -39,6 +39,10 @@ class SampleSchema:
     target_end: int    # = target_start + predict
     split: str  # 'train' | 'val' | 'test'
 
+    # block 归一化用：记录所属 block 在原始序列的起点（block 模式填，time 模式 None）
+    # block 内归一化时，窗口的归一化数据从 block_start 起的段取，不跨 block/split
+    block_start: Optional[int] = None
+
     # 数据（可选，加载时填充）
     values: Optional[np.ndarray] = None  # (window_size, n_features)
     index: Optional[Any] = None  # DatetimeIndex
@@ -86,6 +90,7 @@ def sample_to_dict(sample: SampleSchema) -> Dict[str, Any]:
         'target_start': sample.target_start,
         'target_end': sample.target_end,
         'split': sample.split,
+        'block_start': sample.block_start,
         'values': sample.values,
         'index': sample.index,
     }

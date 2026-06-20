@@ -12,6 +12,7 @@
 | 2026-06-19 | §1.5.2 / §1.5.6 | tokenizer 微调改为步数驱动放回采样（`n_train_iter_multiplier`，默认 32000 步/epoch），删除臆造的 `sample_ratio=0.1`；补微调效果检验（val 重建损失 + 与预训练对比 + 验收标准表） | 原方案杜撰了不存在的采样率与 `KronosTokenizer.train()` API；核实现有 `deprecated/finetune/train_tokenizer.py` 真实做法为步数驱动采样 + 重建损失 early stopping | §21 |
 | 2026-06-19 | §1.2 / §6.2 / §8.3 | 三项口径决策确认：① I2 SlidingMANormalizer **保持含当前点**（不加 shift(1)，归一化需含当前点信息）；② I3 eval.py 用 **DDP 框架统一控卡数**（单/多卡同一套代码，`torchrun --nproc_per_node=N`）；③ P4 excess DA 已写入 training_info（确认已修）。I2 口径与旧代码不同 → Phase 4 等价性改为"新口径自洽 + 可换算对照"，不强求与旧数值对齐 | 用户拍板口径；核实 train.py:627/169 excess_da 已记录、normalization.py:112 含当前点、eval.py 待按 DDP 改造 | §22.6 |
 | 2026-06-19 | §10 | epoch 输出与 best 跟踪完善（ABCD+X）：① epoch 打印各关键指标并列 `current \| best @ep`，不再 IC 主导；② best 跟踪扩展到 val_loss/ic/da_score/excess_da/combined 五项，各记 `{value, epoch}`；③ 可懂指标三件套（振幅误差率/涨跌停命中率）只在产生 best 时算并记录，平凡 epoch 不算（无额外 forward）；④ checkpoint 仍只 3 个（val_loss/ic/combined），DA/可懂指标 best 仅记录值+epoch 不存独立 ckpt（X）；⑤ `update_training_info` 签名改为 `best_updates` dict，epoch_record 补 da_score/excess_da/可懂指标 | 原 epoch 输出 IC 主导，DA/excess_da 无 best 跟踪，可懂指标完全缺失；用户要求各关键指标补 current+best、best 时算可懂指标 | §10 |
+| 2026-06-20 | §1.3 Block Split | block_split 重设计：分块与滑动窗口分层（先按 block_size 切不重叠块，块内 stride=1 生成窗口，target 不超块）；`block_size` 由 `--samples-per-block`（默认 100）自动计算 `window_size + samples_per_block - 1`，只取决于 window_size（lookback+predict），与 norm_mode 无关（per-block 归一化 + 块首 expanding，无需 footprint）；create_samples 改按块生成；create_target_blocks 按 `window_start // block_size` 分组；block_split 改 deficit 算法分配（修复 val=0）。修复运行报错 `Block 0 and 1 target intervals overlap` | 原全序列 stride=1 生成再分块导致 target 跨块重叠；用户方案：先分块再块内 stride=1 | 审查记录 §6.12/§6.13 |
 
 ---
 
@@ -122,93 +123,94 @@ def time_split(samples, train_end, val_end):
 
 #### Block Split（分层抽样）
 
-以 target 时间块为单位分配，不是以 window index 为单位：
+**设计（2026-06-20 重设计）**：分块与滑动窗口分层——**先按 block_size 切不重叠时间段，块内 stride=1 生成窗口（target 不超块边界）**。这样块间 target 天然不相交（块边界即隔离），块内 target 重叠 OK（同块内）。
+
+`block_size` 由 CLI `--samples-per-block`（默认 100）自动计算：`block_size = window_size + samples_per_block - 1`（window_size = lookback + predict）。block 模式归一化**按块独立**进行（块内 sliding_ma，块首用 expanding `min_periods=1`），故 block_size **只取决于 window_size，与 norm_mode 无关**——不再有 footprint（required_history+lookback+predict）约束，sliding_ma120 无需更大的块。约束仅 `block_size ≥ window_size`（即 `samples_per_block ≥ 1`），由 `DataConfig.validate` 校验。
+
+样本由 `preprocess.create_samples` 按块生成（非全序列 stride=1 后分块），`create_target_blocks` 按 `window_start // block_size` 分组（块边界与生成一致），块间不相交自动成立。
 
 ```python
-def create_target_blocks(sym_samples, block_size=50):
+def create_target_blocks(sym_samples, block_size):
     """
-    创建 target 时间块（关键：块之间 target 时间区间不相交）
-    
+    创建 target 时间块（样本已按块生成，target 不跨块）
+
     算法：
-    1. 取该股票 target 时间轴 [t_min, t_max]
-    2. 按 block_size 切成不重叠的时间区间块
-    3. 每个窗口按其 target 落在哪个时间块，归入该块
-    4. 返回 block 列表，每个 block 是窗口列表
-    
-    注意：不是按样本列表顺序切分（那会退化为 window-index splitting → 泄露）
+    1. 样本由 create_samples 按块生成（块内 stride=1，target_end ≤ 块末）
+    2. 按 window_start // block_size 分组（block_id 与生成块边界一致）
+    3. 块间 target 不相交自动成立（块边界即隔离）
+    4. 扫描线 sanity 检查（应永不触发）
     """
     if not sym_samples:
         return []
-    
-    # 按 target_start 排序
-    sorted_samples = sorted(sym_samples, key=lambda s: s['target_start'])
-    
-    # 取 target 时间范围
-    t_min = sorted_samples[0]['target_start']
-    t_max = sorted_samples[-1]['target_end']
-    
-    # 切成时间块
-    blocks = []
-    current_block_start = t_min
-    
-    while current_block_start < t_max:
-        current_block_end = min(current_block_start + block_size, t_max)  # 末端块防超界
-        
-        # 收集 target 落在 [current_block_start, current_block_end) 的窗口
-        block_windows = []
-        for s in sorted_samples:
-            if s['target_start'] >= current_block_start and s['target_end'] <= current_block_end:
-                block_windows.append(s)
-        
-        if block_windows:
-            blocks.append(block_windows)
-        
-        current_block_start = current_block_end
-    
-    # 断言：块之间 target 区间不相交
-    for i, block_a in enumerate(blocks):
-        for j, block_b in enumerate(blocks):
-            if i != j:
-                intervals_a = [(s['target_start'], s['target_end']) for s in block_a]
-                intervals_b = [(s['target_start'], s['target_end']) for s in block_b]
-                assert not intervals_overlap(intervals_a, intervals_b), f"block {i}/{j} overlap!"
-    
+
+    # 按 block_id（window_start // block_size）分组
+    blocks_by_id = defaultdict(list)
+    for s in sym_samples:
+        blocks_by_id[s.window_start // block_size].append(s)
+
+    blocks = [blocks_by_id[k] for k in sorted(blocks_by_id.keys())]
+
+    # 扫描线 sanity：块间 target 不相交（应永不触发，因样本按块生成 target 不跨块）
+    all_intervals = sorted(
+        ((s.target_start, s.target_end, b_idx)
+         for b_idx, block in enumerate(blocks) for s in block),
+        key=lambda x: x[0])
+    for i in range(len(all_intervals) - 1):
+        s1, e1, b1 = all_intervals[i]
+        s2, e2, b2 = all_intervals[i + 1]
+        if e1 > s2 and b1 != b2:
+            raise AssertionError(f"Block {b1}/{b2} target overlap: [{s1},{e1}) vs [{s2},{e2})")
+
     return blocks
 
 
-def block_split(samples, train_ratio=0.6, val_ratio=0.2, test_ratio=0.2, seed=42):
+def block_split(samples, train_ratio=0.75, val_ratio=0.15, test_ratio=0.15,
+                block_size=600, seed=42):
     """
-    以 target 时间块为单位分配 train/val/test
-    
-    关键：同一股票相邻窗口可能跨 split（因为以 block 为单位）
+    以 target 时间块为单位分配 train/val/test（默认 0.75/0.15/0.15）
+
+    分配规则（deficit 算法，修复旧 int(ratio) 在少块时 val=0）：
+    1. 6 指标：个股 train/val/test 缺度 + 全局 train/val/test 缺度
+    2. 选最大缺度对应的 split（谁最缺给谁）
+    3. 同等缺度按优先级 train>val>test，用后该 split 优先级降最低并轮换
     """
     rng = np.random.RandomState(seed)
-    
-    # 按股票分组
     by_symbol = defaultdict(list)
     for s in samples:
-        by_symbol[s['symbol']].append(s)
-    
-    train, val, test = [], [], []
-    
+        by_symbol[s.symbol].append(s)
+
+    # 收集各股票的块（块边界与 create_samples 一致）
+    all_stock_blocks = {}
     for symbol, sym_samples in by_symbol.items():
-        # 创建 target 时间块（块之间不相交）
-        blocks = create_target_blocks(sym_samples, block_size=50)
-        
-        # 随机分配 blocks
-        rng.shuffle(blocks)
-        n_train = int(len(blocks) * train_ratio)
-        n_val = int(len(blocks) * val_ratio)
-        
-        for block in blocks[:n_train]:
-            train.extend(block)
-        for block in blocks[n_train:n_train+n_val]:
-            val.extend(block)
-        for block in blocks[n_train+n_val:]:
-            test.extend(block)
-    
+        blocks = create_target_blocks(sym_samples, block_size=block_size)
+        if blocks:
+            rng.shuffle(blocks)
+            all_stock_blocks[symbol] = blocks
+
+    target_ratios = {'train': train_ratio, 'val': val_ratio, 'test': test_ratio}
+    global_assigned = {k: 0 for k in target_ratios}
+    priority_order = {'train': 0, 'val': 1, 'test': 2}  # 轮换状态
+    assignments = {sym: {k: [] for k in target_ratios} for sym in all_stock_blocks}
+
+    for symbol, blocks in all_stock_blocks.items():
+        for block in blocks:
+            # 计算个股/全局当前比例与缺度（6 指标）
+            indicators = _compute_gap_indicators(
+                assignments[symbol], global_assigned, target_ratios)
+            # 选最大缺度 split；同等缺度按 priority_order 选并轮换
+            best_split = _pick_split(indicators, priority_order)
+            assignments[symbol][best_split].append(block)
+            global_assigned[best_split] += 1
+
+    train, val, test = [], [], []
+    for symbol, asg in assignments.items():
+        for s in asg['train']: s.split = 'train'; train.append(s)
+        for s in asg['val']:   s.split = 'val';   val.append(s)
+        for s in asg['test']:  s.split = 'test';  test.append(s)
     return train, val, test
 ```
+
+> 注：`block_split` 的 `block_size` 形参默认 600 仅为签名占位，实际由 `preprocess.apply_split` 传入 `config.block_size`（= `window_size + samples_per_block - 1`）。deficit 算法保证每只股票 ≥3 块时 train/val/test 均非空。权威实现见 `finetune/predictor/core/splitting.py`。
 
 #### No-Leakage 检查（区间语义）
 
