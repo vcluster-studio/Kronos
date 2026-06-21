@@ -452,9 +452,11 @@ def main():
     parser.add_argument('--checkpoint', type=str, default='best_combined_model',
                         choices=['best_model', 'best_ic_model', 'best_combined_model', 'latest_model'])
     parser.add_argument('--tokenizer-path', type=str, default=None,
-                        help='自定义 tokenizer 路径')
+                        help='自定义 tokenizer 路径（优先级最高）')
     parser.add_argument('--checkpoint-path', type=str, default=None,
-                        help='自定义 checkpoint 目录路径（包含 model.safetensors）')
+                        help='自定义 checkpoint 目录路径（优先级最高）')
+    parser.add_argument('--test-path', type=str, default=None,
+                        help='自定义测试数据路径（优先级最高）')
     parser.add_argument('--n-samples', type=int, default=-1,
                         help='Number of samples (-1 for full)')
     parser.add_argument('--seed', type=int, default=42)
@@ -478,8 +480,11 @@ def main():
         split_mode=args.split_mode,
     )
 
-    # 数据路径（由 preprocess.py 预先生成）
-    test_path = get_split_data_path(config.norm_mode, config.lookback, config.predict, config.split_mode, 'test')
+    # 数据路径：支持自定义（优先级最高）
+    if args.test_path:
+        test_path = args.test_path
+    else:
+        test_path = get_split_data_path(config.norm_mode, config.lookback, config.predict, config.split_mode, 'test')
 
     if is_main:
         print(f"\n{'=' * 60}")
@@ -492,6 +497,9 @@ def main():
             print(f"tokenizer_path: {args.tokenizer_path} (custom)")
         if args.checkpoint_path:
             print(f"checkpoint_path: {args.checkpoint_path} (custom)")
+        print(f"test_path: {test_path}")
+        if args.test_path:
+            print(f"  (custom data path)")
         print(f"n_samples: {args.n_samples if args.n_samples > 0 else 'FULL'}")
         if use_ddp:
             print(f"DDP: {world_size} GPUs")
