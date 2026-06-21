@@ -176,6 +176,7 @@ def evaluate(
     config: DataConfig,
     device: torch.device,
     n_samples: int = -1,
+    n_sample_ratio: float = 0.5,
     seed: int = 42,
     limit_pct: float = 0.10,
     rank: int = 0,
@@ -189,6 +190,11 @@ def evaluate(
     """
     model.eval()
     tokenizer.eval()
+
+    # eval.py 的 model 始终是裸 Kronos（load_model_and_tokenizer 不做 DDP 包装），
+    # DDP 仅用于数据分片 + all_gather 聚合，故 decode_s1/decode_s2 可直接调用。
+    # （train.py 的 model 才被 DDP 包装，需 model.module；eval 无此问题。）
+    use_ddp = world_size > 1
 
     rng = np.random.RandomState(seed)  # EV6 修复：所有 rank 同 seed 抽同样本，再按 idx%world_size 分片
 
@@ -216,9 +222,14 @@ def evaluate(
                 for i in range(seq_len - config.lookback - config.predict + 1):
                     indices.append((symbol, i))
 
-    # 抽样
-    if n_samples > 0 and n_samples < len(indices):
-        sample_idx = rng.choice(len(indices), size=n_samples, replace=False)
+    # 抽样：--n-samples(绝对值) 优先，否则用 --n-sample-ratio(比例)
+    D = len(indices)
+    if n_samples > 0:
+        n_eval = min(n_samples, D)
+    else:
+        n_eval = max(1, int(D * n_sample_ratio))
+    if n_eval < D:
+        sample_idx = rng.choice(len(indices), size=n_eval, replace=False)
         indices = [indices[i] for i in sample_idx]
 
     # 收集结果
@@ -240,20 +251,21 @@ def evaluate(
         end = start + config.lookback + config.predict
 
         try:
-            if 'normalized' in d:
-                x_norm = d['normalized'][start:start + config.lookback].astype(np.float32)
-                means = d['means'][start:end]
-                stds = d['stds'][start:end]
-                original = d['original'][start:end]
-                timestamps = d['index'][start:end]
-            else:
-                df = d.iloc[start:end]
-                x_raw = df.values[:config.lookback].astype(np.float32)
+            # 取数：统一走 extract_window，支持 DataFrame / dict time / dict block 三种格式
+            from finetune.predictor.core.dataset import extract_window
+            normalized, original_vals, means, stds, timestamps = extract_window(d, start, end)
+
+            if normalized is None:
+                # DataFrame 格式（full_window runtime 归一化）
+                x_raw = original_vals[:config.lookback]
                 x_mean = np.mean(x_raw, axis=0)
                 x_std = np.std(x_raw, axis=0) + 1e-5
                 x_norm = np.clip((x_raw - x_mean) / x_std, -config.clip, config.clip)
-                original = df.values
-                timestamps = df.index
+                original = original_vals
+            else:
+                # dict 格式（time / block，已预归一化）
+                x_norm = normalized[:config.lookback].astype(np.float32)
+                original = original_vals
 
             baseline = original[config.lookback - 1]
             baseline_close = original[config.lookback - 1, 3]
@@ -294,11 +306,12 @@ def evaluate(
 
                 pred_norm = preds[0, config.lookback:config.lookback + config.predict, :]
 
-                # 反归一化
-                if 'normalized' in d:
-                    pred_raw = pred_norm.cpu().numpy() * stds[config.lookback:] + means[config.lookback:]
+                # 反归一化：preds 已是 numpy（auto_regressive_inference 返回 np.ndarray）
+                # dict 格式用预计算 means/stds，DataFrame 格式用 runtime x_std/x_mean
+                if normalized is not None:
+                    pred_raw = pred_norm * stds[config.lookback:] + means[config.lookback:]
                 else:
-                    pred_raw = pred_norm.cpu().numpy() * x_std + x_mean
+                    pred_raw = pred_norm * x_std + x_mean
 
                 actual = original[config.lookback:config.lookback + config.predict]
 
@@ -316,11 +329,12 @@ def evaluate(
                 for fi, fn in enumerate(FEATURE_NAMES):
                     pred_dir = (pred_raw[step_idx, fi] - baseline[fi]) > 0
                     actual_dir = (actual[step_idx, fi] - baseline[fi]) > 0
-                    da_by_step[step_idx][fn].append(pred_dir == actual_dir)
+                    # 存 float（非 bool）：聚合时 np.percentile 对 bool 做插值会崩溃
+                    da_by_step[step_idx][fn].append(float(pred_dir == actual_dir))
 
                     # 收集 close 的 actual_dir（用于 naive DA）
                     if fn == 'close':
-                        actual_dir_by_step[step_idx].append(actual_dir)
+                        actual_dir_by_step[step_idx].append(float(actual_dir))
 
             # 振幅误差率
             pred_amp = pred_raw[0, 1] - pred_raw[0, 2]  # high - low
@@ -337,7 +351,6 @@ def evaluate(
             continue
 
     # 聚合结果（DDP 模式用 all_gather）
-    use_ddp = world_size > 1
 
     if use_ddp:
         # DDP 聚合
@@ -457,13 +470,15 @@ def main():
                         help='自定义 checkpoint 目录路径（优先级最高）')
     parser.add_argument('--test-path', type=str, default=None,
                         help='自定义测试数据路径（优先级最高）')
+    # 测试采样：--n-samples(绝对值) 优先，否则用 --n-sample-ratio(比例，默认 0.5)
+    # 与 train.py 验证采样同源概念。默认 0.5 抽样子集加速评估，-1/1.0 全量。
     parser.add_argument('--n-samples', type=int, default=-1,
-                        help='Number of samples (-1 for full)')
+                        help='测试样本绝对数（-1=用 ratio，>0 覆盖 ratio）')
+    parser.add_argument('--n-sample-ratio', type=float, default=0.5,
+                        help='测试子集占 test 总量比例（默认 0.5）。无放回随机抽样，DDP 各 rank 同 seed 抽同样本再分片')
     parser.add_argument('--seed', type=int, default=42)
     parser.add_argument('--limit-pct', type=float, default=0.10,
                         help='Limit threshold (main board 10%, ChiNext 20%)')
-    parser.add_argument('--use-block', action='store_true',
-                        help='Use block_lb400_pd10 data')
     args = parser.parse_args()
 
     # DDP setup
@@ -500,7 +515,10 @@ def main():
         print(f"test_path: {test_path}")
         if args.test_path:
             print(f"  (custom data path)")
-        print(f"n_samples: {args.n_samples if args.n_samples > 0 else 'FULL'}")
+        if args.n_samples > 0:
+            print(f"n_samples: {args.n_samples} (absolute)")
+        else:
+            print(f"n_sample_ratio: {args.n_sample_ratio} (of full test set)")
         if use_ddp:
             print(f"DDP: {world_size} GPUs")
         print(f"{'=' * 60}")
@@ -533,6 +551,7 @@ def main():
         ic_result, da_result, amplitude_result, limit_result, naive_da_by_step = evaluate(
             model, tokenizer, test_data, config, device,
             n_samples=args.n_samples,
+            n_sample_ratio=args.n_sample_ratio,
             seed=args.seed,
             limit_pct=args.limit_pct,
             rank=rank,

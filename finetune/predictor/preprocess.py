@@ -201,32 +201,48 @@ def apply_split(
 def create_backtest_samples(
     train_raw: Dict[str, Any],
     backtest_raw: Dict[str, Any],
-    config: DataConfig
+    config: DataConfig,
+    stride: int = 1
 ) -> Dict[str, Any]:
     """
-    生成 backtest 样本
+    生成 backtest 样本（滑窗多窗口，每窗口独立归一化）
 
-    每只股票一个样本：
-      - context（lookback）来自 train_raw（kline_daily_raw）末尾
-      - target（predict）来自 backtest_raw 开头
-      - 拼接 required_history + lookback + predict 的完整序列后归一化
+    两种归一化场景的窗口构成（由 required_history 决定）：
+      - full_window：required_history=0，窗口 = lookback + predict，统一归一化（窗口内 mean/std）
+      - sliding_maN：required_history=N，窗口 = N + lookback + predict，前 N 根参与归一化
+        （提供滑动窗口历史）但不参与推理/测试，需从 train_raw 借用
+
+    每窗口独立归一化（方案 A）：拼接 前置(required_history) + lookback + predict 后归一化一次。
+    这样每窗口的归一化前缀都是真实历史，无统一归一化的 expanding 边界问题。
+
+    窗口 k 的构成：
+      - target = backtest[k : k+predict]（backtest 自身作为预测段）
+      - context(required_history + lookback) = (train_raw 末尾 + backtest[0:k]) 末尾 context_len 根
+        —— target 之前的真实历史，随窗口推进滑动，无泄露
+      - k=0 时 context 全来自 train_raw 末尾；k 增大时逐渐含 backtest 前缀
+
+    自回归语义下 stride=1 是天然口径：每个 target 起点都对应一个预测窗口。
+    backtest_raw 22 根、predict=10、stride=1 → 每股 13 个窗口。
 
     Args:
-        train_raw: kline_daily_raw（提供 context）
-        backtest_raw: backtest_raw（提供 target）
+        train_raw: kline_daily_raw（借用末尾 context 段，含归一化前置历史）
+        backtest_raw: backtest_raw（自身作为预测段，滑窗形成多窗口）
         config: DataConfig
+        stride: 窗口步长（默认 1）
 
     Returns:
-        {symbol: {normalized, means, stds, original, index, lookback, predict}}
+        {symbol: {windows: [{normalized, means, stds, original, index, lookback, predict, target_start}], lookback, predict, n_windows}}
     """
     lookback = config.lookback
     predict = config.predict
     required_history = NormalizerFactory.get_required_history(config.norm_mode)
     normalizer = NormalizerFactory.create(config.norm_mode, clip=config.clip)
-    context_len = lookback + required_history  # 从 train_raw 取的长度
+    context_len = lookback + required_history  # 每窗口 context 段长度（含归一化前置）
+    window_len = context_len + predict          # 每窗口完整序列长度
 
     samples = {}
     skipped = 0
+    total_windows = 0
 
     for symbol, bt_data in tqdm(backtest_raw.items(), desc="Backtest samples"):
         train_data = train_raw.get(symbol)
@@ -239,40 +255,62 @@ def create_backtest_samples(
         bt_values = bt_data['values']
         bt_index = bt_data['index']
 
-        # train_raw 不足以提供 context
+        # train_raw 不足以提供首个窗口的 context（含归一化前置）
         if len(train_values) < context_len:
             skipped += 1
             continue
-        # backtest_raw 不足以提供 target
+        # backtest_raw 不足以提供至少 1 个 target
         if len(bt_values) < predict:
             skipped += 1
             continue
 
-        # context = train_raw 末尾 context_len 根
-        ctx_values = train_values[-context_len:]
-        ctx_index = train_index[-context_len:]
-        # target = backtest_raw 前 predict 根
-        tgt_values = bt_values[:predict]
-        tgt_index = bt_index[:predict]
+        # 预取 train_raw 末尾 context_len 根作为 context 池前缀（k=0 时直接用）
+        train_ctx_values = train_values[-context_len:]
+        train_ctx_index = train_index[-context_len:]
 
-        # 拼接完整序列：required_history + lookback + predict
-        full_values = np.concatenate([ctx_values, tgt_values], axis=0)
-        full_index = ctx_index.append(tgt_index)
+        n_bt = len(bt_values)
+        windows = []
+        for k in range(0, n_bt - predict + 1, stride):
+            # context 段 = (train_ctx + backtest[0:k]) 末尾 context_len 根
+            if k == 0:
+                ctx_values = train_ctx_values
+                ctx_index = train_ctx_index
+            else:
+                combined_values = np.concatenate([train_ctx_values, bt_values[:k]], axis=0)
+                combined_index = train_ctx_index.append(bt_index[:k])
+                ctx_values = combined_values[-context_len:]
+                ctx_index = combined_index[-context_len:]
 
-        # 归一化整个序列（sliding_ma 依赖前缀历史）
-        normalized, means, stds = normalizer.normalize(full_values)
+            # 拼接完整序列：context(required_history + lookback) + predict
+            tgt_values = bt_values[k:k + predict]
+            tgt_index = bt_index[k:k + predict]
+            full_values = np.concatenate([ctx_values, tgt_values], axis=0)
+            full_index = ctx_index.append(tgt_index)
 
-        samples[symbol] = {
-            'normalized': normalized.astype(np.float32),
-            'means': means.astype(np.float32),
-            'stds': stds.astype(np.float32),
-            'original': full_values.astype(np.float32),
-            'index': full_index,
-            'lookback': lookback,
-            'predict': predict,
-        }
+            # 每窗口独立归一化（sliding_ma 依赖 context 前缀历史，已含 required_history）
+            normalized, means, stds = normalizer.normalize(full_values)
 
-    print(f"Backtest samples: {len(samples)} (skipped {skipped})")
+            windows.append({
+                'normalized': normalized.astype(np.float32),
+                'means': means.astype(np.float32),
+                'stds': stds.astype(np.float32),
+                'original': full_values.astype(np.float32),
+                'index': full_index,
+                'lookback': lookback,
+                'predict': predict,
+                'target_start': k,  # 在 backtest_raw 中的 target 起点（诊断用）
+            })
+            total_windows += 1
+
+        if windows:
+            samples[symbol] = {
+                'windows': windows,
+                'lookback': lookback,
+                'predict': predict,
+                'n_windows': len(windows),
+            }
+
+    print(f"Backtest samples: {len(samples)} stocks, {total_windows} windows (stride={stride}, skipped {skipped})")
     return samples
 
 
@@ -292,17 +330,19 @@ def save_backtest_samples(
     ensure_dir(samples_path)
     with open(samples_path, 'wb') as f:
         pickle.dump(samples, f)
-    print(f"Saved {len(samples)} backtest samples to {samples_path}")
+    n_stocks = len(samples)
+    n_windows = sum(s.get('n_windows', len(s.get('windows', []))) for s in samples.values())
+    print(f"Saved {n_stocks} stocks ({n_windows} windows) backtest samples to {samples_path}")
 
-    # 统计 target 时间区间（所有样本的 target 段索引范围）
+    # 统计 target 时间区间（所有窗口的 target 段索引范围）
     target_start_dates = []
     target_end_dates = []
     for s in samples.values():
-        lb = s['lookback']
-        pd_ = s['predict']
-        idx = s['index']
-        target_start_dates.append(idx[-pd_])
-        target_end_dates.append(idx[-1])
+        for w in s.get('windows', []):
+            pd_ = w['predict']
+            idx = w['index']
+            target_start_dates.append(idx[-pd_])
+            target_end_dates.append(idx[-1])
 
     meta_path = get_meta_path(
         config.norm_mode, config.lookback, config.predict, role='backtest'
@@ -313,8 +353,10 @@ def save_backtest_samples(
         'lookback': config.lookback,
         'predict': config.predict,
         'role': 'backtest',
-        'n_samples': len(samples),
-        'context_source': 'kline_daily_raw.pkl (末尾 lookback+required_history 根)',
+        'n_stocks': n_stocks,
+        'n_windows': n_windows,
+        'n_samples': n_windows,  # 兼容旧字段（= 窗口数）
+        'context_source': 'kline_daily_raw.pkl (末尾 lookback+required_history 根) + backtest_raw 前缀',
         'target_source': os.path.basename(backtest_raw_path),
         'target_start': str(min(target_start_dates)) if target_start_dates else None,
         'target_end': str(max(target_end_dates)) if target_end_dates else None,
@@ -506,7 +548,8 @@ def preprocess(
     train_end: int = None,
     val_end: int = None,
     validate: bool = True,
-    skip_backtest: bool = False
+    skip_backtest: bool = False,
+    backtest_stride: int = 1
 ):
     """
     预处理主流程
@@ -519,6 +562,7 @@ def preprocess(
         val_end: 时间分割验证边界
         validate: 是否运行泄露检查
         skip_backtest: 是否跳过 backtest 样本生成
+        backtest_stride: backtest 滑窗步长（默认 1，自回归天然口径）
     """
     if raw_path is None:
         raw_path = get_raw_path()
@@ -573,7 +617,7 @@ def preprocess(
             print(f"\n[Backtest] Loading backtest raw: {backtest_raw_path}")
             with open(backtest_raw_path, 'rb') as f:
                 backtest_raw = pickle.load(f)
-            bt_samples = create_backtest_samples(raw_data, backtest_raw, config)
+            bt_samples = create_backtest_samples(raw_data, backtest_raw, config, stride=backtest_stride)
             bt_output_path = get_backtest_data_path(
                 config.norm_mode, config.lookback, config.predict
             )
@@ -606,6 +650,8 @@ def main():
                         help='跳过泄露检查')
     parser.add_argument('--skip-backtest', action='store_true',
                         help='跳过 backtest 样本生成')
+    parser.add_argument('--backtest-stride', type=int, default=1,
+                        help='backtest 滑窗步长（默认 1，自回归天然口径。backtest_raw 22 根 predict=10 → 每股 13 窗口）')
     parser.add_argument('--seed', type=int, default=42)
     parser.add_argument('--samples-per-block', type=int, default=100,
                         help='每块窗口数（stride=1）。block_size 自动计算：window_size + samples_per_block - 1')
@@ -643,6 +689,7 @@ def main():
     print(f"backtest_raw: {backtest_raw_path}")
     print(f"validate: {args.validate}")
     print(f"skip_backtest: {args.skip_backtest}")
+    print(f"backtest_stride: {args.backtest_stride}")
     print("=" * 60)
 
     passed = preprocess(
@@ -652,7 +699,8 @@ def main():
         train_end=args.train_end,
         val_end=args.val_end,
         validate=args.validate,
-        skip_backtest=args.skip_backtest
+        skip_backtest=args.skip_backtest,
+        backtest_stride=args.backtest_stride
     )
 
     if args.validate and not passed:

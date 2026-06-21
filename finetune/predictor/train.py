@@ -237,6 +237,10 @@ def evaluate_trajectory_ic(
     model.eval()
     tokenizer.eval()
 
+    # DDP 解包：auto_regressive_inference 内部调 model.decode_s1/decode_s2，
+    # DDP 包装对象无这些方法，需用 model.module
+    raw_model = model.module if isinstance(model, DDP) else model
+
     rng = np.random.RandomState(seed)
 
     # 抽样窗口
@@ -271,23 +275,21 @@ def evaluate_trajectory_ic(
         window_end = window_start + config.lookback + config.predict
 
         try:
-            # 获取数据
-            if 'normalized' in d:
-                # dict 格式（MA60 预归一化）
-                x_norm = d['normalized'][window_start:window_start + config.lookback].astype(np.float32)
-                means = d['means'][window_start:window_end]
-                stds = d['stds'][window_start:window_end]
-                original = d['original'][window_start:window_end]
-                timestamps = d['index'][window_start:window_end]
-            else:
-                # DataFrame 格式（runtime 归一化）
-                df = d.iloc[window_start:window_end]
-                x_raw = df.values[:config.lookback].astype(np.float32)
+            # 取数：统一走 extract_window，支持 DataFrame / dict time / dict block 三种格式
+            from finetune.predictor.core.dataset import extract_window
+            normalized, original_vals, means, stds, timestamps = extract_window(d, window_start, window_end)
+
+            if normalized is None:
+                # DataFrame 格式（full_window runtime 归一化）
+                x_raw = original_vals[:config.lookback]
                 x_mean = np.mean(x_raw, axis=0)
                 x_std = np.std(x_raw, axis=0) + 1e-5
                 x_norm = np.clip((x_raw - x_mean) / x_std, -config.clip, config.clip)
-                original = df.values
-                timestamps = df.index
+                original = original_vals
+            else:
+                # dict 格式（time / block，已预归一化）
+                x_norm = normalized[:config.lookback].astype(np.float32)
+                original = original_vals
 
             baseline = original[config.lookback - 1]
 
@@ -314,7 +316,7 @@ def evaluate_trajectory_ic(
                 y_stamp_tensor = torch.from_numpy(y_stamp).unsqueeze(0).to(device)
 
                 preds = auto_regressive_inference(
-                    tokenizer, model,
+                    tokenizer, raw_model,
                     x_tensor, x_stamp_tensor, y_stamp_tensor,
                     max_context={'mini': 2048, 'small': 512, 'base': 512}.get(model_type, 2048),  # 按 model_type
                     pred_len=config.predict,
@@ -327,11 +329,13 @@ def evaluate_trajectory_ic(
 
                 pred_norm = preds[0, config.lookback:config.lookback + config.predict, :]
 
-                # 反归一化
-                if 'normalized' in d:
-                    pred_raw = pred_norm.cpu().numpy() * stds[config.lookback:] + means[config.lookback:]
+                # 反归一化：preds 已是 numpy（auto_regressive_inference 返回 np.ndarray）
+                # dict 格式用预计算的 means/stds（block 模式已是窗口内相对切片），
+                # DataFrame 格式用 runtime 的 x_std/x_mean
+                if normalized is not None:
+                    pred_raw = pred_norm * stds[config.lookback:] + means[config.lookback:]
                 else:
-                    pred_raw = pred_norm.cpu().numpy() * x_std + x_mean
+                    pred_raw = pred_norm * x_std + x_mean
 
                 actual = original[config.lookback:config.lookback + config.predict]
 
@@ -355,11 +359,12 @@ def evaluate_trajectory_ic(
                 for fi, fn in enumerate(FEATURE_NAMES):
                     pred_dir = (pred_raw[step_idx, fi] - baseline[fi]) > 0
                     actual_dir = (actual[step_idx, fi] - baseline[fi]) > 0
-                    local_da[step_idx][fn].append(pred_dir == actual_dir)
+                    # 存 float（非 bool）：聚合时 np.percentile 对 bool 做插值会崩溃
+                    local_da[step_idx][fn].append(float(pred_dir == actual_dir))
 
                     # 收集 close 的 actual_dir（用于 naive DA）
                     if fn == 'close':
-                        local_actual_dir[step_idx].append(actual_dir)
+                        local_actual_dir[step_idx].append(float(actual_dir))
 
             # §10 新增：可懂指标收集
             baseline_close = baseline[3]  # close 特征
@@ -377,6 +382,10 @@ def evaluate_trajectory_ic(
             local_actual_limit.append(actual_limit.any())
 
         except Exception as e:
+            # 评估循环不应静默吞异常（曾因 block 格式未支持，全部样本异常被吞 → IC/DA 全 0）
+            # 打印首个异常供诊断，仍 continue 不中断整个评估
+            if rank == 0:
+                print(f"[WARN eval] {symbol}@{window_start}: {type(e).__name__}: {e}", flush=True)
             continue
 
     # 聚合（保留分布）
@@ -483,65 +492,92 @@ def compute_val_loss(
     config: DataConfig,
     device: torch.device,
     batch_size: int = 16,
-    max_batches: int = 100,
+    world_size: int = 1,
+    rank: int = 0,
+    use_ddp: bool = False,
 ) -> float:
     """
-    计算 validation 集上的损失
+    计算 validation 子集上的损失（与 train 同口径 token CE）
 
     F2 口径修复：使用 head.compute_loss 算 token CE，与 train 同口径。
     之前用 MSE 重建，量级差 2-3 个数量级，不可用于 early stopping。
+
+    val_indices 已是本 epoch 抽定的同源子集（与 IC 同源），此处全量遍历、不再二次抽样。
+    DDP：各 rank 按 idx%world_size 分片处理（与 IC 评估一致），val_loss all_reduce 聚合
+    保证各 rank 拿到同一值 → early-stop 决定一致（防死锁）。
 
     Args:
         model: Kronos 模型
         tokenizer: KronosTokenizer
         val_data: 验证数据 dict
-        val_indices: 验证索引列表
+        val_indices: 验证索引列表（已是 epoch 同源子集）
         config: 数据配置
         device: 设备
         batch_size: 批大小
-        max_batches: 最大批数（限制计算时间）
+        world_size: DDP 进程数
+        rank: DDP rank
+        use_ddp: 是否 DDP
 
     Returns:
-        avg_val_loss: 平均 token CE 损失（与 train 同口径）
+        avg_val_loss: 平均 token CE 损失（与 train 同口径，DDP 下跨 rank 聚合）
     """
     model.eval()
 
-    # 创建临时 val dataset 和 loader
+    # DDP 解包：val 前向用裸 model，不走 DDP forward。
+    # DDP forward 会注册反向同步 hook 且假设各 rank 调用次数一致，
+    # 但本函数各 rank 按 batch_idx%world_size 分片处理（调用次数不同）→ DDP ALLREDUCE 错位死锁。
+    # eval 在 no_grad 下不需梯度同步，聚合靠下方手写 all_reduce。
+    raw_model = model.module if isinstance(model, DDP) else model
+
+    # 创建临时 val dataset 和 loader（顺序遍历整个同源子集，不抽样）
     val_dataset = KronosDataset(val_data, val_indices, config, mode='val')
     val_loader = DataLoader(
         val_dataset,
         batch_size=batch_size,
-        sampler=RandomSampler(val_dataset, replacement=False, num_samples=min(len(val_dataset), max_batches * batch_size)),
+        shuffle=False,
         collate_fn=collate_fn,
         num_workers=0,
         pin_memory=False,
         drop_last=False,
     )
 
-    val_losses = []
+    val_loss_sum = 0.0
+    val_count = 0
 
     with torch.no_grad():
-        for x_norm, x_stamp, y_stamp, meta in val_loader:
+        for batch_idx, (x_norm, x_stamp, y_stamp, meta) in enumerate(val_loader):
+            # DDP 分片：与 IC 评估一致，各 rank 按 idx%world_size 处理
+            if use_ddp and (batch_idx % world_size != rank):
+                continue
+
             x_norm = x_norm.to(device)
             x_stamp = x_stamp.to(device)
 
             # Tokenize
             token_seq_0, token_seq_1 = tokenizer.encode(x_norm, half=True)
 
-            # Forward（与 train 同口径）
-            s1_logits, s2_logits = model(token_seq_0, token_seq_1, x_stamp)
+            # Forward（与 train 同口径）—— 用裸 model，不走 DDP forward（防分片不均死锁）
+            s1_logits, s2_logits = raw_model(token_seq_0, token_seq_1, x_stamp)
 
             # CE loss（与 train 同口径，用 head.compute_loss）
-            # DDP 解包：DDP 模式下 model 是 DDP 包装，需 model.module.head
-            head = model.module.head if isinstance(model, DDP) else model.head
+            head = raw_model.head
             token_out = [token_seq_0[:, 1:], token_seq_1[:, 1:]]
             ce_loss, _, _ = head.compute_loss(
                 s1_logits[:, :-1, :], s2_logits[:, :-1, :], token_out[0], token_out[1]
             )
-            val_losses.append(ce_loss.item())
+            n = x_norm.size(0)
+            val_loss_sum += ce_loss.item() * n
+            val_count += n
+
+    # DDP：跨 rank 聚合 val_loss（与 tokenizer 一致），保证 early-stop 各 rank 一致
+    if use_ddp:
+        sum_tensor = torch.tensor([val_loss_sum, val_count], device=device, dtype=torch.float64)
+        dist.all_reduce(sum_tensor, op=dist.ReduceOp.SUM)
+        val_loss_sum = sum_tensor[0].item()
+        val_count = sum_tensor[1].item()
 
     model.train()
-    return sum(val_losses) / len(val_losses) if val_losses else 0.0
+    return val_loss_sum / val_count if val_count > 0 else 0.0
 
 
 # ============================================================================
@@ -562,8 +598,7 @@ def train(
     world_size: int = 1,
     use_ddp: bool = False,
     resume_checkpoint: str = None,
-    max_val_batches: int = 100,
-    max_ic_samples: int = -1,
+    val_samples: int = -1,
 ):
     """
     主训练循环
@@ -572,6 +607,8 @@ def train(
     - IC 用去趋势口径（E1 解决）
     - checkpoint 选择用正确口径
     - early stopping patience 需审视（§1.6.7）
+    - val_loss 与 IC 同源采样（每 epoch 抽定一份 val 子集共用），防过拟评估
+    - 训练无放回子集采样（防过拟，由 train_loader 的 sampler 控制）
 
     I9 修复：支持 --resume 断点续训
     """
@@ -680,6 +717,7 @@ def train(
             print(f"\n=== Epoch {epoch_idx + 1}/{train_config.epochs} ===")
             print(f"LR: {current_lr:.6f}")
 
+        total_batches = len(train_loader)
         for batch_idx, (x_norm, x_stamp, y_stamp, meta) in enumerate(train_loader):
             x_norm = x_norm.to(device, non_blocking=True)
             x_stamp = x_stamp.to(device, non_blocking=True)
@@ -710,30 +748,56 @@ def train(
 
             if is_main and (batch_idx % 50 == 0 or batch_idx == 0):
                 avg_loss = sum(epoch_losses[-50:]) / min(len(epoch_losses[-50:]), 50)
-                print(f"  Batch {batch_idx + 1} - Loss: {recon_loss.item():.4f}, Avg: {avg_loss:.4f}", flush=True)
+                progress = (batch_idx + 1) / total_batches * 100
+                elapsed = time.time() - epoch_start
+                print(f"  Batch {batch_idx + 1}/{total_batches} ({progress:.1f}%) - Loss: {recon_loss.item():.4f}, Avg: {avg_loss:.4f} [{elapsed:.0f}s]", flush=True)
 
         avg_train_loss = sum(epoch_losses) / len(epoch_losses)
         current_lr = optimizer.param_groups[0]['lr']
 
-        # Validation loss（在 val 集上前向计算，不反传）
+        # 同源采样：本 epoch 抽定一份 val 子集，val_loss 与 IC 共用（修两处独立采样的 bug）
+        # 每 epoch 随机重抽（评估更全面，early-stop 靠 patience 容噪）
+        # rank0 抽样 → broadcast 给所有 rank，保证各 rank 评估同一子集（IC 分片聚合正确）
+        D_val = len(val_indices)
+        n_eval = val_samples if val_samples > 0 else D_val
+        n_eval = min(n_eval, D_val)
+        rng_eval = np.random.RandomState(config.seed + epoch_idx)
+        sampled_pos = rng_eval.choice(D_val, size=n_eval, replace=False)
+        if use_ddp:
+            # broadcast 采样位置（int64 数组）给所有 rank
+            pos_tensor = torch.from_numpy(sampled_pos.astype(np.int64)).to(device)
+            gathered = [torch.zeros_like(pos_tensor) for _ in range(world_size)]
+            dist.all_gather(gathered, pos_tensor)
+            sampled_pos = gathered[0].cpu().numpy()
+        epoch_val_indices = [val_indices[i] for i in sampled_pos]
+
+        # Validation loss（在 val 子集上前向计算，不反传，与 IC 同源子集）
         avg_val_loss = compute_val_loss(
-            model, tokenizer, val_data, val_indices, config, device,
+            model, tokenizer, val_data, epoch_val_indices, config, device,
             batch_size=train_config.batch_size,
-            max_batches=max_val_batches,
+            world_size=world_size, rank=rank, use_ddp=use_ddp,
         )
 
         history['train_loss'].append(avg_train_loss)
         history['val_loss'].append(avg_val_loss)
         history['lr'].append(current_lr)
 
-        # Trajectory IC 评估（§10 更新：返回可懂指标）
+        # Trajectory IC 评估（§10 更新：返回可懂指标）—— 与 val_loss 同源（同一 epoch_val_indices）
         ic_result, da_result, naive_da_by_step, amplitude_result, limit_result = evaluate_trajectory_ic(
-            model, tokenizer, val_data, val_indices, config,
+            model, tokenizer, val_data, epoch_val_indices, config,
             device, world_size, rank,
-            n_samples=max_ic_samples,  # 支持限制样本数
-            seed=config.seed + epoch_idx * 9999,
+            n_samples=n_eval,  # 已是子集，全量评估这份子集
+            seed=config.seed + epoch_idx,
             model_type=train_config.model_type
         )
+
+        # 关键同步：eval 集体通信全部完成后，所有 rank 在此 barrier 对齐，
+        # 然后才让 rank0 进重活（save_pretrained/torch.save/写 JSON/epoch 输出）。
+        # 否则 non-zero rank 跳过整段 is_main 块、直奔下一 epoch 的 DDP train forward，
+        # 在 backward allreduce 等 rank0 → others 领先一整个 epoch → NCCL 600s 超时死锁。
+        # barrier 把 rank0 与 others 的偏差控制在单 epoch 内，不跨 epoch 累积。
+        if use_ddp:
+            dist.barrier()
 
         if is_main:
             current_ic = ic_result.get('close', {}).get('mean', 0)
@@ -759,14 +823,51 @@ def train(
             history['excess_da'].append(excess_da_avg)
             history['combined'].append(current_combined)
 
-            # §10 更新：epoch 打印并列显示 current | best @ep
+            # 6 维指标：IC / DA 按 6 feature 展开（close 为主指标带 *），best 仍只追 close + Combined
+            # n = 有效样本数：IC 因 safe_trajectory_ic 对近平坦序列返回 None 会丢样本，
+            #   n<总数 说明部分样本被丢；n=0 说明全丢 → mean 兜底 0（即 IC=0 的常见根因）
             epoch_time = time.time() - epoch_start
             print(f"\n  Epoch {epoch_idx + 1}/{train_config.epochs}  LR: {current_lr:.6f}")
-            print(f"    IC:        current {current_ic:.4f}  | best {best_ic:.4f} @ep{best_ic_epoch}")
-            print(f"    DA_score:  current {da_score:.4f}  | best {best_da_score:.4f} @ep{best_da_score_epoch}")
-            print(f"    Excess DA: current {excess_da_avg:+.1%}  | best {best_excess_da:+.1%} @ep{best_excess_da_epoch}")
-            print(f"    Combined:  current {current_combined:.4f}  | best {best_combined:.4f} @ep{best_combined_epoch}")
-            print(f"    Val_loss:  current {avg_val_loss:.4f}  | best {best_val_loss:.4f} @ep{best_val_loss_epoch}")
+
+            # 每 feature 的 IC mean 与 n
+            feat_ic_mean = {f: ic_result.get(f, {}).get('mean', 0.0) for f in FEATURE_NAMES}
+            feat_ic_n = {f: ic_result.get(f, {}).get('n', 0) for f in FEATURE_NAMES}
+            # 每 feature 的 DA（步间简单平均，用于展示；headline DA_score 仍为加权版）
+            feat_da_mean = {
+                f: float(np.mean([da_result.get(f'step{s+1}', {}).get(f, {}).get('mean', 0.0)
+                                  for s in range(config.predict)]))
+                for f in FEATURE_NAMES
+            }
+            # DA 每步每 feature 都 append，n 各 feature 一致；取 step1 close 的 n 代表已处理样本数
+            feat_da_n = da_result.get('step1', {}).get('close', {}).get('n', 0)
+
+            ic_vals = "  ".join(f"{f}{'*' if f=='close' else ''}{feat_ic_mean[f]:+.3f}" for f in FEATURE_NAMES)
+            ic_ns = "[" + ", ".join(str(feat_ic_n[f]) for f in FEATURE_NAMES) + "]"  # 顺序同上: open,high,low,close,vol,amt
+            da_vals = "  ".join(f"{f}{'*' if f=='close' else ''} {feat_da_mean[f]:.3f}" for f in FEATURE_NAMES)
+
+            # 哨兵显示：best_* 仍为初始哨兵值（best_ic=-999 / best_val_loss=inf / 其余 0.0@ep0）说明从未更新过，
+            # 显示 "—" 而非裸露哨兵。resume 时 best 从 resume_meta 读入真实值，不触发此分支。
+            def _fmt_best(val, epoch, is_sentinel):
+                return "—" if is_sentinel else f"{val:.4f} @ep{epoch}"
+            def _fmt_best_pct(val, epoch, is_sentinel):
+                return "—" if is_sentinel else f"{val:+.1%} @ep{epoch}"
+            ic_best_str = _fmt_best(best_ic, best_ic_epoch, best_ic == -999)
+            da_best_str = _fmt_best(best_da_score, best_da_score_epoch,
+                                    best_da_score == 0.0 and best_da_score_epoch == 0)
+            exc_best_str = _fmt_best_pct(best_excess_da, best_excess_da_epoch,
+                                         best_excess_da == 0.0 and best_excess_da_epoch == 0)
+            comb_best_str = _fmt_best(best_combined, best_combined_epoch,
+                                      best_combined == 0.0 and best_combined_epoch == 0)
+            vl_best_str = _fmt_best(best_val_loss, best_val_loss_epoch,
+                                    best_val_loss == float('inf'))
+
+            print(f"    IC:    {ic_vals}")
+            print(f"           n: {ic_ns}   | best close {ic_best_str}")
+            print(f"    DA:    {da_vals}  (n={feat_da_n})")
+            print(f"           best close {da_best_str}")
+            print(f"    ExcDA: close* {excess_da_avg:+.1%}  | best {exc_best_str}  [close-only]")
+            print(f"    Combined:  current {current_combined:.4f}  | best {comb_best_str}")
+            print(f"    Val_loss:  current {avg_val_loss:.4f}  | best {vl_best_str}")
             print(f"    Train: {avg_train_loss:.4f}, Time: {format_time(epoch_time)}")
 
             # IC 滑动均值（用于 early stopping）
@@ -899,19 +1000,24 @@ def train(
                 }
                 update_training_info(info_path, epoch_idx + 1, metrics_dict, best_updates)
 
-            # Early stopping（§1.6.7: patience=12 需审视）
-            # DDP 同步：rank 0 算 stop 决定，broadcast 给所有 rank，一起 break。
-            # 否则只 rank 0 退出循环，其他 rank 在下一 epoch 的 all_gather 永久阻塞 → NCCL 超时。
-            stop_flag = torch.zeros(1, dtype=torch.float32, device=device)
-            if is_main:
-                if epoch_idx >= train_config.early_stopping_grace_period:
-                    if patience_counter >= train_config.early_stopping_patience:
-                        print(f"\n[EARLY STOP] No improvement for {patience_counter} epochs")
-                        stop_flag[0] = 1.0
-            if use_ddp:
-                dist.broadcast(stop_flag, src=0)
-            if stop_flag[0] > 0:
-                break
+        # Early stopping（§1.6.7: patience=12 需审视）
+        # DDP 同步：rank 0 算 stop 决定，broadcast 给所有 rank，一起 break。
+        # 关键：此段必须在 is_main 块【外】，所有 rank 都执行 barrier/broadcast/break。
+        # 之前的 bug：整段被缩进进 is_main 块，只有 r0 执行 → others 永不 break、
+        # 永不参与 broadcast → r0 卡死、others 超前进下一 epoch → NCCL 死锁。
+        # 此 barrier 让 others 等 rank0 做完 is_main 块（save/输出），再一起进 broadcast。
+        if use_ddp:
+            dist.barrier()
+        stop_flag = torch.zeros(1, dtype=torch.float32, device=device)
+        if is_main:
+            if epoch_idx >= train_config.early_stopping_grace_period:
+                if patience_counter >= train_config.early_stopping_patience:
+                    print(f"\n[EARLY STOP] No improvement for {patience_counter} epochs")
+                    stop_flag[0] = 1.0
+        if use_ddp:
+            dist.broadcast(stop_flag, src=0)
+        if stop_flag[0] > 0:
+            break
 
             # Final save
     if is_main:
@@ -947,6 +1053,13 @@ def train(
         print(f"Saved to: {save_dir}")
         print(f"{'=' * 60}")
 
+    # 训练结束同步：rank0 在上面 if is_main 块做 final save（save_pretrained + 写 JSON），
+    # others 跳过直奔 return → cleanup_ddp → destroy_process_group。
+    # 若 rank0 save 慢，others 先 destroy_process_group → 各 rank destroy 不对齐 → 进程挂。
+    # 此 barrier 让 rank0 做完 save 后、return 前等齐所有 rank，再一起进 cleanup。
+    if use_ddp:
+        dist.barrier()
+
     return {
         'best_val_loss': best_val_loss,
         'best_ic': best_ic,
@@ -974,17 +1087,25 @@ def main():
     parser.add_argument('--lr', type=float, default=0.01)
     parser.add_argument('--weight-decay', type=float, default=0.01)
     parser.add_argument('--seed', type=int, default=42)
-    parser.add_argument('--use-block', action='store_true',
-                        help='Use block_lb400_pd10 data (legacy compat)')
     parser.add_argument('--output-folder', type=str, default=None)
     parser.add_argument('--resume', type=str, default=None,
                         help='Resume from checkpoint path (e.g. outputs/models/.../checkpoints/latest_model)')
-    parser.add_argument('--max-train-batches', type=int, default=None,
-                        help='Max batches per epoch for minimal testing (default: full dataset)')
-    parser.add_argument('--max-val-batches', type=int, default=100,
-                        help='Max batches for val loss computation (default: 100)')
-    parser.add_argument('--max-ic-samples', type=int, default=-1,
-                        help='Max samples for IC evaluation (-1 for full)')
+    # 采样参数（防过拟 + 快速验证）
+    # train: --train-sample-ratio 控每 epoch 训练子集占比（防过拟，默认 0.5）；
+    #        --train-samples 传绝对数覆盖 ratio（-1=用 ratio）。
+    # val/IC: --n-sample-ratio 控验证子集占比（默认 0.5）；--n-samples 传绝对数覆盖。
+    # val_loss 与 IC 同源（epoch 内抽定一份共用），子集大小统一由 --n-sample-ratio/--n-samples 控制。
+    # ratio<1 会让 len(train_loader) 缩小 → CosineAnnealingLR total_steps 同比缩小 →
+    # cosine 提前退火。调 ratio 后需配套调 --epochs（如 ratio=0.5 时 epochs×2 才等价全量步数）。
+    parser.add_argument('--train-sample-ratio', type=float, default=0.5,
+                        help='每 epoch 训练子集占总量比例（防过拟，默认 0.5）。无放回采样，多 epoch 轮换不同子集。'
+                             'ratio<1 会同比缩短 cosine 退火周期，需配套调 --epochs')
+    parser.add_argument('--train-samples', type=int, default=-1,
+                        help='每 epoch 训练样本绝对数（-1=用 ratio，>0 覆盖 ratio）。快速验证/调试用')
+    parser.add_argument('--n-sample-ratio', type=float, default=0.5,
+                        help='验证(val_loss+IC)子集占 val 总量比例（默认 0.5）。每 epoch 随机重抽，val_loss 与 IC 同源')
+    parser.add_argument('--n-samples', type=int, default=-1,
+                        help='验证样本绝对数（-1=用 ratio，>0 覆盖 ratio）。快速验证用')
     args = parser.parse_args()
 
     # DDP setup
@@ -1058,7 +1179,10 @@ def main():
     model = Kronos.from_pretrained(model_path)
     model.to(device)
     if use_ddp:
-        model = DDP(model, device_ids=[local_rank])
+        # broadcast_buffers=False：Kronos 的 buffer（inv_freq/basis/group_basis/group_codebook）
+        # 都是确定性常量，预训练权重 + 相同 init → 各卡已一致，无需每 forward 广播。
+        # 关闭后消除 DDP 每 forward 的 BROADCAST，避免 buffer 广播时机错位导致的死锁。
+        model = DDP(model, device_ids=[local_rank], broadcast_buffers=False)
     if is_main:
         print(f"Model: {model_path}, Size: {get_model_size(model):.2f}M")
 
@@ -1114,15 +1238,30 @@ def main():
     train_dataset = KronosDataset(train_data, train_indices, config, mode='train')
     val_dataset = KronosDataset(val_data, val_indices, config, mode='val')
 
-    # 采样数（支持 minimal testing）
-    train_samples = len(train_dataset)
-    if args.max_train_batches:
-        train_samples = min(train_samples, args.max_train_batches * train_config.batch_size)
+    # 训练采样数：--train-samples(绝对值) 优先，否则用 --train-sample-ratio(比例)
+    # replacement=False：无放回，每 epoch 抽真子集，多 epoch 轮换不同样本 → 防过拟
+    D_train = len(train_dataset)
+    if args.train_samples > 0:
+        train_samples = min(args.train_samples, D_train)
+    else:
+        train_samples = max(1, int(D_train * args.train_sample_ratio))
+
+    # 验证采样数：--n-samples(绝对值) 优先，否则用 --n-sample-ratio(比例)
+    # val_loss 与 IC 同源（epoch 内抽定一份共用），每 epoch 随机重抽
+    D_val = len(val_indices)
+    if args.n_samples > 0:
+        val_samples = min(args.n_samples, D_val)
+    else:
+        val_samples = max(1, int(D_val * args.n_sample_ratio))
+
+    if is_main:
+        print(f"Train: {D_train} windows, sampling {train_samples}/epoch (ratio={args.train_sample_ratio if args.train_samples <= 0 else 'n/a'})")
+        print(f"Val: {D_val} windows, sampling {val_samples}/epoch for val_loss+IC (ratio={args.n_sample_ratio if args.n_samples <= 0 else 'n/a'})")
 
     train_loader = DataLoader(
         train_dataset,
         batch_size=train_config.batch_size,
-        sampler=RandomSampler(train_dataset, replacement=True, num_samples=train_samples),
+        sampler=RandomSampler(train_dataset, replacement=False, num_samples=train_samples),
         collate_fn=collate_fn,
         num_workers=0,
         pin_memory=True,
@@ -1145,8 +1284,7 @@ def main():
         config, train_config, save_dir, device,
         rank, world_size, use_ddp,
         resume_checkpoint=args.resume,
-        max_val_batches=args.max_val_batches,
-        max_ic_samples=args.max_ic_samples,
+        val_samples=val_samples,
     )
 
     cleanup_ddp()

@@ -334,6 +334,8 @@ python finetune/predictor/train.py \
     --batch-size 16
 ```
 
+> **默认即防过拟采样**：未显式传采样参数时，训练默认 `--train-sample-ratio 0.5`、验证默认 `--n-sample-ratio 0.5`（每 epoch 无放回抽 50% 子集）。冒烟测试用 `--train-samples 64 --n-samples 64 --epochs 1`。详见 §3.3。
+
 ### 3.2 多卡训练（DDP）
 
 ```bash
@@ -364,34 +366,43 @@ torchrun --nproc_per_node=$(nvidia-smi -L | wc -l) finetune/predictor/train.py \
 | `--seed` | 42 | 随机种子（DDP 各 rank 实际用 seed+rank） |
 | `--resume` | None | 断点续训，传 checkpoint 路径（加载 latest + optimizer/scheduler/best 状态） |
 | `--output-folder` | None | 自定义输出目录名（默认按 norm_mode/lb/pd/split/model 自动生成） |
-| `--use-block` | False | 兼容旧 block_lb400_pd10 数据（legacy） |
-| `--max-train-batches` | None | 每 epoch 最大批数（调试用，默认全量） |
-| `--max-val-batches` | 100 | val loss 计算最大批数 |
-| `--max-ic-samples` | -1 | IC 评估样本数（-1 全量） |
+| `--train-sample-ratio` | 0.5 | 每 epoch 训练子集占总量比例（**防过拟**，无放回采样，多 epoch 轮换不同子集） |
+| `--train-samples` | -1 | 每 epoch 训练样本绝对数（-1=用 ratio，>0 覆盖 ratio）。快速验证/调试用 |
+| `--n-sample-ratio` | 0.5 | 验证子集占总量比例（val_loss 与 IC 同源共用此子集） |
+| `--n-samples` | -1 | 验证样本绝对数（-1=用 ratio，>0 覆盖 ratio） |
 
+> **采样防过拟**：模型越大、微调样本越有限，易过拟。每 epoch 无放回随机抽子集训练，子集间轮换不同样本，等价于在全量上做随机子采样训练，缓解过拟。`ratio<1` 会让 `len(train_loader)` 缩小 → `CosineAnnealingLR` 的 `total_steps`（=`epochs×len(train_loader)`）同比缩小 → cosine 提前退火；调 ratio 后需配套调 `--epochs`（如 ratio=0.5 时 `epochs×2` 才等价全量步数）。
+>
+> **同源验证**：每 epoch 抽定一份 val 子集，`val_loss` 与 `IC/DA` 共用同一份，保证指标可比；`--train-samples`/`--n-samples` 传绝对数可快速走完流程（如 `--train-samples 64 --n-samples 64 --epochs 1` 用于冒烟测试）。
+>
 > **注**：`early_stopping_patience`(12)、`early_stopping_grace_period`(8)、`warmup_epochs`(2)、`lr_min`(1e-5)、`ic_patience_reset`(True)、`combined_ic_weight`(0.6)/`combined_da_weight`(0.4) 在 `TrainConfig` 中定义，**未通过 CLI 暴露**，需改代码调整。详见 `core/config.py`。
 
 ### 3.4 输出监控
 
-训练过程每个 epoch 输出（各关键指标并列显示 current | best @ep，best 产生时额外算可懂指标）：
+训练过程每个 epoch 输出（IC/DA 按 6 feature 展开，close 为主指标带 `*`；best 仍只追 close + Combined）：
 ```
   Epoch 12/50  LR: 0.003000
-    IC:        current 0.1823  | best 0.2105 @ep8
-    DA_score:  current 0.5410  | best 0.5520 @ep10
-    Excess DA: current +4.1%   | best +6.2% @ep10
+    IC:    open+0.180  high+0.195  low+0.172  close*+0.210  vol+0.063  amt+0.071
+           n: [1500, 1500, 1500, 1500, 1500, 1500]   | best close 0.2105 @ep8
+    DA:    open 0.540  high 0.535  low 0.548  close* 0.552  vol 0.588  amt 0.595  (n=1500)
+           best close 0.5520 @ep10
+    ExcDA: close* +4.1%  | best +6.2% @ep10  [close-only]
     Combined:  current 0.4521  | best 0.4780 @ep8
-    Val_loss:  current 2.31    | best 2.28 @ep7
+    Val_loss:  current 2.31  | best 2.28 @ep7
     Train: 2.35, Time: 03:12
 ```
+
+- **n 列**：每 feature 有效 IC 样本数（顺序 open/high/low/close/vol/amt）。`safe_trajectory_ic` 对近平坦（std<1e-8）或含 NaN 的轨迹返回 None 被丢弃，`n<抽样总数` 说明部分样本被丢；**`n=0` 则该 feature 的 IC 兜底为 0**（即 IC=0 的常见根因——模型产出退化导致全丢）。DA 的 `(n=...)` 是已处理样本数（DA 每 sample 必计入，各 feature 一致）。
+- **哨兵显示**：ep1 best 尚未更新时显示 `—`（初始哨兵 `best_ic=-999`/`best_val_loss=inf`/其余 `0.0@ep0` 不裸露）；resume 续训时 best 从 `resume_meta.json` 读入真实值，正常显示。
 
 产生 best（val_loss/ic/combined 任一刷新）时，额外计算并记录可懂指标三件套（振幅误差率、涨跌停命中率）到 `training_info.json` 的该 epoch 记录与 `best` 块；平凡 epoch 不算（省时）。
 
 **关键指标**：
-- **IC**: trajectory IC（去趋势序列上的相关系数，close 主指标）
-- **DA_score**: 综合 DA 评分（对数步权重 × 特征权重加权）
-- **Excess DA**: DA − naive DA（naive=多数方向比例），正值表示模型优于朴素预测
-- **Combined**: IC 和 DA 的综合评分（权重 0.6/0.4）
-- **Val_loss**: val 集重建损失（真实前向计算，非 train loss）
+- **IC**: trajectory IC（去趋势序列上的相关系数，按 6 feature 分别计算；close 为主指标，best 追踪 close）
+- **DA**: 方向准确率（按 6 feature × pred 步展开；headline `DA_score` 为加权综合评分，对数步权重 × 特征权重加权，best 追踪 close）
+- **Excess DA**: DA − naive DA（naive=多数方向比例），正值表示模型优于朴素预测（当前 close-only；per-feature 待补）
+- **Combined**: close IC 和 DA_score 的综合评分（权重 0.6/0.4）
+- **Val_loss**: val 子集重建损失（真实前向计算，非 train loss；与 IC/DA 同源子集）
 
 ### 3.5 Checkpoint 选择
 
@@ -416,7 +427,7 @@ python finetune/predictor/eval.py \
     --split-mode block \
     --model mini \
     --checkpoint best_combined_model \
-    --n-samples -1   # 全量评估
+    --n-sample-ratio 1.0   # 全量评估（默认 0.5 抽样子集）
 
 # 多卡 DDP（卡数自动探测，单卡即 nproc_per_node=1）
 torchrun --nproc_per_node=$(nvidia-smi -L | wc -l) finetune/predictor/eval.py \
@@ -425,7 +436,9 @@ torchrun --nproc_per_node=$(nvidia-smi -L | wc -l) finetune/predictor/eval.py \
     --checkpoint best_combined_model
 ```
 
-**评估支持 DDP**：各 rank 按 `idx % world_size` 分片处理样本，IC/DA 用 `aggregate_ic`/`aggregate_da` 聚合（all_gather）。`--n-samples` 抽样时所有 rank 同 seed 抽同样本再分片，保证覆盖正确。
+**评估支持 DDP**：各 rank 按 `idx % world_size` 分片处理样本，IC/DA 用 `aggregate_ic`/`aggregate_da` 聚合（all_gather）。`--n-samples`/`--n-sample-ratio` 抽样时所有 rank 同 seed 抽同样本再分片，保证覆盖正确。
+
+> **抽样口径**：默认 `--n-sample-ratio 0.5`（抽 50% 测试集），与训练验证同口径、加快评估；`--n-samples N` 传绝对数优先；全量评估用 `--n-sample-ratio 1.0`。
 
 ### 4.1.1 评估参数
 
@@ -441,10 +454,10 @@ torchrun --nproc_per_node=$(nvidia-smi -L | wc -l) finetune/predictor/eval.py \
 | `--tokenizer-path` | None | **自定义 tokenizer 路径（优先级最高）** |
 | `--checkpoint-path` | None | **自定义 checkpoint 目录路径（优先级最高）** |
 | `--test-path` | None | **自定义测试数据路径（优先级最高）** |
-| `--n-samples` | -1 | 评估样本数（-1 全量） |
+| `--n-samples` | -1 | 评估样本绝对数（-1=用 ratio，>0 覆盖 ratio） |
+| `--n-sample-ratio` | 0.5 | 评估子集占总量比例（与训练验证同口径，-1 时用 ratio） |
 | `--seed` | 42 | 随机种子（抽样用） |
 | `--limit-pct` | 0.10 | 涨跌停阈值（主板 10%，创业板 20%） |
-| `--use-block` | False | 兼容旧 block_lb400_pd10 数据（legacy） |
 
 **使用自定义路径**：
 ```bash
@@ -453,7 +466,7 @@ python finetune/predictor/eval.py \
     --tokenizer-path outputs/tokenizers/sliding_ma60/mini \
     --checkpoint-path outputs/models/sliding_ma60/lb400_pd10/block/mini/checkpoints/best_combined_model \
     --test-path finetune/data/processed/sliding_ma60/lb400_pd10/block/test.pkl \
-    --n-samples -1
+    --n-sample-ratio 1.0   # 全量评估
 ```
 
 ### 4.2 评估输出示例
@@ -735,7 +748,14 @@ python finetune/predictor/preprocess.py \
 ---
 
 *文档更新：2026-06-21*
-*对应提交：P1-P5 fixes (5f4cb7a) + M4 fix + 指南对齐*
+*对应提交：采样防过拟改造 + 6 维 epoch 输出 + 哨兵显示清理*
+
+**2026-06-21 二次对齐（采样防过拟 + 6 维输出）**：
+- §3.3 训练参数：删除 `--use-block`/`--max-train-batches`/`--max-val-batches`/`--max-ic-samples`；新增 `--train-sample-ratio`(0.5)/`--train-samples`(-1)/`--n-sample-ratio`(0.5)/`--n-samples`(-1)，补防过拟机制说明 + cosine `total_steps` 随 ratio 缩短的 caveat
+- §3.4 输出监控：示例改为 6 feature 展开格式（IC/DA 按 open/high/low/close/vol/amt 列出，close 带 `*`），补 `n` 列含义（`n=0` 即 IC 兜底 0 的根因）+ 哨兵显示说明（ep1 best 未更新显示 `—`）
+- §4.1 评估命令：`--n-samples -1`(全量) 改为 `--n-sample-ratio 1.0`（-1 语义已变为"用 ratio"）
+- §4.1.1 评估参数：新增 `--n-sample-ratio`(0.5)，删除 `--use-block`；`--n-samples` 语义改为"-1=用 ratio，>0 覆盖 ratio"
+- §3.1 单卡训练：补默认防过拟采样提示
 
 **2026-06-21 对齐（自定义路径支持）**：
 - §2.4.1 验证参数：新增 `--tokenizer-path`/`--data-path`（优先级最高）

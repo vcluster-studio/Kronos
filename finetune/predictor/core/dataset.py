@@ -25,6 +25,68 @@ from .schema import SampleSchema, dict_to_sample
 from .utils import extract_time_features
 
 
+def extract_window(d: Any, start: int, end: int) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, Any]:
+    """
+    从单个 symbol 的数据中提取 [start, end) 窗口的归一化段（统一入口）。
+
+    支持三种存储格式：
+    - DataFrame：runtime 归一化（full_window），返回原始值，归一化由调用方做
+    - dict time 模式：整条归一化，d['normalized'] 等顶层键
+    - dict block 模式：per-block 归一化，需按 window_start 定位所属 block 再取 block 内相对段
+
+    train.py 的 evaluate_trajectory_ic 与 eval.py 的 evaluate 共用此函数取数，
+    避免重复实现 block 解析导致的不一致（曾因 evaluate 路径漏处理 block 格式，
+    'normalized' not in d 误入 DataFrame 分支 → iloc 崩溃）。
+
+    Args:
+        d: 单个 symbol 的数据（DataFrame 或 dict）
+        start: 窗口起点（全局位置）
+        end: 窗口终点（全局位置，exclusive）
+
+    Returns:
+        (normalized, original, means, stds, timestamps)
+        - DataFrame 格式：normalized=None（调用方自行归一化），其余为原始值切片
+        - dict 格式：均为预归一化切片
+    """
+    if hasattr(d, 'iloc'):
+        # DataFrame 格式（full_window runtime 归一化）
+        window_df = d.iloc[start:end]
+        return None, window_df.values.astype(np.float32), None, None, window_df.index
+
+    # dict 格式
+    mode = d.get('mode', 'time')  # 旧数据无 mode 字段，按 time 兼容
+    if mode == 'block':
+        # 找包含 start 的 block（window_start 在 [b_start, b_start+len(original)) 内）
+        block = None
+        b_start = None
+        for bs, blk in d['blocks'].items():
+            b_end = bs + len(blk['original'])
+            if bs <= start < b_end:
+                block = blk
+                b_start = bs
+                break
+        if block is None:
+            raise ValueError(f"window_start {start} not found in any block")
+        rel_start = start - b_start
+        rel_end = end - b_start
+        return (
+            block['normalized'][rel_start:rel_end].astype(np.float32),
+            block['original'][rel_start:rel_end],
+            block['means'][rel_start:rel_end],
+            block['stds'][rel_start:rel_end],
+            block['index'][rel_start:rel_end],
+        )
+    else:
+        # time 模式：整条归一化
+        return (
+            d['normalized'][start:end].astype(np.float32),
+            d['original'][start:end],
+            d['means'][start:end],
+            d['stds'][start:end],
+            d['index'][start:end],
+        )
+
+
 class KronosDataset(Dataset):
     """
     Kronos 统一数据集
@@ -158,47 +220,13 @@ class KronosDataset(Dataset):
         dict 格式样本（MA60 预归一化数据）
 
         数据结构：
-        {
-            'normalized': np.ndarray,
-            'original': np.ndarray,
-            'means': np.ndarray,
-            'stds': np.ndarray,
-            'index': DatetimeIndex,
-            'windows': List[int] (optional)
-        }
+        - time 模式：{normalized, original, means, stds, index, windows(可选)}
+        - block 模式：{mode:'block', blocks:{b_start: {normalized, original, means, stds, index, windows}}}
+
+        取数逻辑统一走 extract_window（与 evaluate_trajectory_ic/evaluate 同源）。
         """
         d = self.data[symbol]
-
-        # 支持两种存储模式：block（per-block 归一化）/ time（整条归一化）
-        mode = d.get('mode', 'time')  # 旧数据无 mode 字段，按 time 兼容
-        if mode == 'block':
-            # 找包含 start 的 block（window_start 在 [b_start, b_end) 内）
-            block = None
-            b_start = None
-            for bs, blk in d['blocks'].items():
-                # block 范围 [bs, bs+len(blk['original']))
-                b_end = bs + len(blk['original'])
-                if bs <= start < b_end:
-                    block = blk
-                    b_start = bs
-                    break
-            if block is None:
-                raise ValueError(f"window_start {start} not found in any block of {symbol}")
-            # block 内相对位置
-            rel_start = start - b_start
-            rel_end = end - b_start
-            normalized = block['normalized'][rel_start:rel_end].astype(np.float32)
-            original = block['original'][rel_start:rel_end]
-            means = block['means'][rel_start:rel_end]
-            stds = block['stds'][rel_start:rel_end]
-            timestamps = block['index'][rel_start:rel_end]
-        else:
-            # time 模式：整条归一化
-            normalized = d['normalized'][start:end].astype(np.float32)
-            original = d['original'][start:end]
-            means = d['means'][start:end]
-            stds = d['stds'][start:end]
-            timestamps = d['index'][start:end]
+        normalized, original, means, stds, timestamps = extract_window(d, start, end)
 
         # 归一化数据已预计算，直接使用
         x_norm = normalized[:self.lookback]

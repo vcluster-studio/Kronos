@@ -82,28 +82,29 @@ def backtest(
 
     rng = np.random.RandomState(seed)
 
-    # 每只股票一个窗口（preprocess 已拼好 context+target）
+    # 每只股票多窗口（preprocess 滑窗生成，stride=1 默认每股 13 窗口）
     symbols = list(test_data.keys())
 
-    # 抽样
+    # 抽样：按股票抽（n_samples=股票数），每只股票全量遍历其 windows
     if n_samples > 0 and n_samples < len(symbols):
         indices = rng.choice(len(symbols), size=n_samples, replace=False)
         symbols = [symbols[i] for i in indices]
 
-    # 结果收集（per-symbol）
+    # 结果收集（per-symbol，多窗口聚合）
     results_by_symbol = {}
 
     # PR4 修复：一次性校验 context 段归一化未用 target 段数据（无泄露）
-    # 对第一个样本重算 context 段归一化，与 preprocess 存的 normalized 对比。
+    # 对第一个股票的第一个窗口重算 context 段归一化，与 preprocess 存的 normalized 对比。
     # 若 preprocess 用了 target 数据归一化 context，重算结果会不同 → 报错。
     if symbols:
         first_sym = symbols[0]
         first_d = test_data[first_sym]
+        first_w = first_d['windows'][0]  # 取第一个窗口校验
         try:
-            lb = first_d['lookback']
-            pd_ = first_d['predict']
-            full_orig = first_d['original']
-            full_norm = first_d['normalized']
+            lb = first_w['lookback']
+            pd_ = first_w['predict']
+            full_orig = first_w['original']
+            full_norm = first_w['normalized']
             seq_len = len(full_orig)
             ctx_start = seq_len - lb - pd_
             target_start = ctx_start + lb
@@ -124,121 +125,127 @@ def backtest(
                     f"PR4 校验失败：{first_sym} context 段归一化与重算不一致，"
                     f"preprocess 可能用了 target 段数据归一化 context（泄露）"
                 )
-            print(f"[INFO] PR4 校验通过：context 段归一化未用 target 数据（{first_sym}）")
+            print(f"[INFO] PR4 校验通过：context 段归一化未用 target 数据（{first_sym} window0）")
         except RuntimeError:
             raise
         except Exception as e:
             print(f"[WARNING] PR4 校验跳过：{e}")
 
     for sym in tqdm(symbols, desc="Backtesting"):
-        d = test_data[sym]
+        sym_data = test_data[sym]
+        windows = sym_data['windows']
 
-        try:
-            lookback = d['lookback']
-            predict = d['predict']
-            # 序列布局：[required_history? + lookback + predict]
-            # normalized/original/index 长度 = required_history + lookback + predict
-            # lookback 段起始 = len - lookback - predict
-            seq_len = len(d['normalized'])
-            ctx_start = seq_len - lookback - predict
-            target_start = ctx_start + lookback
+        for wi, w in enumerate(windows):
+            try:
+                lookback = w['lookback']
+                predict = w['predict']
+                # 序列布局：[required_history? + lookback + predict]
+                # normalized/original/index 长度 = required_history + lookback + predict
+                # lookback 段起始 = len - lookback - predict
+                seq_len = len(w['normalized'])
+                ctx_start = seq_len - lookback - predict
+                target_start = ctx_start + lookback
 
-            x_norm = d['normalized'][ctx_start:target_start].astype(np.float32)
-            means = d['means']
-            stds = d['stds']
-            original = d['original']
-            timestamps = d['index']
+                x_norm = w['normalized'][ctx_start:target_start].astype(np.float32)
+                means = w['means']
+                stds = w['stds']
+                original = w['original']
+                timestamps = w['index']
 
-            baseline = original[target_start - 1]
-            baseline_close = original[target_start - 1, 3]
+                baseline = original[target_start - 1]
+                baseline_close = original[target_start - 1, 3]
 
-            # 时间戳
-            x_stamp = np.stack([
-                timestamps[ctx_start:target_start].minute.values,
-                timestamps[ctx_start:target_start].hour.values,
-                timestamps[ctx_start:target_start].weekday.values,
-                timestamps[ctx_start:target_start].day.values,
-                timestamps[ctx_start:target_start].month.values,
-            ], axis=1).astype(np.float32)
+                # 时间戳
+                x_stamp = np.stack([
+                    timestamps[ctx_start:target_start].minute.values,
+                    timestamps[ctx_start:target_start].hour.values,
+                    timestamps[ctx_start:target_start].weekday.values,
+                    timestamps[ctx_start:target_start].day.values,
+                    timestamps[ctx_start:target_start].month.values,
+                ], axis=1).astype(np.float32)
 
-            y_stamp = np.stack([
-                timestamps[target_start:target_start + predict].minute.values,
-                timestamps[target_start:target_start + predict].hour.values,
-                timestamps[target_start:target_start + predict].weekday.values,
-                timestamps[target_start:target_start + predict].day.values,
-                timestamps[target_start:target_start + predict].month.values,
-            ], axis=1).astype(np.float32)
+                y_stamp = np.stack([
+                    timestamps[target_start:target_start + predict].minute.values,
+                    timestamps[target_start:target_start + predict].hour.values,
+                    timestamps[target_start:target_start + predict].weekday.values,
+                    timestamps[target_start:target_start + predict].day.values,
+                    timestamps[target_start:target_start + predict].month.values,
+                ], axis=1).astype(np.float32)
 
-            with torch.no_grad():
-                x_tensor = torch.from_numpy(x_norm).unsqueeze(0).to(device)
-                x_stamp_tensor = torch.from_numpy(x_stamp).unsqueeze(0).to(device)
-                y_stamp_tensor = torch.from_numpy(y_stamp).unsqueeze(0).to(device)
+                with torch.no_grad():
+                    x_tensor = torch.from_numpy(x_norm).unsqueeze(0).to(device)
+                    x_stamp_tensor = torch.from_numpy(x_stamp).unsqueeze(0).to(device)
+                    y_stamp_tensor = torch.from_numpy(y_stamp).unsqueeze(0).to(device)
 
-                preds = auto_regressive_inference(
-                    tokenizer, model,
-                    x_tensor, x_stamp_tensor, y_stamp_tensor,
-                    max_context={'mini': 2048, 'small': 512, 'base': 512}.get(model_type, 2048),  # B11 修复：按 model_type
-                    pred_len=predict,
-                    clip=5.0,
-                    T=1.0,
-                    top_p=0.9,
-                    sample_count=1,
-                    verbose=False
-                )
+                    preds = auto_regressive_inference(
+                        tokenizer, model,
+                        x_tensor, x_stamp_tensor, y_stamp_tensor,
+                        max_context={'mini': 2048, 'small': 512, 'base': 512}.get(model_type, 2048),  # B11 修复：按 model_type
+                        pred_len=predict,
+                        clip=5.0,
+                        T=1.0,
+                        top_p=0.9,
+                        sample_count=1,
+                        verbose=False
+                    )
 
-                pred_norm = preds[0, -predict:, :]
+                    pred_norm = preds[0, -predict:, :]
 
-                # 反归一化（用 target 段的 means/stds）
-                pred_raw = pred_norm.cpu().numpy() * stds[target_start:target_start + predict] + means[target_start:target_start + predict]
-                actual = original[target_start:target_start + predict]
+                    # 反归一化（用 target 段的 means/stds）
+                    # preds 已是 numpy（auto_regressive_inference 返回 np.ndarray），直接用
+                    pred_raw = pred_norm * stds[target_start:target_start + predict] + means[target_start:target_start + predict]
+                    actual = original[target_start:target_start + predict]
 
-            # 增益计算（用 close）
-            pred_close = pred_raw[0, 3]
-            actual_close = actual[0, 3]
-            pred_gain = (pred_close - baseline_close) / (abs(baseline_close) + 1e-8)
-            actual_gain = (actual_close - baseline_close) / (abs(baseline_close) + 1e-8)
+                # 增益计算（用 close）
+                pred_close = pred_raw[0, 3]
+                actual_close = actual[0, 3]
+                pred_gain = (pred_close - baseline_close) / (abs(baseline_close) + 1e-8)
+                actual_gain = (actual_close - baseline_close) / (abs(baseline_close) + 1e-8)
 
-            # sigmoid 分值
-            score = config.sigmoid_score(pred_gain)
+                # sigmoid 分值
+                score = config.sigmoid_score(pred_gain)
 
-            # 方向
-            pred_dir = pred_gain > 0
-            actual_dir = actual_gain > 0
-            direction_correct = pred_dir == actual_dir
+                # 方向
+                pred_dir = pred_gain > 0
+                actual_dir = actual_gain > 0
+                direction_correct = pred_dir == actual_dir
 
-            # 振幅
-            pred_amp = pred_raw[0, 1] - pred_raw[0, 2]
-            actual_amp = actual[0, 1] - actual[0, 2]
-            amp_rate = amplitude_error_rate(pred_amp, actual_amp)
+                # 振幅
+                pred_amp = pred_raw[0, 1] - pred_raw[0, 2]
+                actual_amp = actual[0, 1] - actual[0, 2]
+                amp_rate = amplitude_error_rate(pred_amp, actual_amp)
 
-            # 涨跌停
-            pred_limit = detect_limit(pred_raw, baseline_close, config.limit_pct)
-            actual_limit = detect_limit(actual, baseline_close, config.limit_pct)
+                # 涨跌停
+                pred_limit = detect_limit(pred_raw, baseline_close, config.limit_pct)
+                actual_limit = detect_limit(actual, baseline_close, config.limit_pct)
 
-            # 按股票收集
-            if sym not in results_by_symbol:
-                results_by_symbol[sym] = {
-                    'pred_gains': [],
-                    'actual_gains': [],
-                    'scores': [],
-                    'directions': [],
-                    'actual_dirs': [],  # 新增：用于计算 naive DA
-                    'amp_rates': [],
-                    'pred_limit': [],
-                    'actual_limit': [],
-                }
+                # 按股票收集（多窗口聚合到同一 symbol）
+                if sym not in results_by_symbol:
+                    results_by_symbol[sym] = {
+                        'pred_gains': [],
+                        'actual_gains': [],
+                        'scores': [],
+                        'directions': [],
+                        'actual_dirs': [],  # 新增：用于计算 naive DA
+                        'amp_rates': [],
+                        'pred_limit': [],
+                        'actual_limit': [],
+                    }
 
-            results_by_symbol[sym]['pred_gains'].append(pred_gain)
-            results_by_symbol[sym]['actual_gains'].append(actual_gain)
-            results_by_symbol[sym]['scores'].append(score)
-            results_by_symbol[sym]['directions'].append(direction_correct)
-            results_by_symbol[sym]['actual_dirs'].append(actual_dir)  # 新增
-            results_by_symbol[sym]['amp_rates'].append(amp_rate)
-            results_by_symbol[sym]['pred_limit'].append(pred_limit.any())
-            results_by_symbol[sym]['actual_limit'].append(actual_limit.any())
+                results_by_symbol[sym]['pred_gains'].append(pred_gain)
+                results_by_symbol[sym]['actual_gains'].append(actual_gain)
+                results_by_symbol[sym]['scores'].append(score)
+                results_by_symbol[sym]['directions'].append(direction_correct)
+                results_by_symbol[sym]['actual_dirs'].append(actual_dir)  # 新增
+                results_by_symbol[sym]['amp_rates'].append(amp_rate)
+                results_by_symbol[sym]['pred_limit'].append(pred_limit.any())
+                results_by_symbol[sym]['actual_limit'].append(actual_limit.any())
 
-        except Exception:
-            continue
+            except Exception as e:
+                # 回测循环不应静默吞异常（曾因 except: continue 导致全 0 无法定位）
+                # 打印异常供诊断，仍 continue 跳过该窗口不中断整个回测
+                print(f"[WARN backtest] {sym} window{wi}: {type(e).__name__}: {e}")
+                continue
 
     # 聚合（per-stock IC）
     per_stock_ics = []
@@ -352,7 +359,7 @@ def main():
                         choices=['time', 'block'],
                         help='Split mode for locating model checkpoint (B3 修复：不再硬编码 block)')
     parser.add_argument('--n-samples', type=int, default=100,
-                        help='Number of samples (-1 for full)')
+                        help='抽样股票数（-1 全量）。每股票全量遍历其滑窗 windows（stride=1 默认每股 13 窗口）')
     parser.add_argument('--batch-size', type=int, default=64)
     parser.add_argument('--seed', type=int, default=42)
     parser.add_argument('--limit-pct', type=float, default=0.10)
