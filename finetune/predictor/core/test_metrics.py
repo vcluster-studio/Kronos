@@ -161,6 +161,15 @@ def test_amplitude_error_rate():
     print(f"Under-predict: {rate_under:.2f}")
     assert abs(rate_under - 0.8) < 1e-6, "预测偏小 20% 应返回 0.8"
 
+    # actual 无波动（一字涨跌停/停牌）→ 返回 None，不污染均值
+    rate_novol = amplitude_error_rate(5.0, 0.0)
+    print(f"No-volatility: {rate_novol}")
+    assert rate_novol is None, "actual 无波动时应返回 None"
+
+    rate_novol2 = amplitude_error_rate(5.0, 0.0005)
+    print(f"Near-zero vol: {rate_novol2}")
+    assert rate_novol2 is None, "actual 近零波动时应返回 None"
+
     print("PASS: 振幅误差率正确计算")
     print()
 

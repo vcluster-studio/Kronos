@@ -467,12 +467,14 @@ def evaluate_trajectory_ic(
     if rank == 0:
         # 振幅误差率统计
         if local_amplitude_rates:
-            amp_arr = np.array(local_amplitude_rates)
-            amplitude_result = {
-                'mean_rate': float(np.mean(amp_arr)),
-                'std_rate': float(np.std(amp_arr)),
-                'usable_pct': float(np.mean(np.abs(amp_arr - 1.0) < 0.3)),
-            }
+            valid_rates = [r for r in local_amplitude_rates if r is not None]
+            if valid_rates:
+                amp_arr = np.array(valid_rates)
+                amplitude_result = {
+                    'mean_rate': float(np.mean(amp_arr)),
+                    'std_rate': float(np.std(amp_arr)),
+                    'usable_pct': float(np.mean(np.abs(amp_arr - 1.0) < 0.3)),
+                }
 
         # 涨跌停命中率
         if local_pred_limit and local_actual_limit:

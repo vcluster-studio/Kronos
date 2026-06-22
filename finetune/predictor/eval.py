@@ -433,11 +433,12 @@ def evaluate(
                 naive_da_by_step[step_idx] = 0.5
 
     # 振幅统计
+    valid_amp_rates = [r for r in amplitude_rates if r is not None]
     amplitude_result = {
-        'mean_rate': float(np.mean(amplitude_rates)) if amplitude_rates else 1.0,
-        'std_rate': float(np.std(amplitude_rates)) if amplitude_rates else 0.0,
-        'perfect_pct': float(np.mean(np.abs(np.array(amplitude_rates) - 1.0) < 0.1)) if amplitude_rates else 0.0,
-        'usable_pct': float(np.mean(np.abs(np.array(amplitude_rates) - 1.0) < 0.3)) if amplitude_rates else 0.0,
+        'mean_rate': float(np.mean(valid_amp_rates)) if valid_amp_rates else 1.0,
+        'std_rate': float(np.std(valid_amp_rates)) if valid_amp_rates else 0.0,
+        'perfect_pct': float(np.mean(np.abs(np.array(valid_amp_rates) - 1.0) < 0.1)) if valid_amp_rates else 0.0,
+        'usable_pct': float(np.mean(np.abs(np.array(valid_amp_rates) - 1.0) < 0.3)) if valid_amp_rates else 0.0,
     }
 
     # 涨跌停命中率

@@ -318,9 +318,12 @@ def backtest(
 
     # 振幅
     if all_amp_rates:
-        result['amplitude_mean'] = float(np.mean(all_amp_rates))
-        result['amplitude_std'] = float(np.std(all_amp_rates))
-        result['amplitude_usable_pct'] = float(np.mean(np.abs(np.array(all_amp_rates) - 1.0) < 0.3))
+        valid_amp_rates = [r for r in all_amp_rates if r is not None]
+        if valid_amp_rates:
+            valid_arr = np.array(valid_amp_rates)
+            result['amplitude_mean'] = float(np.mean(valid_arr))
+            result['amplitude_std'] = float(np.std(valid_arr))
+            result['amplitude_usable_pct'] = float(np.mean(np.abs(valid_arr - 1.0) < 0.3))
 
     # 涨跌停
     limit_result = limit_hit_rate(np.array(all_pred_limit), np.array(all_actual_limit))

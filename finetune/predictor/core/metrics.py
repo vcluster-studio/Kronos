@@ -418,7 +418,7 @@ def aggregate_da(
 def amplitude_error_rate(
     pred_high_low: float,
     actual_high_low: float
-) -> float:
+) -> Optional[float]:
     """
     预测振幅误差率
 
@@ -426,15 +426,19 @@ def amplitude_error_rate(
     error_rate = 预测振幅 ÷ 实际振幅
     标尺：1.0=完美，0.8-1.2=可用，偏离>30%=失真
 
+    actual_high_low 接近 0 时（一字涨跌停/停牌，全天无波动）返回 None，
+    避免除近零导致 ratio 爆炸污染均值。调用方聚合时需 skip None。
+
     Args:
         pred_high_low: 预测的 (high - low)
         actual_high_low: 实际的 (high - low)
 
     Returns:
-        振幅误差率，1.0 表示完美匹配
+        振幅误差率，1.0 表示完美匹配；actual 无波动时返回 None
     """
-    eps = 1e-8
-    return pred_high_low / (actual_high_low + eps)
+    if actual_high_low <= 1e-3:
+        return None
+    return pred_high_low / actual_high_low
 
 
 def compute_amplitude_stats(
