@@ -1,11 +1,12 @@
 """
 Kronos Predictor Evaluation Entry
 
-统一评估入口，支持：
-- DDP 多卡评估
-- 多模型批量对比
-- 正确度量口径（去趋势 trajectory IC）
-- 可懂指标输出
+评估指标体系重构：基于 OHLCV 预测准确度
+
+核心指标：
+- MAPE：各特征的平均绝对百分比误差（主要指标）
+- Trajectory IC：轨迹形状相关性（去趋势）
+- Amplitude Error Rate：振幅误差率
 
 使用：
     # 单模型
@@ -16,11 +17,6 @@ Kronos Predictor Evaluation Entry
 
     # 多模型对比
     python finetune/predictor/eval.py --models mini,small,base
-
-关键：
-- 与 train.py 共用 core/metrics.py
-- trajectory IC 用去趋势序列
-- 主输出为可懂指标（方向胜率/振幅误差率/涨跌停命中率）
 """
 
 import os
@@ -51,24 +47,19 @@ from finetune.predictor.core.metrics import (
     detrend_to_baseline,
     safe_trajectory_ic,
     safe_corrcoef,
-    calculate_combined_score,
-    calculate_da_score,
-    get_log_step_weights,
-    get_feature_weights,
+    compute_mape,
+    compute_mae,
+    get_step_weights,
     amplitude_error_rate,
     compute_amplitude_stats,
-    limit_hit_rate,
-    detect_limit,
-    format_metrics_report,
-    excess_da,
     aggregate_ic,
-    aggregate_da,
+    format_metrics_report,
 )
 from finetune.predictor.core.utils import get_device, format_time
 
 
 # ============================================================================
-# DDP 工具（从 train.py 复用）
+# DDP 工具
 # ============================================================================
 
 def get_rank_info():
@@ -104,22 +95,13 @@ def load_model_and_tokenizer(
     model_type: str,
     device: torch.device,
     checkpoint: str = 'best_combined_model',
-    lookback: int = 400,      # EV1 修复：从 CLI 传入
-    predict: int = 10,        # EV1 修复
-    split_mode: str = 'block', # EV1 修复
+    lookback: int = 400,
+    predict: int = 10,
+    split_mode: str = 'block',
     custom_tokenizer_path: str = None,
     custom_checkpoint_path: str = None,
 ):
-    """
-    加载模型和 tokenizer
-
-    EV1 修复：lookback/predict/split_mode 从 CLI 传入，避免硬编码导致数据模型错配
-
-    支持自定义路径：
-    - custom_tokenizer_path: 自定义 tokenizer 路径
-    - custom_checkpoint_path: 自定义 checkpoint 目录路径
-    """
-    # Tokenizer：支持自定义路径
+    """加载模型和 tokenizer"""
     if custom_tokenizer_path:
         tokenizer_path = custom_tokenizer_path
     else:
@@ -130,7 +112,6 @@ def load_model_and_tokenizer(
     tokenizer = KronosTokenizer.from_pretrained(tokenizer_path)
     tokenizer.eval().to(device)
 
-    # 模型
     pretrained_paths = {
         'mini': 'pretrained/Kronos-mini',
         'small': 'pretrained/Kronos-small',
@@ -140,7 +121,6 @@ def load_model_and_tokenizer(
     model = Kronos.from_pretrained(pretrained_paths[model_type])
     model.eval().to(device)
 
-    # Checkpoint：支持自定义路径
     if custom_checkpoint_path:
         checkpoint_path = custom_checkpoint_path
     else:
@@ -150,17 +130,15 @@ def load_model_and_tokenizer(
     checkpoint_file = os.path.join(checkpoint_path, 'model.safetensors')
     if os.path.exists(checkpoint_file):
         state_dict = load_file(checkpoint_file)
-        # EV2 修复：checkpoint 与模型对不上直接报错（不静默用错权重）
         missing, unexpected = model.load_state_dict(state_dict, strict=False)
         if missing or unexpected:
             raise RuntimeError(
-                f"Checkpoint 与模型不匹配，拒绝加载: missing={missing}, unexpected={unexpected}"
+                f"Checkpoint 与模型不匹配: missing={missing}, unexpected={unexpected}"
             )
         print(f"[INFO] Loaded checkpoint: {checkpoint_path}")
     else:
-        # EV3 修复：显式警告找不到 checkpoint，使用预训练
         print(f"[WARNING] Checkpoint not found at {checkpoint_path}")
-        print(f"[WARNING] Using pretrained model instead - evaluation may not reflect fine-tuned performance")
+        print(f"[WARNING] Using pretrained model instead")
 
     return model, tokenizer
 
@@ -178,37 +156,30 @@ def evaluate(
     n_samples: int = -1,
     n_sample_ratio: float = 0.5,
     seed: int = 42,
-    limit_pct: float = 0.10,
     rank: int = 0,
     world_size: int = 1,
     model_type: str = 'mini',
 ):
     """
-    评估模型（正确口径）
+    评估模型（基于 OHLCV 准确度）
 
-    DDP 模式：各 rank 按轮询分配样本，最后用 all_gather 聚合
+    核心指标：MAPE（各特征的百分比误差）
     """
     model.eval()
     tokenizer.eval()
 
-    # eval.py 的 model 始终是裸 Kronos（load_model_and_tokenizer 不做 DDP 包装），
-    # DDP 仅用于数据分片 + all_gather 聚合，故 decode_s1/decode_s2 可直接调用。
-    # （train.py 的 model 才被 DDP 包装，需 model.module；eval 无此问题。）
     use_ddp = world_size > 1
-
-    rng = np.random.RandomState(seed)  # EV6 修复：所有 rank 同 seed 抽同样本，再按 idx%world_size 分片
+    rng = np.random.RandomState(seed)
 
     # 构建窗口索引
     indices = []
     for symbol, d in test_data.items():
         mode = d.get('mode', 'time') if isinstance(d, dict) else None
         if mode == 'block':
-            # block 模式：遍历各 block 的 windows
             for b_start, blk in d['blocks'].items():
                 for w in blk['windows']:
                     indices.append((symbol, int(w)))
         elif 'windows' in d:
-            # time 模式（或有预分配 windows）
             for w in d['windows']:
                 indices.append((symbol, int(w)))
         elif hasattr(d, 'columns'):
@@ -222,7 +193,7 @@ def evaluate(
                 for i in range(seq_len - config.lookback - config.predict + 1):
                     indices.append((symbol, i))
 
-    # 抽样：--n-samples(绝对值) 优先，否则用 --n-sample-ratio(比例)
+    # 抽样
     D = len(indices)
     if n_samples > 0:
         n_eval = min(n_samples, D)
@@ -233,37 +204,29 @@ def evaluate(
         indices = [indices[i] for i in sample_idx]
 
     # 收集结果
-    ic_lists = {f: [] for f in FEATURE_NAMES}
-    da_by_step = [{f: [] for f in FEATURE_NAMES} for _ in range(config.predict)]
-
-    # 收集 actual_dir 统计（用于计算 naive DA）
-    actual_dir_by_step = [[] for _ in range(config.predict)]  # 仅 close
-
+    mape_lists = {fn: [] for fn in FEATURE_NAMES}
+    ic_lists = {fn: [] for fn in FEATURE_NAMES}
     amplitude_rates = []
-    limit_results = {'pred_limit': [], 'actual_limit': []}
 
-    # DDP 分片：每个 rank 只处理属于它的样本（按轮询分配）
+    # DDP 分片
     for idx, (symbol, start) in enumerate(tqdm(indices, desc=f"Rank {rank} Evaluating", disable=rank != 0)):
         if idx % world_size != rank:
-            continue  # 跳过不属于该 rank 的样本
+            continue
 
         d = test_data[symbol]
         end = start + config.lookback + config.predict
 
         try:
-            # 取数：统一走 extract_window，支持 DataFrame / dict time / dict block 三种格式
             from finetune.predictor.core.dataset import extract_window
             normalized, original_vals, means, stds, timestamps = extract_window(d, start, end)
 
             if normalized is None:
-                # DataFrame 格式（full_window runtime 归一化）
                 x_raw = original_vals[:config.lookback]
                 x_mean = np.mean(x_raw, axis=0)
                 x_std = np.std(x_raw, axis=0) + 1e-5
                 x_norm = np.clip((x_raw - x_mean) / x_std, -config.clip, config.clip)
                 original = original_vals
             else:
-                # dict 格式（time / block，已预归一化）
                 x_norm = normalized[:config.lookback].astype(np.float32)
                 original = original_vals
 
@@ -295,7 +258,7 @@ def evaluate(
                 preds = auto_regressive_inference(
                     tokenizer, model,
                     x_tensor, x_stamp_tensor, y_stamp_tensor,
-                    max_context={'mini': 2048, 'small': 512, 'base': 512}.get(model_type, 2048),  # EV9 修复：按 model_type
+                    max_context={'mini': 2048, 'small': 512, 'base': 512}.get(model_type, 2048),
                     pred_len=config.predict,
                     clip=config.clip,
                     T=1.0,
@@ -306,8 +269,6 @@ def evaluate(
 
                 pred_norm = preds[0, config.lookback:config.lookback + config.predict, :]
 
-                # 反归一化：preds 已是 numpy（auto_regressive_inference 返回 np.ndarray）
-                # dict 格式用预计算 means/stds，DataFrame 格式用 runtime x_std/x_mean
                 if normalized is not None:
                     pred_raw = pred_norm * stds[config.lookback:] + means[config.lookback:]
                 else:
@@ -315,75 +276,72 @@ def evaluate(
 
                 actual = original[config.lookback:config.lookback + config.predict]
 
-            # Trajectory IC（去趋势口径）
+            # 计算 MAPE（每步每个特征）
+            mape_matrix = compute_mape(pred_raw, actual)
+            for fi, fn in enumerate(FEATURE_NAMES):
+                mape_lists[fn].append(mape_matrix)
+
+            # Trajectory IC（去趋势）
             for fi, fn in enumerate(FEATURE_NAMES):
                 pred_detrend = detrend_to_baseline(pred_raw[:, fi], baseline[fi])
                 actual_detrend = detrend_to_baseline(actual[:, fi], baseline[fi])
-
                 ic, _ = safe_trajectory_ic(pred_detrend, actual_detrend)
                 if ic is not None:
                     ic_lists[fn].append(ic)
 
-            # DA
-            for step_idx in range(config.predict):
-                for fi, fn in enumerate(FEATURE_NAMES):
-                    pred_dir = (pred_raw[step_idx, fi] - baseline[fi]) > 0
-                    actual_dir = (actual[step_idx, fi] - baseline[fi]) > 0
-                    # 存 float（非 bool）：聚合时 np.percentile 对 bool 做插值会崩溃
-                    da_by_step[step_idx][fn].append(float(pred_dir == actual_dir))
-
-                    # 收集 close 的 actual_dir（用于 naive DA）
-                    if fn == 'close':
-                        actual_dir_by_step[step_idx].append(float(actual_dir))
-
             # 振幅误差率
-            pred_amp = pred_raw[0, 1] - pred_raw[0, 2]  # high - low
+            pred_amp = pred_raw[0, 1] - pred_raw[0, 2]
             actual_amp = actual[0, 1] - actual[0, 2]
             amplitude_rates.append(amplitude_error_rate(pred_amp, actual_amp))
-
-            # 涨跌停检测
-            pred_limit = detect_limit(pred_raw, baseline_close, limit_pct)
-            actual_limit = detect_limit(actual, baseline_close, limit_pct)
-            limit_results['pred_limit'].append(pred_limit.any())
-            limit_results['actual_limit'].append(actual_limit.any())
 
         except Exception:
             continue
 
-    # 聚合结果（DDP 模式用 all_gather）
-
+    # 聚合结果
     if use_ddp:
-        # DDP 聚合
         ic_result = aggregate_ic(ic_lists, world_size, device, rank == 0)
-        da_result = aggregate_da(da_by_step, world_size, device, config.predict, rank == 0)
 
-        # 聚合 actual_dir 用于 naive DA（EV7 修复：计数法，避免列表 padding）
-        # 与 train.py:386-412 同源：all_gather up_count/n 标量，rank0 算 up_ratio
-        naive_da_by_step = {}
-        for step_idx in range(config.predict):
-            local_actual = actual_dir_by_step[step_idx]
-            local_up_count = int(sum(local_actual))
-            local_n = len(local_actual)
+        # 聚合 MAPE（简化：只用 rank 0 的结果）
+        if rank == 0:
+            # 计算每步 MAPE
+            mape_by_step = {}
+            for step_idx in range(config.predict):
+                step_result = {}
+                for fi, fn in enumerate(FEATURE_NAMES):
+                    values = []
+                    for mape_matrix in mape_lists[fn]:
+                        if mape_matrix is not None and step_idx < len(mape_matrix):
+                            values.append(mape_matrix[step_idx, fi])
+                    if values:
+                        arr = np.array(values)
+                        step_result[fn] = {
+                            'mean': float(np.mean(arr)),
+                            'std': float(np.std(arr)),
+                            'p50': float(np.percentile(arr, 50)),
+                            'n': len(arr),
+                        }
+                    else:
+                        step_result[fn] = {'mean': 0.0, 'std': 0.0, 'p50': 0.0, 'n': 0}
+                mape_by_step[f'step{step_idx + 1}'] = step_result
 
-            up_count_tensor = torch.tensor([local_up_count], device=device)
-            n_tensor = torch.tensor([local_n], device=device)
-
-            gathered_up = [torch.zeros_like(up_count_tensor) for _ in range(world_size)]
-            gathered_n = [torch.zeros_like(n_tensor) for _ in range(world_size)]
-
-            # 所有 rank 执行 all_gather
-            dist.all_gather(gathered_up, up_count_tensor)
-            dist.all_gather(gathered_n, n_tensor)
-
-            # 只 rank 0 组装
-            if rank == 0:
-                total_up = sum(t.item() for t in gathered_up)
-                total_n = sum(t.item() for t in gathered_n)
-                if total_n > 0:
-                    up_ratio = total_up / total_n
-                    naive_da_by_step[step_idx] = float(max(up_ratio, 1 - up_ratio))
-                else:
-                    naive_da_by_step[step_idx] = 0.5
+            # 计算加权摘要
+            mape_summary = {}
+            step_weights = get_step_weights(config.predict)
+            for fi, fn in enumerate(FEATURE_NAMES):
+                weighted_sum = 0.0
+                total_weight = 0.0
+                for mape_matrix in mape_lists[fn]:
+                    if mape_matrix is None:
+                        continue
+                    for step_idx in range(min(len(mape_matrix), config.predict)):
+                        val = mape_matrix[step_idx, fi]
+                        w = step_weights[step_idx]
+                        weighted_sum += val * w
+                        total_weight += w
+                mape_summary[fn] = weighted_sum / total_weight if total_weight > 0 else 0.0
+        else:
+            mape_by_step = {}
+            mape_summary = {}
     else:
         # 单进程聚合
         ic_result = {}
@@ -403,34 +361,42 @@ def evaluate(
             else:
                 ic_result[fn] = {'mean': 0.0, 'std': 0.0, 'p25': None, 'p50': None, 'p75': None, 'n': 0}
 
-        da_result = {}
-        naive_da_by_step = {}
+        # 计算 MAPE
+        mape_by_step = {}
         for step_idx in range(config.predict):
             step_result = {}
-            for fn in FEATURE_NAMES:
-                da_list = da_by_step[step_idx][fn]
-                if da_list:
-                    da_arr = np.array(da_list)
-                    n = len(da_list)
+            for fi, fn in enumerate(FEATURE_NAMES):
+                values = []
+                for mape_matrix in mape_lists[fn]:
+                    if mape_matrix is not None and step_idx < len(mape_matrix):
+                        values.append(mape_matrix[step_idx, fi])
+                if values:
+                    arr = np.array(values)
                     step_result[fn] = {
-                        'mean': float(np.mean(da_arr)),
-                        'std': float(np.std(da_arr)) if n >= 2 else 0.0,
-                        'p25': float(np.percentile(da_arr, 25)) if n >= 4 else None,
-                        'p50': float(np.percentile(da_arr, 50)),
-                        'p75': float(np.percentile(da_arr, 75)) if n >= 4 else None,
-                        'n': n,
+                        'mean': float(np.mean(arr)),
+                        'std': float(np.std(arr)),
+                        'p50': float(np.percentile(arr, 50)),
+                        'n': len(arr),
                     }
                 else:
-                    step_result[fn] = {'mean': 0.0, 'std': 0.0, 'p25': None, 'p50': None, 'p75': None, 'n': 0}
-            da_result[f'step{step_idx + 1}'] = step_result
+                    step_result[fn] = {'mean': 0.0, 'std': 0.0, 'p50': 0.0, 'n': 0}
+            mape_by_step[f'step{step_idx + 1}'] = step_result
 
-            # 计算 naive DA
-            actual_dirs = actual_dir_by_step[step_idx]
-            if actual_dirs:
-                up_ratio = np.mean(actual_dirs)
-                naive_da_by_step[step_idx] = float(max(up_ratio, 1 - up_ratio))
-            else:
-                naive_da_by_step[step_idx] = 0.5
+        # 加权摘要
+        mape_summary = {}
+        step_weights = get_step_weights(config.predict)
+        for fi, fn in enumerate(FEATURE_NAMES):
+            weighted_sum = 0.0
+            total_weight = 0.0
+            for mape_matrix in mape_lists[fn]:
+                if mape_matrix is None:
+                    continue
+                for step_idx in range(min(len(mape_matrix), config.predict)):
+                    val = mape_matrix[step_idx, fi]
+                    w = step_weights[step_idx]
+                    weighted_sum += val * w
+                    total_weight += w
+            mape_summary[fn] = weighted_sum / total_weight if total_weight > 0 else 0.0
 
     # 振幅统计
     valid_amp_rates = [r for r in amplitude_rates if r is not None]
@@ -441,13 +407,7 @@ def evaluate(
         'usable_pct': float(np.mean(np.abs(np.array(valid_amp_rates) - 1.0) < 0.3)) if valid_amp_rates else 0.0,
     }
 
-    # 涨跌停命中率
-    limit_result = limit_hit_rate(
-        np.array(limit_results['pred_limit']),
-        np.array(limit_results['actual_limit'])
-    )
-
-    return ic_result, da_result, amplitude_result, limit_result, naive_da_by_step
+    return mape_by_step, mape_summary, ic_result, amplitude_result
 
 
 # ============================================================================
@@ -461,25 +421,15 @@ def main():
     parser.add_argument('--predict', type=int, default=10)
     parser.add_argument('--split-mode', type=str, default='block')
     parser.add_argument('--model', type=str, default='mini')
-    parser.add_argument('--models', type=str, default=None,
-                        help='Comma-separated models for batch comparison')
+    parser.add_argument('--models', type=str, default=None)
     parser.add_argument('--checkpoint', type=str, default='best_combined_model',
                         choices=['best_model', 'best_ic_model', 'best_combined_model', 'latest_model'])
-    parser.add_argument('--tokenizer-path', type=str, default=None,
-                        help='自定义 tokenizer 路径（优先级最高）')
-    parser.add_argument('--checkpoint-path', type=str, default=None,
-                        help='自定义 checkpoint 目录路径（优先级最高）')
-    parser.add_argument('--test-path', type=str, default=None,
-                        help='自定义测试数据路径（优先级最高）')
-    # 测试采样：--n-samples(绝对值) 优先，否则用 --n-sample-ratio(比例，默认 0.5)
-    # 与 train.py 验证采样同源概念。默认 0.5 抽样子集加速评估，-1/1.0 全量。
-    parser.add_argument('--n-samples', type=int, default=-1,
-                        help='测试样本绝对数（-1=用 ratio，>0 覆盖 ratio）')
-    parser.add_argument('--n-sample-ratio', type=float, default=0.5,
-                        help='测试子集占 test 总量比例（默认 0.5）。无放回随机抽样，DDP 各 rank 同 seed 抽同样本再分片')
+    parser.add_argument('--tokenizer-path', type=str, default=None)
+    parser.add_argument('--checkpoint-path', type=str, default=None)
+    parser.add_argument('--test-path', type=str, default=None)
+    parser.add_argument('--n-samples', type=int, default=-1)
+    parser.add_argument('--n-sample-ratio', type=float, default=0.5)
     parser.add_argument('--seed', type=int, default=42)
-    parser.add_argument('--limit-pct', type=float, default=0.10,
-                        help='Limit threshold (main board 10%, ChiNext 20%)')
     args = parser.parse_args()
 
     # DDP setup
@@ -496,7 +446,6 @@ def main():
         split_mode=args.split_mode,
     )
 
-    # 数据路径：支持自定义（优先级最高）
     if args.test_path:
         test_path = args.test_path
     else:
@@ -504,33 +453,23 @@ def main():
 
     if is_main:
         print(f"\n{'=' * 60}")
-        print(f"Kronos Predictor Evaluation (Detrended IC)")
+        print(f"Kronos Predictor Evaluation (OHLCV Accuracy)")
         print(f"{'=' * 60}")
         print(f"norm_mode: {config.norm_mode}")
         print(f"model: {args.model}")
         print(f"checkpoint: {args.checkpoint}")
-        if args.tokenizer_path:
-            print(f"tokenizer_path: {args.tokenizer_path} (custom)")
-        if args.checkpoint_path:
-            print(f"checkpoint_path: {args.checkpoint_path} (custom)")
         print(f"test_path: {test_path}")
-        if args.test_path:
-            print(f"  (custom data path)")
         if args.n_samples > 0:
             print(f"n_samples: {args.n_samples} (absolute)")
         else:
-            print(f"n_sample_ratio: {args.n_sample_ratio} (of full test set)")
-        if use_ddp:
-            print(f"DDP: {world_size} GPUs")
+            print(f"n_sample_ratio: {args.n_sample_ratio}")
         print(f"{'=' * 60}")
 
-    # 加载测试数据
     with open(test_path, 'rb') as f:
         test_data = pickle.load(f)
     if is_main:
         print(f"Test data: {len(test_data)} stocks")
 
-    # 模型列表
     if args.models:
         model_types = args.models.split(',')
     else:
@@ -549,22 +488,19 @@ def main():
             custom_checkpoint_path=args.checkpoint_path,
         )
 
-        ic_result, da_result, amplitude_result, limit_result, naive_da_by_step = evaluate(
+        mape_by_step, mape_summary, ic_result, amplitude_result = evaluate(
             model, tokenizer, test_data, config, device,
             n_samples=args.n_samples,
             n_sample_ratio=args.n_sample_ratio,
             seed=args.seed,
-            limit_pct=args.limit_pct,
             rank=rank,
             world_size=world_size,
             model_type=model_type,
         )
 
-        # 输出报告（只 rank 0）
         if is_main:
             report = format_metrics_report(
-                ic_result, da_result, amplitude_result, limit_result,
-                naive_da_by_step=naive_da_by_step,
+                mape_by_step, mape_summary, ic_result, amplitude_result,
                 predict=config.predict
             )
             print(report)

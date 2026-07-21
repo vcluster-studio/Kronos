@@ -1,13 +1,20 @@
 """
 Kronos Predictor Core Modules
 
-重构后的核心模块，提供：
-- config: 配置对象（DataConfig/TrainConfig/ArtifactConfig）
+重构后的核心模块，基于 OHLCV 准确度指标：
+
+核心指标：
+- MAPE：各特征的平均绝对百分比误差
+- Trajectory IC：轨迹形状相关性（去趋势）
+- Amplitude Error Rate：振幅误差率
+
+模块：
+- config: 配置对象
 - paths: 路径构建函数
-- schema: 数据 schema 定义（SampleSchema/BacktestSchema/MetaSchema）
-- normalization: 归一化器（FullWindowNormalizer/SlidingMANormalizer）
-- splitting: 数据分割算法（time_split/block_split/validate_no_leakage）
-- metrics: 度量计算（trajectory IC/DA/可懂指标）
+- schema: 数据 schema 定义
+- normalization: 归一化器
+- splitting: 数据分割算法
+- metrics: 度量计算
 - utils: 工具函数
 """
 
@@ -61,21 +68,24 @@ from .splitting import (
 )
 
 from .metrics import (
+    # 核心：OHLCV 准确度
+    compute_mape,
+    compute_mae,
+    get_step_weights,
+    compute_weighted_summary,
+
+    # Trajectory IC（去趋势）
     detrend_to_baseline,
     safe_corrcoef,
     safe_spearmanr,
     safe_trajectory_ic,
-    excess_da,
     aggregate_ic,
-    aggregate_da,
+
+    # Amplitude
     amplitude_error_rate,
     compute_amplitude_stats,
-    limit_hit_rate,
-    detect_limit,
-    calculate_combined_score,
-    calculate_da_score,
-    get_log_step_weights,
-    get_feature_weights,
+
+    # 报告
     format_metrics_report,
     FEATURE_NAMES,
 )
@@ -152,22 +162,18 @@ __all__ = [
     'create_backtest_samples',
     'get_split_stats',
 
-    # Metrics
+    # Metrics - OHLCV Accuracy
+    'compute_mape',
+    'compute_mae',
+    'get_step_weights',
+    'compute_weighted_summary',
     'detrend_to_baseline',
     'safe_corrcoef',
     'safe_spearmanr',
     'safe_trajectory_ic',
-    'excess_da',
     'aggregate_ic',
-    'aggregate_da',
     'amplitude_error_rate',
     'compute_amplitude_stats',
-    'limit_hit_rate',
-    'detect_limit',
-    'calculate_combined_score',
-    'calculate_da_score',
-    'get_log_step_weights',
-    'get_feature_weights',
     'format_metrics_report',
     'FEATURE_NAMES',
 
