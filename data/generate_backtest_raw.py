@@ -1,18 +1,15 @@
 """
-回测原始数据生成：从样本外 kline_daily sql 解析为 backtest_raw.pkl
+回测原始数据生成：从 kline_daily sql 解析为 backtest_raw.pkl
 
 输入：
-  data/kline_daily_20260508~20260617.sql  样本外 sql（2026-05-08 ~ 2026-06-17）
+  新格式 SQL（带 id 字段）或旧格式 SQL
 
 输出：
-  finetune/data/raw/backtest_raw.pkl      回测 raw（2026-05-19 ~ 2026-06-17）
+  finetune/data/raw/backtest_raw.pkl      回测 raw（start_date 之后的数据）
 
 说明:
-  与 kline_daily_raw.pkl（截止 2026-05-18）时间区间不重叠。
+  与 kline_daily_raw.pkl 时间区间不重叠。
   backtest 窗口 = kline_daily_raw 末尾 lookback 根（context）+ 本文件（target）。
-
-  本文件只取 2026-05-19 及之后的数据，2026-05-08 ~ 2026-05-18 部分丢弃
-  （该区间已在 kline_daily_raw.pkl 中）。
 
 结构：{symbol: {'values': (T,6) [open,high,low,close,vol,amt], 'index': DatetimeIndex}}
 """
@@ -31,18 +28,20 @@ sys.path.insert(0, project_root)
 
 feature_cols = ['open', 'high', 'low', 'close', 'vol', 'amt']
 
-# 样本外 sql 列名：stock_code, trade_date, open_price, high_price, low_price, close_price, volume, amount
-SQL_PATTERN = re.compile(
+# 新格式（带 id）: VALUES (id, 'stock', 'date', 'open', 'high', 'low', 'close', vol, 'amt')
+NEW_SQL_PATTERN = re.compile(
     r"VALUES \(\d+, '([^']+)', '([^']+)', '([0-9.]+)', '([0-9.]+)', '([0-9.]+)', '([0-9.]+)', ([0-9]+), '([0-9.]+)'"
 )
 
-# backtest 起始日期（kline_daily_raw.pkl 截止日的次日）
-BACKTEST_START_DEFAULT = '2026-05-19'
+# 旧格式（无 id）: VALUES ('stock', 'date', 'open', 'high', 'low', 'close', vol, 'amt')
+OLD_SQL_PATTERN = re.compile(
+    r"VALUES \('([^']+)', '([^']+)', '([0-9.]+)', '([0-9.]+)', '([0-9.]+)', '([0-9.]+)', ([0-9]+), '([0-9.]+)'"
+)
 
 
-def parse_sql_line(line):
-    """解析样本外 sql INSERT 行"""
-    match = SQL_PATTERN.search(line)
+def parse_sql_line(line, pattern):
+    """解析 SQL INSERT 行"""
+    match = pattern.search(line)
     if match:
         return {
             'symbol': match.group(1),
@@ -57,12 +56,27 @@ def parse_sql_line(line):
     return None
 
 
+def detect_sql_format(sql_path):
+    """检测 SQL 文件格式"""
+    with open(sql_path, 'r', encoding='utf-8') as f:
+        for line in f:
+            if line.startswith('INSERT INTO'):
+                if re.search(r"VALUES \(\d+,", line):
+                    return 'new'
+                return 'old'
+    return 'new'  # 默认新格式
+
+
+# backtest 起始日期（kline_daily_raw.pkl 截止日的次日）
+BACKTEST_START_DEFAULT = '2026-05-19'
+
+
 def main():
     parser = argparse.ArgumentParser(
-        description='解析样本外 kline_daily sql 为 backtest_raw.pkl（回测 target 输入源）'
+        description='解析 kline_daily sql 为 backtest_raw.pkl（回测 target 输入源）'
     )
     parser.add_argument('--sql', type=str,
-                        default=os.path.join(script_dir, 'kline_daily_20260508~20260617.sql'),
+                        default=os.path.join(script_dir, 'kline_daily(~20260622).sql'),
                         help='输入 sql 文件路径')
     parser.add_argument('--output', type=str,
                         default=os.path.join(project_root, 'finetune', 'data', 'raw', 'backtest_raw.pkl'),
@@ -84,32 +98,43 @@ def main():
         print(f"Error: sql 文件不存在: {sql_path}")
         sys.exit(1)
 
+    # 检测 SQL 格式
+    sql_format = detect_sql_format(sql_path)
+    pattern = NEW_SQL_PATTERN if sql_format == 'new' else OLD_SQL_PATTERN
+    print(f"SQL 格式: {sql_format}")
+
     # 1. 解析 sql
     print(f"\n[1] 解析 sql: {sql_path}")
+    print(f"回测起始: {backtest_start.date()}")
     stock_data = {}
     count = 0
     with open(sql_path, 'r', encoding='utf-8') as f:
         for line in f:
             if not line.startswith('INSERT INTO'):
                 continue
-            row = parse_sql_line(line)
+            row = parse_sql_line(line, pattern)
             if row is None:
                 continue
+
+            # 只取起始日期之后的数据
+            if pd.Timestamp(row['date']) < backtest_start:
+                continue
+
             stock_data.setdefault(row['symbol'], []).append(row)
             count += 1
     print(f"  总行数: {count}, 股票数: {len(stock_data)}")
 
-    # 2. 转换为 DataFrame 并截取起始日期之后
-    print(f"\n[2] 转换为序列（起始 {backtest_start.date()}）...")
+    # 2. 转换为 DataFrame
+    print(f"\n[2] 转换为序列...")
     backtest_data = {}
     for symbol, rows in stock_data.items():
         df = pd.DataFrame(rows)
         df['date'] = pd.to_datetime(df['date'])
         df = df.set_index('date')
         df.index.name = 'datetime'
+        df = df.sort_index()
         df = df[feature_cols]
 
-        df = df[df.index >= backtest_start]
         if len(df) == 0:
             continue
 
@@ -134,7 +159,7 @@ def main():
     sample = backtest_data[sample_sym]
     print(f"  样本股票: {sample_sym}")
     print(f"  values shape: {sample['values'].shape}")
-    print(f"  date range: {sample['index'][0]} ~ {sample['index'][-1]}")
+    print(f"  date range: {sample['index'][0].date()} ~ {sample['index'][-1].date()}")
 
     print(f"\n{'=' * 60}")
     print("完成")
