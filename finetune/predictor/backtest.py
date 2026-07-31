@@ -286,10 +286,15 @@ def backtest(
 
 def main():
     parser = argparse.ArgumentParser(description='Kronos Predictor Backtest')
-    parser.add_argument('--model', type=str, default='mini')
+    parser.add_argument('--model', type=str, default='mini',
+                        help='模型类型(mini/small/base)或 checkpoint 绝对路径')
+    parser.add_argument('--model-type', type=str, default=None,
+                        choices=['mini', 'small', 'base'],
+                        help='模型架构类型（--model 为路径时必须指定）')
     parser.add_argument('--checkpoint', type=str, default='best_combined_model',
                         choices=['best_model', 'best_ic_model', 'best_combined_model', 'latest_model'])
-    parser.add_argument('--tokenizer', type=str, default=None)
+    parser.add_argument('--tokenizer', type=str, default=None,
+                        help='tokenizer 绝对路径（不指定则用默认路径）')
     parser.add_argument('--norm-mode', type=str, default='sliding_ma60',
                         choices=['full_window', 'sliding_ma20', 'sliding_ma60', 'sliding_ma120'])
     parser.add_argument('--lookback', type=int, default=400)
@@ -303,36 +308,52 @@ def main():
     device = get_device()
     config = BacktestConfig()
 
+    # 模型类型判断
+    pretrained_paths = {
+        'mini': 'pretrained/Kronos-mini',
+        'small': 'pretrained/Kronos-small',
+        'base': 'pretrained/Kronos-base',
+    }
+
+    # 判断 --model 是类型还是路径
+    is_model_path = args.model not in pretrained_paths or args.model_type is not None
+
+    if is_model_path:
+        # 路径模式：必须指定 --model-type
+        if args.model_type is None:
+            raise ValueError("--model 为路径时必须指定 --model-type (mini/small/base)")
+        model_type = args.model_type
+        checkpoint_dir = args.model
+    else:
+        # 类型模式：使用默认路径
+        model_type = args.model
+        checkpoint_dir = None
+
     # Tokenizer
     if args.tokenizer:
         tokenizer_path = args.tokenizer
     else:
-        tokenizer_path = get_tokenizer_path(args.norm_mode, args.model)
+        tokenizer_path = get_tokenizer_path(args.norm_mode, model_type)
 
     if not os.path.exists(tokenizer_path):
         print(f"[WARNING] Tokenizer not found at {tokenizer_path}")
-        tokenizer_path = 'pretrained/Kronos-Tokenizer-2k' if args.model == 'mini' else 'pretrained/Kronos-Tokenizer-base'
+        tokenizer_path = 'pretrained/Kronos-Tokenizer-2k' if model_type == 'mini' else 'pretrained/Kronos-Tokenizer-base'
         print(f"[WARNING] Using pretrained tokenizer: {tokenizer_path}")
 
     tokenizer = KronosTokenizer.from_pretrained(tokenizer_path)
     tokenizer.eval().to(device)
 
     # 模型
-    pretrained_paths = {
-        'mini': 'pretrained/Kronos-mini',
-        'small': 'pretrained/Kronos-small',
-        'base': 'pretrained/Kronos-base',
-    }
-    model_type = args.model if args.model in pretrained_paths else 'mini'
     model = Kronos.from_pretrained(pretrained_paths[model_type])
     model.eval().to(device)
 
     # Checkpoint
-    if args.model in pretrained_paths:
-        model_dir = get_model_path(args.norm_mode, args.lookback, args.predict, args.split_mode, args.model)
-        checkpoint_dir = get_checkpoint_path(model_dir, args.checkpoint)
-    else:
-        checkpoint_dir = os.path.join(project_root, args.model)
+    if checkpoint_dir is None:
+        checkpoint_dir = get_checkpoint_path(
+            get_model_path(args.norm_mode, args.lookback, args.predict, args.split_mode, model_type),
+            args.checkpoint
+        )
+
     safetensors_path = os.path.join(checkpoint_dir, 'model.safetensors')
 
     if os.path.exists(safetensors_path):
